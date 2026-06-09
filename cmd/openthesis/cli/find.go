@@ -41,12 +41,10 @@ func CmdFind(args []string) int {
 		return 0
 	}
 
-	// Show campaign context if a manifest exists.
 	printCampaignHeader(*stateDir)
 
 	applyStatusBadges(entries, *stateDir)
 
-	// If a prefix argument was given, skip the selection menu.
 	var chosen *artifactEntry
 	if fs.NArg() > 0 {
 		prefix := fs.Arg(0)
@@ -198,8 +196,6 @@ func printViolationBox(a *report.Artifact, e *artifactEntry) {
 	if len(a.PathBranchIndices) > 0 {
 		printBoxLine("  Path depth", fmt.Sprintf("%d", len(a.PathBranchIndices)-1), width)
 	}
-	// Active faults from artifact dir - load violation.json if present for ActiveFaults.
-	// (ActiveFaults is on ViolationEntry, not Artifact; skip if not available.)
 	fmt.Printf("  ├%s┤\n", bar)
 	fmt.Printf("  │  %s%-*s│\n", styleDim.Render("dir: "), width-7, truncate(e.Dir, width-7))
 	fmt.Printf("  └%s┘\n", bar)
@@ -209,7 +205,6 @@ func printViolationBox(a *report.Artifact, e *artifactEntry) {
 // printBoxLine renders a single "  KEY  value" row inside the box.
 func printBoxLine(key, value string, width int) {
 	label := styleBold.Render(key)
-	// Visible length of label (strip ANSI for padding calculation).
 	visLen := len(key) + 2                 // "  " prefix
 	pad := width - visLen - len(value) - 2 // 2 for "│" on each side
 	if pad < 1 {
@@ -268,14 +263,12 @@ func openArtifactDir(dir string) {
 		runSubcommand(editor, []string{dir})
 		return
 	}
-	// Try platform-specific file managers.
 	for _, opener := range []string{"open", "xdg-open"} {
 		if path, err := exec.LookPath(opener); err == nil {
 			runSubcommand(path, []string{dir})
 			return
 		}
 	}
-	// Last resort: just print.
 	fmt.Printf("\n  Artifact directory: %s\n\n", dir)
 }
 
@@ -380,7 +373,7 @@ func verifyFix(e *artifactEntry, bin, configPath string) {
 	const trials = 10
 	fmt.Printf("\n  Running %d replay trials to check whether fix is effective...\n\n", trials)
 	reproduced := 0
-	for i := 0; i < trials; i++ {
+	for i := range trials {
 		fmt.Printf("  Trial %2d/%d: ", i+1, trials)
 		args := append(buildReplayArgs(e.Artifact, e.Dir, configPath), "--verify")
 		cmd := exec.Command(bin, args...)

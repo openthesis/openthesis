@@ -13,6 +13,15 @@ import (
 	"github.com/openthesis/openthesis/internal/report"
 )
 
+// execMsg is the wire format for sending a shell command to the guest agent.
+type execMsg struct {
+	Type    string `json:"type"`
+	Payload struct {
+		Cmd            string `json:"cmd"`
+		TimeoutSeconds int    `json:"timeout_seconds"`
+	} `json:"payload"`
+}
+
 // ExecResult holds the output of a guest exec command.
 type ExecResult struct {
 	Stdout   string
@@ -124,20 +133,12 @@ func ExecAtSnapshot(ctx context.Context, cfg RunConfig, artifact *report.Artifac
 	}
 
 	// Send the exec command to the guest.
-	execMsg := struct {
-		Type    string `json:"type"`
-		Payload struct {
-			Cmd            string `json:"cmd"`
-			TimeoutSeconds int    `json:"timeout_seconds"`
-		} `json:"payload"`
-	}{
-		Type: "exec",
-	}
-	execMsg.Payload.Cmd = cmd
-	execMsg.Payload.TimeoutSeconds = timeoutSeconds
+	msg := execMsg{Type: "exec"}
+	msg.Payload.Cmd = cmd
+	msg.Payload.TimeoutSeconds = timeoutSeconds
 
 	slog.Info("orchestrator exec: sending exec command", "cmd", cmd)
-	if err := orch.listener.Send(execMsg); err != nil {
+	if err := orch.listener.Send(msg); err != nil {
 		return nil, fmt.Errorf("orchestrator exec: send: %w", err)
 	}
 

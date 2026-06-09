@@ -27,7 +27,28 @@ type ScheduleEntry struct {
 	VirtualTimeNS uint64 `json:"virtual_time_ns,omitempty"`
 }
 
-// Schedule records and replays fault injection sequences deterministically.
+// Schedule maps fault injection events onto burst steps. Each ScheduleEntry
+// fires at a specific Step (burst index). Faults persist until a KindClear
+// entry or end of burst. The cursor advances monotonically during replay.
+//
+// Burst window: step 0 to step N.
+//
+//  step:  0    500   1000  1500  2000  2500  2800  N
+//         +----+-----+-----+-----+-----+-----+----+
+//         |    | drop|     | hang|     |     | clr|
+//         |    +---------->|     +---------->|    |
+//         |    | eth0 drop |     | node-2 hang    |
+//         +----+-----------+-----+---------------++
+//              ^                 ^           ^
+//              KindDrop          KindHang    KindClear
+//              Step=500          Step=1500   Step=2800
+//
+// Two faults can overlap; each fires independently. KindClear at Step=2800
+// lifts all active faults before the burst ends.
+//
+// Record mode: the orchestrator appends entries as faults fire.
+// Replay mode: FaultsAt(step) returns entries due at that step and advances
+// the cursor. The sequence is deterministically reproducible.
 type Schedule struct {
 	mu           sync.Mutex
 	Entries      []ScheduleEntry `json:"entries"`

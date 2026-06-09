@@ -26,7 +26,6 @@ func CmdStatus(args []string) int {
 		return 0
 	}
 
-	// Load the history DB to get stats for the last run.
 	histDB, _ := history.Load(history.DefaultPath(*stateDir))
 
 	var lastRecord *history.RunRecord

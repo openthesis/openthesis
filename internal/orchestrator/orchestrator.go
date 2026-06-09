@@ -437,15 +437,6 @@ func New(cfg RunConfig) (*Orchestrator, error) {
 	}, nil
 }
 
-// Run executes the full pipeline:
-//  1. Prepare rootfs + initramfs
-//  2. Boot QEMU VM
-//  3. Connect host-side listener to virtio-serial
-//  4. Wait for setup_complete from guest
-//  5. Discover test commands, create composer
-//  6. Run exploration loop
-//  7. Generate report
-//  8. Cleanup
 func (o *Orchestrator) Run(ctx context.Context) (*RunResult, error) {
 	if o.cfg.TestConfig == nil {
 		return nil, ErrNoTestConfig

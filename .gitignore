@@ -1,18 +1,15 @@
-# Compiled binaries
 /bin/
 *.exe
 *.exe~
 *.dll
 *.dylib
-
-# Go build artifacts
 *.test
 *.out
 *.prof
 /vendor/
 /go.sum.bak
-
-# Root-level loose binaries (built locally, not source)
+/go.work
+/go.work.sum
 /openthesis
 /openthesis-init
 /openthesis-linux
@@ -28,49 +25,48 @@
 /pg-driver
 /redis-driver
 /docgen
-
-# Go workspace files (local multi-module dev, not needed by consumers)
-/go.work
-/go.work.sum
-
-# Generated output files
 /heatmap.html
 /heatmap.png
 /heatmap.svg
-
-# Reports and run state
 /reports/
+/site/
+/mkdocs.yml
+/tutorial/
+/docs/
+/post-mortems/
+/gaps/
+/CLAUDE.md
+/CHANGELOG.md
+/scripts/
+/pkg/
+/notebook/
+/debug/
+/upstream/
+/ANTITHESIS_BLOG_ANALYSIS.md
+/ANTITHESIS_GAP_APRIL.md
+/DETERMINISM_CHECKLIST.md
+/GIT_INSTRUCTIONS.md
+/MARCH_CHECKLIST.md
+/NONDETERMINISM_SOURCES.md
+/PATCHED_BACKEND_DEBUG.md
+/PATCH_PROGRESS.md
 *.log
 *.jsonl.tmp
-
-# SDK build artifacts
-sdk/c/*.o
-sdk/c/*.a
-sdk/rust/target/
-
-# Rust init binary
-cmd/openthesis-init-rs/target/
-
-# Compiled test binaries and pre-built drivers in examples
-examples/*/tests/
-examples/*/bin/
-examples/etcd/etcd-driver
-examples/etcd/etcd-repro-driver
-examples/postgres/pg-driver
-examples/postgres/pg-server
-examples/redis/redis-driver
-
-# Examples not ready for public release (keep etcd, postgres, redis)
-examples/etcd-repro/
-examples/etcd-watch/
-examples/glitch-grid/
-examples/helm/
-examples/inkless/
-examples/kv/
-examples/mario/
-examples/nats/
-
-# Python
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.cursor/
+.ropeproject/
+.claude/
+.mcp.json
+.make-stamps/
+.code-review-graph/
+.codex-checkpoints/
+.parcel-cache/
 __pycache__/
 *.py[cod]
 *.pyo
@@ -80,97 +76,46 @@ venv/
 *.egg-info/
 dist/
 build/
-
-# Node / web frontend
 node_modules/
 web/
-.parcel-cache/
-
-# MkDocs build output and source
-/site/
-/mkdocs.yml
-
-# Tutorial (not ready for public)
-/tutorial/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Editors
-.idea/
-.vscode/
-.cursor/
-.ropeproject/
-*.swp
-*.swo
-*~
-
-# AI tool config and session state
-.claude/
-.mcp.json
-
-# Upstream source clones for patch authoring (large - see deploy/local/checkout-upstream)
-upstream/
-
-# Build stamps and caches
-.make-stamps/
-.code-review-graph/
-
-# CI checkpoints
-.codex-checkpoints/
-
-# Deploy artifacts (generated, not source)
+sdk/c/*.o
+sdk/c/*.a
+sdk/rust/target/
+cmd/openthesis-init-rs/target/
+examples/*/tests/
+examples/*/bin/
+examples/etcd/etcd-driver
+examples/etcd/etcd-repro-driver
+examples/postgres/pg-driver
+examples/postgres/pg-server
+examples/redis/redis-driver
+examples/etcd-repro/
+examples/etcd-watch/
+examples/glitch-grid/
+examples/helm/
+examples/inkless/
+examples/kv/
+examples/mario/
+examples/nats/
 deploy/__pycache__/
 deploy/*.pyc
-
-# Deploy patch series not yet ready for public release
 deploy/cloud-hypervisor-patches/
 deploy/qemu-patches/
 deploy/patches-backup/
 deploy/linux-patches/
 deploy/local/
-
-# Internal documentation (design notes, post-mortems, research)
-/docs/
-/post-mortems/
-/gaps/
-
-# CLAUDE.md (AI tool instructions, not for consumers)
-/CLAUDE.md
-
-# Changelog (not maintained yet)
-/CHANGELOG.md
-
-# WIP root-level analysis and internal notes
-/ANTITHESIS_BLOG_ANALYSIS.md
-/ANTITHESIS_GAP_APRIL.md
-/DETERMINISM_CHECKLIST.md
-/GIT_INSTRUCTIONS.md
-/MARCH_CHECKLIST.md
-/NONDETERMINISM_SOURCES.md
-/PATCHED_BACKEND_DEBUG.md
-/PATCH_PROGRESS.md
-
-# Internal deploy logs and ad-hoc scripts
-/deploy/DEPLOY_LOG.md
-/deploy/PATCH_PROGRESS.md
 deploy/firecracker-patches/PATCH_PROGRESS.md
+deploy/firecracker-patches/reference/PATCH_PROGRESS.md
 deploy/gvisor-patches/PATCH_PROGRESS.md
 deploy/host-kernel-patches/PATCH_PROGRESS.md
+/deploy/DEPLOY_LOG.md
+/deploy/PATCH_PROGRESS.md
 /deploy/apply-patch-*.py
 /deploy/apply-patch-*.sh
 /deploy/fix-service.sh
 /deploy/build-cloud-hypervisor.sh
 /deploy/build-qemu.sh
 /deploy/build-qemu-patched.sh
-
-# Developer scripts (local tooling, not for consumers)
-/scripts/
-
-# Moved to internal/ - kept locally for reference only
-/pkg/
-
-# Notebook scratch output
-/notebook/
-/debug/
+deploy/server/build-qemu.sh
+deploy/server/build-qemu-patched.sh
+internal/fault/testdata/rapid/**/*.fail

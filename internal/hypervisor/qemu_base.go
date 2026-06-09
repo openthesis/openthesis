@@ -62,7 +62,6 @@ func (b *qemuBase) startQEMU(ctx context.Context, cfg VMConfig, args []string, l
 	qmpSocket := filepath.Join(vmDir, "qmp.sock")
 	serialSocket := filepath.Join(vmDir, "serial.sock")
 
-	// Remove stale sockets from previous runs.
 	os.Remove(qmpSocket)
 	os.Remove(serialSocket)
 
@@ -89,7 +88,6 @@ func (b *qemuBase) startQEMU(ctx context.Context, cfg VMConfig, args []string, l
 
 	slog.Info(logPrefix+" started", "vm", cfg.Name, "pid", cmd.Process.Pid)
 
-	// Connect QMP with retries (QEMU needs a moment to open the socket).
 	qmp, err := dialQMP(ctx, qmpSocket)
 	if err != nil {
 		cancel()
@@ -149,7 +147,6 @@ func (b *qemuBase) monitor(_ context.Context, m *managedVM) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// Read console log for diagnostics.
 	consoleLog := filepath.Join(b.stateDir, m.vm.ID, "console.log")
 	if console, readErr := os.ReadFile(consoleLog); readErr == nil && len(console) > 0 {
 		s := string(console)
@@ -278,10 +275,6 @@ func (b *qemuBase) InjectFault(ctx context.Context, vm *VM, f fault.Fault) error
 	case fault.KindHang, fault.KindTerminate:
 		return m.qmp.InjectDiskFault(faultType, f.Params)
 	case fault.KindThreadPause:
-		// SIGSTOP the QEMU process for the specified duration, then SIGCONT.
-		// This pauses the entire VM (all vCPUs + I/O threads), simulating a
-		// scheduler starvation event from the guest's perspective. Coarser than
-		// per-process SIGSTOP but effective for exposing heartbeat-loss bugs.
 		durationMS := int64(50)
 		if v, ok := f.Params["duration_ms"]; ok {
 			switch d := v.(type) {
@@ -304,7 +297,6 @@ func (b *qemuBase) InjectFault(ctx context.Context, vm *VM, f fault.Fault) error
 	case fault.KindClockJitter:
 		return m.qmp.InjectNetworkFault(faultType, f.Params)
 	case fault.KindClear:
-		// Clear all active faults via both subsystems.
 		netErr := m.qmp.InjectNetworkFault(faultType, f.Params)
 		diskErr := m.qmp.InjectDiskFault(faultType, f.Params)
 		if netErr != nil {
@@ -348,15 +340,10 @@ func (b *qemuBase) RunForInstructions(ctx context.Context, vm *VM, instructions 
 		return err
 	}
 
-	// Wall-clock sleep: resume VM, sleep for proportional duration, then pause.
-	// With shift=7 (128ns/instruction) and TCG running ~16x slower than native,
-	// the effective real-time cost is ~instructions * 128ns / 16 = instructions * 8ns.
-	// We use a minimum of 300ms to ensure guest HTTP round-trips and assertions
-	// complete before the pause, and a maximum of 2s to keep exploration responsive.
 	if resumeErr := m.qmp.Resume(); resumeErr != nil {
 		return fmt.Errorf("run-for-instructions resume: %w", resumeErr)
 	}
-	sleepNS := instructions * 8 // 128ns / 16x slowdown = 8ns per instruction
+	sleepNS := instructions * 8
 	sleepDur := time.Duration(sleepNS) * time.Nanosecond
 	if sleepDur < 300*time.Millisecond {
 		sleepDur = 300 * time.Millisecond
@@ -414,7 +401,6 @@ func (b *qemuBase) snapshotSaveVMPaused(ctx context.Context, vm *VM) (snapshot.I
 	return id, nil
 }
 
-// restoreLoadVM restores a snapshot using standard loadvm.
 // startMultiQEMU is the QEMU fallback for StartMulti: launches each container
 // as a separate independent QEMU VM. QEMU does not support shared sandboxes,
 // so this does NOT give co-deterministic execution across VMs; each runs in
@@ -424,7 +410,6 @@ func (b *qemuBase) startMultiQEMU(ctx context.Context, cfgs []VMConfig, starter 
 	for _, cfg := range cfgs {
 		vm, err := starter(ctx, cfg)
 		if err != nil {
-			// Best-effort stop already-started VMs.
 			for _, started := range vms {
 				_ = b.Stop(ctx, started)
 			}

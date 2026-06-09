@@ -23,20 +23,19 @@ import (
 
 // CmdCampaign implements `openthesis campaign`.
 //
-// With no flags it runs 10 exploration rounds. With --adaptive it runs
-// indefinitely using saturation detection and fault escalation (the behaviour
-// previously in `openthesis auto`). `openthesis auto` is now a thin alias.
+// --adaptive runs indefinitely with saturation detection and fault escalation
+// (same as `openthesis auto`). Without it, runs a fixed number of rounds (default 10).
 //
 // Artifact layout:
 //
 //	~/.openthesis/<name>/
-//	  campaign.json          manifest - enables resumability and find
-//	  corpus.json            fault UCB1 stats persisted across rounds
-//	  rounds/001/            per-round output
-//	    meta.json            seed, states, edges, violations, duration
+//	  campaign.json          manifest (resume, find, seed reproduction)
+//	  corpus.json            fault UCB1 stats
+//	  rounds/001/
+//	    meta.json
 //	    report.json
 //	    violations/
-//	  violations/            flat symlink index into rounds/NNN/violations/
+//	  violations/            flat symlink index -> rounds/NNN/violations/
 func CmdCampaign(args []string) int {
 	fs := flag.NewFlagSet("campaign", flag.ExitOnError)
 
@@ -100,7 +99,7 @@ func CmdCampaign(args []string) int {
 		testCfg.KernelPath = otKernelPath()
 	}
 
-	// Apply config-level defaults for backend and parallel (flag > config > default).
+	// flag > config > default
 	if *backendStr == "" {
 		if testCfg.Backend != "" {
 			*backendStr = testCfg.Backend
@@ -116,7 +115,6 @@ func CmdCampaign(args []string) int {
 		}
 	}
 
-	// Resolve --rounds default based on mode.
 	if *maxRoundsAdapt > 0 && *rounds == -1 {
 		*rounds = *maxRoundsAdapt
 	}
@@ -128,7 +126,6 @@ func CmdCampaign(args []string) int {
 		}
 	}
 
-	// Resolve state dir: default to ~/.openthesis/<name>.
 	if *stateDir == "" {
 		*stateDir = campaignStateDir(testCfg.Name)
 	}
@@ -162,7 +159,6 @@ func CmdCampaign(args []string) int {
 		memMB = *memory
 	}
 
-	// Load or create campaign manifest.
 	manifest, err := loadCampaignManifest(*stateDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: load campaign manifest: %v\n", err)
@@ -191,7 +187,6 @@ func CmdCampaign(args []string) int {
 			RoundsTarget: *rounds,
 		}
 	}
-	// Suppress --resume flag noise when there's nothing to resume.
 	_ = resume
 
 	const phiStride = uint64(0x9e3779b97f4a7c15)
@@ -245,7 +240,6 @@ func CmdCampaign(args []string) int {
 		})
 	}
 
-	// Non-adaptive: explicit round loop.
 	type faultSummary struct {
 		kind      string
 		pulls     uint64
@@ -386,7 +380,6 @@ func CmdCampaign(args []string) int {
 		}
 	}
 
-	// Campaign summary.
 	fmt.Println()
 	fmt.Println(styleBold.Render("  Campaign Summary"))
 	fmt.Println()
@@ -462,7 +455,6 @@ func runAdaptiveCampaign(ctx context.Context, p adaptiveParams) int {
 		go srv.ListenAndServe(ctx)
 	}
 
-	// Print a live line per burst so operators can see activity during long rounds.
 	go printBurstLines(ctx, sharedObs)
 
 	adapt := p.testCfg.Adaptation
@@ -555,8 +547,6 @@ func runAdaptiveCampaign(ctx context.Context, p adaptiveParams) int {
 				satStr,
 			)
 
-			// Print assertion coupling summary after each round so developers
-			// can see why violations were or were not found without --dev-addr.
 			if stats.Observer != nil {
 				devobs.PrintTerminalSummary(stats.Observer, os.Stdout)
 			}

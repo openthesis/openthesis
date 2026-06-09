@@ -31,11 +31,6 @@ import (
 //     process is descheduled by the kernel rather than burning
 //     CPU in userspace.
 func (o *Orchestrator) injectFaults(ctx context.Context, step uint64) {
-	// In replay mode, inject faults from the saved schedule. For Firecracker,
-	// network-level and signal-level faults live in the guest agent, not the
-	// hypervisor, so replayAgentFault reroutes the applicable kinds over
-	// vsock to keep replay byte-identical to the original run. Other backends
-	// dispatch straight through the hypervisor interface.
 	if o.faultSchedule.IsReplay() {
 		entries := o.faultSchedule.FaultsAt(step)
 		isFCReplay := o.cfg.Backend == hypervisor.BackendFirecracker
@@ -61,7 +56,6 @@ func (o *Orchestrator) injectFaults(ctx context.Context, step uint64) {
 		return
 	}
 
-	// Honour stop_faults quiet period requested by the SUT.
 	if !o.faultQuietUntil.IsZero() && time.Now().Before(o.faultQuietUntil) {
 		slog.Debug("orchestrator: fault injection suppressed (stop_faults quiet period)",
 			"until", o.faultQuietUntil)
@@ -70,14 +64,8 @@ func (o *Orchestrator) injectFaults(ctx context.Context, step uint64) {
 
 	nodes := o.cfg.TestConfig.NodeNames()
 
-	// Use the dedicated fault PRNG; never touches o.rng so fault sequences are
-	// independent of coverage-driven energy calculations.
 	faultRng := o.faultRng
 
-	// MOPT-style: if adaptive faults enabled, select which fault types to inject.
-	// SelectMultiple returns the top-2 UCB1 kinds so compound faults are possible:
-	// e.g. "network partition AND clock jitter" simultaneously, which is what
-	// triggers many leader election bugs that single-fault injection misses.
 	var selectedFaults []fault.Kind
 	if o.adaptiveFaults != nil {
 		selectedFaults = o.adaptiveFaults.SelectMultiple(faultRng, 2)
@@ -86,15 +74,9 @@ func (o *Orchestrator) injectFaults(ctx context.Context, step uint64) {
 		}
 	}
 
-	// Stamp path hash and virtual time for this step's schedule entries.
-	// PathHash is seed+ancestry-derived (independent of coverage/energy).
 	o.currentStepPathHash = o.tree.PathHash(o.tree.Current(), o.cfg.Seed)
 	o.currentStepVTimeNS = o.currentTimeNS
 
-	// Clear any residual fault state from the restored snapshot before injecting
-	// new faults, so each step starts with a clean slate.
-	// FC: send "clear" to guest agent (iptables + tc rules inside the VM).
-	// QEMU/gVisor: call InjectFault(KindClear) via the hypervisor interface.
 	isFCBackend := o.cfg.Backend == hypervisor.BackendFirecracker
 	if isFCBackend && o.faultNet != nil {
 		_ = o.sendAgentFault(ctx, "clear", "", 0)
@@ -103,8 +85,6 @@ func (o *Orchestrator) injectFaults(ctx context.Context, step uint64) {
 	}
 
 	if o.faultNet != nil {
-		// N-way split-brain: check before per-pair loop since it's a global decision.
-		// Assigns every node to one of N groups; all inter-group traffic is blocked.
 		if o.adaptiveFaults == nil || slices.Contains(selectedFaults, fault.KindNWayPartition) {
 			if fired, groups := o.faultNet.ShouldNWayPartition(nodes, faultRng); fired {
 				groupPorts := make([][]string, len(groups))
@@ -148,9 +128,6 @@ func (o *Orchestrator) injectFaults(ctx context.Context, step uint64) {
 						Params: params,
 					})
 				}
-			} else {
-				// ShouldNWayPartition always draws 2 values from rng; nothing to do here.
-				_ = fired
 			}
 		}
 
@@ -165,8 +142,6 @@ func (o *Orchestrator) injectFaults(ctx context.Context, step uint64) {
 						}
 						var injectErr error
 						if isFCBackend {
-							// Firecracker: all nodes are on loopback inside one VM.
-							// Block ALL TCP to dst node's listen port (undirected drop).
 							if port := nodePort(o.cfg.TestConfig.Nodes, b); port != "" {
 								injectErr = o.sendAgentFault(ctx, "block_port", port, 0)
 							}
@@ -193,7 +168,6 @@ func (o *Orchestrator) injectFaults(ctx context.Context, step uint64) {
 						}
 						var injectErr error
 						if isFCBackend {
-							// Firecracker: add tc netem delay to dst node's listen port.
 							if port := nodePort(o.cfg.TestConfig.Nodes, b); port != "" {
 								injectErr = o.sendAgentFault(ctx, "delay_port", port, delay.Milliseconds())
 							}
@@ -303,8 +277,6 @@ func (o *Orchestrator) injectFaults(ctx context.Context, step uint64) {
 					}
 					var injectErr error
 					if isFCBackend {
-						// Firecracker: route hang through guest agent so only the named
-						// node process is affected (not the whole VM).
 						injectErr = o.sendAgentHangNode(ctx, n, hangDuration.Nanoseconds())
 					} else {
 						injectErr = o.hyp.InjectFault(ctx, o.vm, f)
@@ -328,8 +300,6 @@ func (o *Orchestrator) injectFaults(ctx context.Context, step uint64) {
 					}
 					var injectErr error
 					if isFCBackend {
-						// Firecracker: terminate only the named node process via guest
-						// agent SIGKILL; not the whole VM (which was the old behaviour).
 						injectErr = o.sendAgentTerminateNode(ctx, n)
 					} else {
 						injectErr = o.hyp.InjectFault(ctx, o.vm, f)
@@ -507,7 +477,6 @@ func (o *Orchestrator) injectFaults(ctx context.Context, step uint64) {
 			}
 		}
 
-		// DiskFull is VM-wide (not per-node); fill the guest filesystem once per step.
 		if o.adaptiveFaults == nil || slices.Contains(selectedFaults, fault.KindDiskFull) {
 			if o.faultNode.ShouldDiskFull("", faultRng) {
 				targetFree := o.cfg.TestConfig.Faults.Node.DiskFullTargetFreeBytes
@@ -526,9 +495,6 @@ func (o *Orchestrator) injectFaults(ctx context.Context, step uint64) {
 			}
 		}
 
-		// Clock jitter: shift the VM's virtual clock by a random offset.
-		// Tests SUT code that relies on monotonic time (NTP step, DST, leap second).
-		// Applied once per step (VM-wide, not per-node) since all nodes share one clock.
 		if o.adaptiveFaults == nil || slices.Contains(selectedFaults, fault.KindClockJitter) {
 			jitter := o.faultNode.ClockJitter(faultRng)
 			if jitter != 0 {
@@ -570,8 +536,6 @@ func (o *Orchestrator) recordFault(entry fault.ScheduleEntry) {
 	})
 }
 
-// countFault increments the per-step fault counter and ORs the kind's bitmask
-// into currentFaultKindMask. Call this whenever a fault is successfully injected.
 func (o *Orchestrator) countFault(k fault.Kind) {
 	o.currentFaultCount++
 	o.currentFaultKindMask |= fault.KindToMask(k)
@@ -579,10 +543,6 @@ func (o *Orchestrator) countFault(k fault.Kind) {
 
 func (o *Orchestrator) clearFaults(ctx context.Context) {
 	slog.Info("orchestrator: clearing faults")
-	// Send a clear-all command via the hypervisor fault injection interface.
-	// This resets network drops, delays, and any other active fault state.
-	// Snapshot restore (called before this) resets most device state, but
-	// explicit clearing ensures no residual faults leak into the Eventually phase.
 	f := fault.Fault{
 		Kind:   fault.KindClear,
 		Params: map[string]any{},
@@ -590,7 +550,6 @@ func (o *Orchestrator) clearFaults(ctx context.Context) {
 	if err := o.hyp.InjectFault(ctx, o.vm, f); err != nil {
 		slog.Warn("orchestrator: clear faults failed", "err", err)
 	}
-	// For Firecracker, also clear iptables rules inside the guest via the agent.
 	if o.cfg.Backend == hypervisor.BackendFirecracker {
 		if err := o.sendAgentFault(ctx, "clear", "", 0); err != nil {
 			slog.Debug("orchestrator: FC agent clear faults failed", "err", err)

@@ -35,7 +35,6 @@ func cmdInit(args []string) int {
 		return cmdInitHelm(*helmChart, *helmValues, *helmRelease, *output, *testDir)
 	}
 
-	// Auto-detect compose file if not specified.
 	if *composePath == "" {
 		for _, candidate := range []string{
 			"docker-compose.yml", "docker-compose.yaml",
@@ -63,7 +62,6 @@ func cmdInit(args []string) int {
 
 	cfg := scaffold.GenerateConfig(spec, *composePath, *testDir)
 
-	// Don't clobber an existing config without asking.
 	if _, err := os.Stat(*output); err == nil {
 		fmt.Fprintf(os.Stderr, "error: %s already exists; remove it or choose a different --output path\n", *output)
 		return 1
@@ -80,7 +78,6 @@ func cmdInit(args []string) int {
 		return 1
 	}
 
-	// Print what was generated.
 	fmt.Fprintf(os.Stderr, "Generated %s\n", *output)
 	absTestDir, _ := filepath.Abs(*testDir)
 	fmt.Fprintf(os.Stderr, "Generated %s/\n", absTestDir)
@@ -165,7 +162,6 @@ func cmdInitHelm(chartPath, valuesPath, release, output, testDir string) int {
 		return 1
 	}
 
-	// Generate minimal test scripts.
 	if err := os.MkdirAll(testDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "error: create test dir: %v\n", err)
 		return 1

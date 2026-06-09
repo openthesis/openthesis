@@ -73,15 +73,15 @@ func (h *PatchedQEMUHypervisor) Start(ctx context.Context, cfg VMConfig) (*VM, e
 	return vm, nil
 }
 
-// EnableDeterminism activates the patched QEMU determinism hooks (time, RNG,
-// I/O ordering). Must be called after the guest kernel has finished booting,
-// because the timer hooks freeze guest clocks until the TB execution callback
-// advances virtual time.
 // StartMulti is a QEMU fallback: each VM runs independently (no shared sandbox).
 func (h *PatchedQEMUHypervisor) StartMulti(ctx context.Context, cfgs []VMConfig) ([]*VM, error) {
 	return h.startMultiQEMU(ctx, cfgs, h.Start)
 }
 
+// EnableDeterminism activates the patched QEMU determinism hooks (time, RNG,
+// I/O ordering). Must be called after the guest kernel has finished booting,
+// because the timer hooks freeze guest clocks until the TB execution callback
+// advances virtual time.
 func (h *PatchedQEMUHypervisor) EnableDeterminism(ctx context.Context, vm *VM) error {
 	m, err := h.lookup(vm.ID)
 	if err != nil {

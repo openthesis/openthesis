@@ -8,10 +8,28 @@ import (
 )
 
 // SaturationTracker monitors coverage discovery rates per subtree and
-// estimates remaining undiscovered coverage using the Chao1 species-richness
-// estimator. Subtrees with plateaued discovery get reduced exploration budget.
-// Chao1: Chao (1984) "Nonparametric estimation of the number of classes in a population"
-// https://github.com/scikit-bio/scikit-bio/blob/main/skbio/diversity/alpha/_chao1.py#L63C1-L69C47
+// estimates remaining undiscovered coverage using Chao1.
+// Chao (1984): https://github.com/scikit-bio/scikit-bio/blob/main/skbio/diversity/alpha/_chao1.py#L63
+//
+// A ring buffer of width W holds the per-step new-edge counts for each subtree:
+//
+//   slot:  [0]  [1]  [2]  ...  [W-1]
+//   value:  3    0    1   ...    2     <- new edges found in that step
+//   ^-- cursor % W writes here
+//
+// From the window, Chao1 estimates total undiscovered coverage:
+//
+//   f1 = count(slots == 1)    singletons
+//   f2 = count(slots == 2)    doubletons
+//   S_obs = count(slots > 0)  active discovery periods
+//
+//   Chao1 = S_obs + f1^2 / (2*f2)       when f2 > 0
+//         = S_obs + f1*(f1-1) / 2        when f2 == 0 and f1 > 0
+//         = S_obs                        otherwise
+//
+//   EstRemaining = Chao1 - S_obs
+//
+// A subtree is saturated when EstRemaining < 1% of S_obs.
 type SaturationTracker struct {
 	mu       sync.RWMutex
 	subtrees map[snapshot.ID]*SubtreeSaturation
@@ -69,12 +87,9 @@ func (s *SaturationTracker) RecordDiscovery(subtreeRoot snapshot.ID, newEdges ui
 	st.WindowCursor++
 }
 
-// UpdateChao1 recomputes the Chao1 estimate for a subtree based on its
-// recent observation window. Should be called periodically (e.g., every 100 steps).
-//
-// Chao1: S_chao1 = S_obs + f1²/(2*f2)
-// If f2 == 0: S_chao1 = S_obs + f1*(f1-1)/2
-// EstRemaining = S_chao1 - S_obs
+// UpdateChao1 recomputes the Chao1 estimate for a subtree's recent window.
+// Call periodically, e.g. every 100 steps. Sets Saturated when
+// EstRemaining < 1% of S_obs and at least half the window is filled.
 func (s *SaturationTracker) UpdateChao1(subtreeRoot snapshot.ID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -84,10 +99,7 @@ func (s *SaturationTracker) UpdateChao1(subtreeRoot snapshot.ID) {
 		return
 	}
 
-	// Count singletons and doubletons from the ring buffer.
-	// A "singleton" is an observation period where exactly 1 new edge was found.
-	// A "doubleton" is where exactly 2 were found.
-	// S_obs is the count of periods with any discovery (non-zero).
+	// Count singletons, doubletons, and active periods from the ring buffer.
 	var f1, f2, sObs uint64
 	entries := min(int(st.TotalSteps), s.window)
 	for i := range entries {
@@ -107,7 +119,6 @@ func (s *SaturationTracker) UpdateChao1(subtreeRoot snapshot.ID) {
 	st.F2 = f2
 	st.ObservedInWindow = sObs
 
-	// Chao1 estimator.
 	var chao1Est float64
 	switch {
 	case f2 > 0:
@@ -123,8 +134,6 @@ func (s *SaturationTracker) UpdateChao1(subtreeRoot snapshot.ID) {
 		st.EstRemaining = 0
 	}
 
-	// Saturated if estimated remaining < 1% of observed, and we have
-	// enough data (at least half the window filled).
 	prevSaturated := st.Saturated
 	if sObs > 0 && entries >= s.window/2 {
 		st.Saturated = st.EstRemaining/float64(sObs) < 0.01

@@ -54,15 +54,13 @@ type BranchProgressFunc func(faultKind string, trial, total int, reproduced bool
 
 // Branch performs causal attribution over a violation artifact by running
 // parallel replay branches - each with one fault kind removed - to determine
-// which fault type is causally responsible for the bug.
-//
-// For each fault kind K present in the artifact's fault schedule, Branch:
-//  1. Runs TrialsPerConfig replays with the original schedule (baseline).
-//  2. Runs TrialsPerConfig replays with all entries of kind K removed.
-//  3. Computes CausalStrength = P(bug|all) - P(bug|no K).
-//
-// The caller is responsible for populating cfg.Seed and cfg.Backend. Progress
-// is reported via the optional progressFn callback; pass nil to suppress callbacks.
+// which fault type is causally responsible for the bug. For each fault kind K
+// present in the artifact's fault schedule, it runs TrialsPerConfig replays
+// with the full schedule (baseline) and TrialsPerConfig replays with all
+// entries of kind K removed, then computes CausalStrength = P(bug|all) -
+// P(bug|no K). The caller is responsible for populating cfg.Seed and
+// cfg.Backend. Progress is reported via the optional progressFn callback; pass
+// nil to suppress callbacks.
 func Branch(ctx context.Context, cfg BranchConfig, artifact *report.Artifact, progressFn BranchProgressFunc) (*BranchResult, error) {
 	if artifact == nil {
 		return nil, fmt.Errorf("multiverse: artifact is required")

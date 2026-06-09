@@ -74,9 +74,37 @@ type poolWorker struct {
 	stepChoiceEvents []explorer.ChoiceEvent
 }
 
-// VMPool manages N concurrent workers exploring in parallel.
-// Workers share a global CoverageTracker and violation list, but each
-// worker has its own VM process, snapshot tree, and frontier.
+// VMPool manages N concurrent workers exploring in parallel. Workers share
+// a global CoverageTracker and violation list. Each worker owns its own VM
+// process, snapshot tree, and frontier. Coverage is OR'd atomically into
+// the shared bitmap after each burst so all workers benefit from each
+// other's discoveries.
+//
+//	                    VMPool
+//	  +-------------------------------------------------+
+//	  | coverage *CoverageTracker  (shared, atomic OR)  |
+//	  | violations []Violation     (shared, mu-guarded) |
+//	  | faultNet / faultNode       (stateless, shared)  |
+//	  +-------------------------------------------------+
+//	       |                  |                  |
+//	  worker 0           worker 1  ...      worker N-1
+//	  VM  frontier       VM  frontier       VM  frontier
+//	  tree rng           tree rng           tree rng
+//	  (per-worker)       (per-worker)       (per-worker)
+//
+// Per-worker loop (workerLoop):
+//
+//	frontier.Pop()
+//	     |
+//	     v  workerRestoreVM: Restore(hypID) + vsock reconnect
+//	workerInjectFaults (faultRng seeded from initialSeed ^ step)
+//	     |
+//	     v  RunForInstructions(burstInsns) + drain burst
+//	collectWorkerCoverage -> p.coverage.Update(bitmap)  [OR into shared bitmap]
+//	processWorkerOutput   -> p.violations append, novelty check
+//	     |
+//	     v  workerMaybeChildSnapshot: SnapshotPaused, w.tree.Create, w.frontier.Push
+//	(loop)
 type VMPool struct {
 	cfg      RunConfig
 	hyp      hypervisor.Hypervisor
@@ -1445,7 +1473,7 @@ func (p *VMPool) runWorkerUntilConnected(ctx context.Context, w *poolWorker, max
 // StageRootSnapshot returns the path to the pre-staged root snapshot directory
 // (copied immediately after the root snapshot was taken, before GC could prune it).
 // Returns "" if no staging is available.
-func (p *VMPool) StageRootSnapshot(_ string) string {
+func (p *VMPool) StageRootSnapshot() string {
 	if len(p.workers) == 0 || p.workers[0] == nil {
 		return ""
 	}

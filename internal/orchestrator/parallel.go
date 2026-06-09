@@ -99,8 +99,7 @@ func (o *Orchestrator) exploreParallel(ctx context.Context, prep *PrepareResult)
 	// The staged copy survives pool teardown and is used by Run() to bundle
 	// the root snapshot into each violation artifact for fast replay.
 	if len(result.Violations) > 0 {
-		stagingDir := fmt.Sprintf("%s/%s/pool-root-snapshot", o.cfg.StateDir, o.runID)
-		if staged := pool.StageRootSnapshot(stagingDir); staged != "" {
+		if staged := pool.StageRootSnapshot(); staged != "" {
 			o.stagedRootSnapshot = staged
 			slog.Info("orchestrator: pool root snapshot staged for fast replay", "dir", staged)
 		}

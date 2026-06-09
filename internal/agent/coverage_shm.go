@@ -10,14 +10,33 @@ import (
 const coverageMapSize = 1 << 16 // 64K edges, matches QEMU patch
 
 // ShmCoverageReader reads coverage data directly from QEMU's shared memory
-// region, bypassing virtio-serial. The coverage bitmap is placed at offset
-// ram_size within /dev/shm/openthesis-{name} by the patched QEMU.
+// region, bypassing virtio-serial. The patched QEMU places the coverage
+// bitmap at offset ram_size within /dev/shm/openthesis-{name}.
 //
-// Layout:
+// Shared memory file layout (/dev/shm/openthesis-{name}):
 //
-//	[0,           ramSize)       guest RAM
-//	[ramSize,     ramSize+64K)   coverage bitmap
-//	[ramSize+64K, ramSize+64K+8) generation counter (uint64)
+//   byte offset        size     field
+//   -----------------  -------  ----------------------------------
+//   0                  ramSize  guest RAM (not mapped here)
+//   ramSize            64K      edge bitmap (AFL-style hit counts)
+//   ramSize + 64K      8        generation counter (uint64 LE)
+//
+// Collect gates copies on the generation counter:
+//
+//   QEMU (patched)              ShmCoverageReader.Collect()
+//   ------------------          ------------------------------------
+//   writes edge bitmap          gen = LE64(mapped[64K : 64K+8])
+//   increments gen      ------> if gen == r.lastGen: return nil
+//                               r.lastGen = gen
+//                               copy(buf, mapped[0 : 64K])
+//                               return buf
+//
+// Only the coverage region is mmap'd. The mmap offset is page-aligned;
+// mapped is a sub-slice that starts at the bitmap.
+//
+//   [0,           ramSize)        guest RAM
+//   [ramSize,     ramSize+64K)    coverage bitmap
+//   [ramSize+64K, ramSize+64K+8)  generation counter (uint64)
 type ShmCoverageReader struct {
 	name      string
 	shmPath   string
@@ -28,11 +47,10 @@ type ShmCoverageReader struct {
 }
 
 // NewShmCoverageReader creates a coverage reader that mmaps the shared memory
-// file at the coverage bitmap offset.
-//
-// Returns an error if the shm file doesn't contain the coverage bitmap
-// (stock QEMU without patches). This prevents SIGBUS from accessing
-// pages beyond the file's actual size on tmpfs.
+// file at the coverage bitmap offset. Returns an error if the file is too
+// small to contain the coverage region; stock QEMU (TCG) creates shm files
+// of exactly ramSize and accessing beyond that via mmap causes SIGBUS on
+// tmpfs. Patched QEMU is required.
 func NewShmCoverageReader(name, shmPath string, ramSizeMB uint64) (*ShmCoverageReader, error) {
 	ramSize := ramSizeMB * 1024 * 1024
 	totalSize := ramSize + coverageMapSize + 8
@@ -44,8 +62,6 @@ func NewShmCoverageReader(name, shmPath string, ramSizeMB uint64) (*ShmCoverageR
 	defer f.Close()
 
 	// Verify the file is large enough to contain the coverage bitmap.
-	// Stock QEMU (TCG) creates shm files of exactly ramSize; accessing
-	// beyond that via mmap causes SIGBUS on tmpfs.
 	fi, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("coverage shm stat: %w", err)
@@ -54,11 +70,11 @@ func NewShmCoverageReader(name, shmPath string, ramSizeMB uint64) (*ShmCoverageR
 		return nil, fmt.Errorf("coverage shm too small: %d < %d (no coverage bitmap; patched QEMU required)", fi.Size(), totalSize)
 	}
 
-	// mmap just the coverage region (64K + 8 bytes for generation counter).
+	// Map only the coverage region: 64K bitmap + 8-byte generation counter.
 	mapOffset := int64(ramSize)
 	mapSize := coverageMapSize + 8
 
-	// Align offset to page boundary.
+	// mmap requires a page-aligned offset.
 	pageSize := int64(syscall.Getpagesize())
 	alignedOffset := (mapOffset / pageSize) * pageSize
 	extraBytes := mapOffset - alignedOffset
@@ -84,21 +100,20 @@ func (r *ShmCoverageReader) Name() string {
 	return r.name
 }
 
-// Collect reads the coverage bitmap from shared memory.
-// Returns nil if the generation counter hasn't changed since last read.
+// Collect reads the coverage bitmap from shared memory. Returns nil if the
+// generation counter has not changed since the last read.
 func (r *ShmCoverageReader) Collect() ([]byte, error) {
 	if len(r.mapped) < coverageMapSize+8 {
 		return nil, fmt.Errorf("coverage shm: mapped region too small")
 	}
 
-	// Read generation counter.
 	gen := binary.LittleEndian.Uint64(r.mapped[coverageMapSize:])
 	if gen == r.lastGen {
-		return nil, nil // No new coverage since last read.
+		return nil, nil // no new coverage since last read
 	}
 	r.lastGen = gen
 
-	// Copy bitmap (don't return the mmap'd slice directly).
+	// Return a copy; do not expose the mmap'd slice directly.
 	buf := make([]byte, coverageMapSize)
 	copy(buf, r.mapped[:coverageMapSize])
 	return buf, nil

@@ -87,7 +87,6 @@ type ctrlResponse struct {
 	SnapshotID    string          `json:"snapshot_id,omitempty"`
 	VirtualTimeNS int64           `json:"virtual_time_ns,omitempty"`
 	RNGSeed       uint64          `json:"rng_seed,omitempty"`
-	// Firecracker DST: reported by ping to indicate PMC availability.
 	PMCActive bool `json:"pmc_active,omitempty"`
 }
 
@@ -145,25 +144,15 @@ func (h *GVisorHypervisor) Start(ctx context.Context, cfg VMConfig) (*VM, error)
 		return nil, fmt.Errorf("hypervisor start mkdir state: %w", err)
 	}
 
-	// Secondary containers (SandboxID != "") share the sandbox of the primary.
-	// They are added via "runsc create --sandbox <id>" and started with
-	// "runsc start <name>", then share the primary's ctrl connection.
 	if cfg.SandboxID != "" {
 		return h.startSecondaryContainer(ctx, cfg, sandboxDir, stateRoot)
 	}
 
-	// The sentry (sandbox) runs in an isolated network namespace, so abstract
-	// Unix sockets it creates are not visible in the host netns. We dial them
-	// by entering the sentry's netns via syscall.Setns (see gvisor_linux.go).
-	// A filesystem fallback path is kept so discoverSockets can also find any
-	// socket the sentry may have created on the host filesystem.
 	ctrlSocket := "@openthesis-" + cfg.Name
 	fallbackCtrlSocket := filepath.Join(stateRoot, "openthesis-"+cfg.Name+".sock")
 	serialSocket := filepath.Join(sandboxDir, "serial.sock")
 	platform := strings.TrimSpace(os.Getenv("OPENTHESIS_GVISOR_PLATFORM"))
 	if platform == "" {
-		// kvm gives hardware-accelerated execution with full TSC control for
-		// DST virtual-time injection. Falls back to ptrace via env override.
 		platform = "kvm"
 	}
 	os.Remove(fallbackCtrlSocket)
@@ -189,9 +178,6 @@ func (h *GVisorHypervisor) Start(ctx context.Context, cfg VMConfig) (*VM, error)
 
 	var args []string
 	if cfg.SandboxID != "" {
-		// Join an existing sandbox. runsc create adds this container to the
-		// sandbox owned by cfg.SandboxID, sharing its network namespace,
-		// virtual clock, and DST RNG. A subsequent "runsc start" activates it.
 		slog.Info("gvisor: joining existing sandbox",
 			"vm", cfg.Name, "sandbox", cfg.SandboxID)
 		args = append(args, globalArgs...)
@@ -202,7 +188,6 @@ func (h *GVisorHypervisor) Start(ctx context.Context, cfg VMConfig) (*VM, error)
 			cfg.Name,
 		)
 	} else {
-		// Create a new sandbox and start the container in one step.
 		args = append(args, globalArgs...)
 		args = append(args,
 			"run",
@@ -279,8 +264,6 @@ func (h *GVisorHypervisor) Start(ctx context.Context, cfg VMConfig) (*VM, error)
 			}
 		}
 
-		// The sentry binds the abstract socket in its own isolated network
-		// namespace. If the host-side probe missed it, enter the sentry's netns.
 		if ctrlConn == nil && cmd.Process != nil {
 			if conn, err := probeInSentryNetNS(ctx, cmd.Process.Pid, ctrlSocket); err == nil {
 				ctrlConn = conn
@@ -348,7 +331,6 @@ func (h *GVisorHypervisor) startSecondaryContainer(ctx context.Context, cfg VMCo
 		platform = "kvm"
 	}
 
-	// Run "runsc create --sandbox <sandboxID> --bundle <bundle> <name>".
 	createArgs := []string{
 		"--root", stateRoot,
 		"--log", filepath.Join(sandboxDir, "runsc-create.log"),
@@ -366,7 +348,6 @@ func (h *GVisorHypervisor) startSecondaryContainer(ctx context.Context, cfg VMCo
 			cfg.Name, createErr, strings.TrimSpace(string(createOut)))
 	}
 
-	// Run "runsc start <name>" to activate the container.
 	startArgs := []string{"--root", stateRoot, "start", cfg.Name}
 	startOut, startErr := exec.CommandContext(ctx, h.binary, startArgs...).CombinedOutput()
 	if startErr != nil {
@@ -382,8 +363,6 @@ func (h *GVisorHypervisor) startSecondaryContainer(ctx context.Context, cfg VMCo
 		Config:  cfg,
 	}
 
-	// Register the secondary container. It shares the sandbox's ctrl connection
-	// and process handle; its cancel/exited channel mirrors the sandbox owner.
 	gc := &gvisorContainer{
 		vm:       vm,
 		ctrlConn: ownerGC.ctrlConn,
@@ -417,22 +396,19 @@ func (h *GVisorHypervisor) StartMulti(ctx context.Context, cfgs []VMConfig) ([]*
 
 	vms := make([]*VM, 0, len(cfgs))
 
-	// Start primary container (creates sandbox).
 	primaryCfg := cfgs[0]
-	primaryCfg.SandboxID = "" // ensure no SandboxID on primary
+	primaryCfg.SandboxID = ""
 	primary, err := h.Start(ctx, primaryCfg)
 	if err != nil {
 		return nil, fmt.Errorf("gvisor StartMulti: primary %s: %w", primaryCfg.Name, err)
 	}
 	vms = append(vms, primary)
 
-	// Start secondary containers, all joining the primary's sandbox.
 	for _, cfg := range cfgs[1:] {
 		cfg.SandboxID = primaryCfg.Name
 		vm, err := h.Start(ctx, cfg)
 		if err != nil {
-			// Stop already-started containers on failure.
-			for _, started := range vms {
+				for _, started := range vms {
 				_ = h.Stop(ctx, started)
 			}
 			return nil, fmt.Errorf("gvisor StartMulti: secondary %s: %w", cfg.Name, err)
@@ -443,19 +419,7 @@ func (h *GVisorHypervisor) StartMulti(ctx context.Context, cfgs []VMConfig) ([]*
 	slog.Info("gvisor StartMulti: all containers started",
 		"count", len(vms), "sandbox", primaryCfg.Name)
 
-	// Sync-start barrier: ensure every container begins from an identical
-	// virtual state regardless of how long each runsc process took to start.
-	//
-	// Without this, OS scheduling of the separate runsc processes during
-	// startup causes containers to receive different amounts of virtual time
-	// before the first burst. In Raft, whichever container got more virtual
-	// time wins the election timeout first, producing Run 1 ≠ Run 2+.
-	//
-	// All containers in a sandbox share ONE sentry process (one scheduler,
-	// one VirtualClock, one DST RNG). Pause + set-time + set-seed affects
-	// all of them via the single shared ctrl socket.
 	if err := h.syncStart(primaryCfg.Name, primaryCfg.Seed); err != nil {
-		// Stop every container we already started so we don't leak sandboxes.
 		for _, started := range vms {
 			_ = h.Stop(ctx, started)
 		}
@@ -481,11 +445,9 @@ func (h *GVisorHypervisor) syncStart(primaryName string, seed uint64) error {
 	if resp := h.sendCtrl(gc, "pause", nil); !resp.OK {
 		return fmt.Errorf("sync-start pause: %s", resp.Error)
 	}
-	// Reset virtual clock to 0 so all containers start at the same epoch.
 	if resp := h.sendCtrl(gc, "set-time", map[string]any{"nanos": int64(0)}); !resp.OK {
 		slog.Warn("gvisor sync-start: set-time unavailable", "err", resp.Error)
 	}
-	// Re-seed the DST RNG so the scheduling sequence matches the configured seed.
 	if resp := h.sendCtrl(gc, "set-seed", map[string]any{"seed": seed}); !resp.OK {
 		slog.Warn("gvisor sync-start: set-seed unavailable", "err", resp.Error)
 	}
@@ -567,17 +529,6 @@ func (h *GVisorHypervisor) Snapshot(ctx context.Context, vm *VM) (snapshot.ID, e
 		rngSeed: resp.RNGSeed,
 	}
 
-	// Attempt a real filesystem checkpoint via "runsc checkpoint --leave-running".
-	// This writes the full container memory state (heap, goroutine stacks,
-	// open FDs) to disk so that Restore can start a new container from this
-	// exact program state rather than re-running from the OCI bundle entry point.
-	//
-	// --leave-running keeps the current container alive after the checkpoint
-	// image is written, so exploration continues uninterrupted.
-	//
-	// On failure (e.g. sentry build without checkpoint support, or insufficient
-	// disk space) we fall back to DST-metadata-only mode, where Restore kills
-	// and restarts the container from the beginning (slow but correct).
 	h.mu.RLock()
 	cfg, hasCfg := h.configs[vm.ID]
 	h.mu.RUnlock()
@@ -618,13 +569,11 @@ func (h *GVisorHypervisor) Restore(ctx context.Context, vm *VM, id snapshot.ID) 
 		return err
 	}
 
-	// Retrieve saved DST metadata.
 	h.mu.RLock()
 	meta, hasMeta := h.snapshots[id]
 	h.mu.RUnlock()
 
 	if !hasMeta {
-		// Ask the sentry for the metadata (it may still have it in-tree).
 		resp := h.sendCtrl(gc, "restore", map[string]any{"id": fmt.Sprintf("snap-%d", id)})
 		if !resp.OK {
 			return fmt.Errorf("hypervisor restore: %s: %w", resp.Error, ErrRestoreFailed)
@@ -632,17 +581,10 @@ func (h *GVisorHypervisor) Restore(ctx context.Context, vm *VM, id snapshot.ID) 
 		meta = &gvisorSnapshotMeta{clockNS: resp.VirtualTimeNS, rngSeed: resp.RNGSeed}
 	}
 
-	// If a real filesystem checkpoint exists, use runsc restore for true
-	// memory-state branching. This is the preferred path: we CoW-copy the
-	// checkpoint directory (O(1) on XFS reflink) then start a new container
-	// from the image, giving exact program-state replay without re-running
-	// the SUT entry point or waiting for setup_complete.
 	if meta.checkpointDir != "" {
 		if err := h.restoreFromCheckpoint(ctx, vm, meta); err != nil {
 			slog.Warn("gvisor restore: runsc restore failed, falling back to container restart",
 				"vm", vm.ID, "snapshot", id, "err", err)
-			// Clear the checkpoint dir so future Restore calls don't retry
-			// the same broken path for this snapshot.
 			h.mu.Lock()
 			meta.checkpointDir = ""
 			h.mu.Unlock()
@@ -651,8 +593,6 @@ func (h *GVisorHypervisor) Restore(ctx context.Context, vm *VM, id snapshot.ID) 
 		return nil
 	}
 
-	// Try soft restore: set-time + set-seed via ctrl socket.
-	// Fast path when the sentry supports these commands.
 	timeResp := h.sendCtrl(gc, "set-time", map[string]any{"nanos": meta.clockNS})
 	seedResp := h.sendCtrl(gc, "set-seed", map[string]any{"seed": meta.rngSeed})
 
@@ -661,7 +601,6 @@ func (h *GVisorHypervisor) Restore(ctx context.Context, vm *VM, id snapshot.ID) 
 		return nil
 	}
 
-	// Soft restore failed. Fall back to full container restart.
 	slog.Info("gvisor restore: soft restore unavailable, restarting container",
 		"vm", vm.ID, "snapshot", id,
 		"set_time_err", timeResp.Error, "set_seed_err", seedResp.Error)
@@ -686,42 +625,33 @@ func (h *GVisorHypervisor) restartContainer(ctx context.Context, vm *VM, meta *g
 		return fmt.Errorf("hypervisor restore: no setup waiter registered: %w", ErrRestoreFailed)
 	}
 
-	// Stop the running container.
 	if err := h.Stop(ctx, vm); err != nil {
 		slog.Warn("gvisor restore: stop failed (proceeding with restart)", "err", err)
 	}
 
-	// Clean up stale state directory so runsc doesn't conflict.
 	sandboxDir := filepath.Join(h.stateDir, cfg.Name)
 	stateRoot := filepath.Join(sandboxDir, "state")
 	_ = os.RemoveAll(stateRoot)
 	_ = os.MkdirAll(stateRoot, 0o750)
 
-	// Re-launch the container with the same config.
 	newVM, err := h.Start(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("hypervisor restore restart: %w", err)
 	}
 
-	// Update the caller's VM pointer to reflect the new process.
 	vm.PID = newVM.PID
 	vm.Status = newVM.Status
 	vm.QMPPath = newVM.QMPPath
 
-	// Wait for the SUT to reach setup_complete.
 	if err := setupWaiter(ctx, vm.ID); err != nil {
 		return fmt.Errorf("hypervisor restore setup: %w", err)
 	}
 
-	// Apply DST metadata to the freshly-started container.
 	gc, err := h.lookup(vm.ID)
 	if err != nil {
 		return fmt.Errorf("hypervisor restore lookup after restart: %w", err)
 	}
 
-	// Try to set the DST parameters. If the commands aren't supported,
-	// the container still starts with the default epoch/seed, which is
-	// deterministic but won't branch differently without seed variation.
 	h.sendCtrl(gc, "set-time", map[string]any{"nanos": meta.clockNS})
 	h.sendCtrl(gc, "set-seed", map[string]any{"seed": meta.rngSeed})
 
@@ -743,7 +673,6 @@ func (h *GVisorHypervisor) restoreFromCheckpoint(ctx context.Context, vm *VM, me
 		return fmt.Errorf("no config for %s", vm.ID)
 	}
 
-	// Stop the current container before restoring.
 	if err := h.Stop(ctx, vm); err != nil {
 		slog.Warn("gvisor restore: stop failed (proceeding)", "vm", vm.ID, "err", err)
 	}
@@ -753,8 +682,6 @@ func (h *GVisorHypervisor) restoreFromCheckpoint(ctx context.Context, vm *VM, me
 	_ = os.RemoveAll(stateRoot)
 	_ = os.MkdirAll(stateRoot, 0o750)
 
-	// CoW-copy the checkpoint directory. On XFS with reflink support this is
-	// O(1); on other filesystems cp falls back to a regular data copy.
 	restoreDir := filepath.Join(sandboxDir, "restore", fmt.Sprintf("r-%d", time.Now().UnixNano()))
 	if err := os.MkdirAll(filepath.Dir(restoreDir), 0o750); err != nil {
 		return fmt.Errorf("mkdir restore parent: %w", err)
@@ -765,8 +692,6 @@ func (h *GVisorHypervisor) restoreFromCheckpoint(ctx context.Context, vm *VM, me
 		return fmt.Errorf("copy checkpoint dir: %w; output: %s", cpErr, strings.TrimSpace(string(cpOut)))
 	}
 
-	// Build runsc restore command. Uses the same flags as Start but with
-	// "restore --image-path" instead of "run --bundle".
 	ctrlSocket := "@openthesis-" + cfg.Name
 	platform := strings.TrimSpace(os.Getenv("OPENTHESIS_GVISOR_PLATFORM"))
 	if platform == "" {
@@ -812,7 +737,6 @@ func (h *GVisorHypervisor) restoreFromCheckpoint(ctx context.Context, vm *VM, me
 		close(waitErr)
 	}()
 
-	// Wait for the ctrl socket to become available.
 	var ctrlConn net.Conn
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -827,7 +751,6 @@ func (h *GVisorHypervisor) restoreFromCheckpoint(ctx context.Context, vm *VM, me
 			ctrlConn = conn
 			break
 		}
-		// Also try netns probe for abstract sockets.
 		if cmd.Process != nil {
 			if conn, err := probeInSentryNetNS(ctx, cmd.Process.Pid, ctrlSocket); err == nil {
 				ctrlConn = conn
@@ -878,9 +801,6 @@ func (h *GVisorHypervisor) restoreFromCheckpoint(ctx context.Context, vm *VM, me
 
 	go h.monitor(gc)
 
-	// Re-apply DST metadata. The restored sentry resumes from the checkpointed
-	// virtual clock value, but we set it explicitly to ensure clock consistency
-	// in case the sentry's restore path resets it.
 	h.sendCtrl(gc, "set-time", map[string]any{"nanos": meta.clockNS})
 	h.sendCtrl(gc, "set-seed", map[string]any{"seed": meta.rngSeed})
 
@@ -897,12 +817,10 @@ func (h *GVisorHypervisor) DeleteSnapshot(ctx context.Context, vm *VM, id snapsh
 	delete(h.snapshots, id)
 	h.mu.Unlock()
 
-	// Remove checkpoint directory if one was written to disk.
 	if meta != nil && meta.checkpointDir != "" {
 		_ = os.RemoveAll(meta.checkpointDir)
 	}
 
-	// Ask the sentry to prune its in-memory snapshot entry.
 	if gc, err := h.lookup(vm.ID); err == nil {
 		h.sendCtrl(gc, "prune", map[string]any{"id": fmt.Sprintf("snap-%d", id)})
 	}
@@ -1010,23 +928,14 @@ func (h *GVisorHypervisor) RunForInstructions(ctx context.Context, vm *VM, instr
 		return err
 	}
 
-	// Attempt instruction-count-based burst via the OpenThesis ctrl socket.
-	// The patched gVisor sentry implements "run-burst" in runsc/dst/ctrl.go:
-	// it resumes the deterministic scheduler, advances N virtual instruction
-	// quanta (each quantum ≈ 10ms virtual), then pauses again. This gives
-	// reproducible burst lengths across simulation runs.
 	resp := h.sendCtrl(gc, "run-burst", map[string]any{"instructions": instructions})
 	if resp.OK {
-		// Record the burst length to the quantum tape for replay.
 		h.mu.Lock()
 		h.quantumTape = append(h.quantumTape, instructions)
 		h.mu.Unlock()
 		return nil
 	}
 
-	// run-burst is unavailable (old sentry build without patch 7). Fall back
-	// to a wall-clock sleep. Record 0 to the tape to mark a non-replayable
-	// burst so the replay subsystem can detect the gap.
 	slog.Debug("gvisor run-burst unavailable, falling back to wall-clock sleep",
 		"vm", vm.ID, "err", resp.Error)
 	h.mu.Lock()

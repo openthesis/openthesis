@@ -19,24 +19,9 @@ import (
 	"github.com/openthesis/openthesis/internal/testconfig"
 )
 
-// cmdRecord implements `openthesis record --artifact <dir> --config <cfg>`:
-// re-runs a violation with QEMU record/replay enabled, capturing an execution
-// trace that can be replayed deterministically with GDB for time-travel debugging.
-//
-// Workflow:
-//
-//  1. Find a violation:  openthesis run --backend tcg ...
-//  2. Record the trace:  openthesis record --artifact violations/v-000/ --config openthesis.json
-//  3. Debug it:          openthesis debug --artifact violations/v-000/ --qemu /path/to/qemu --kernel /path/to/vmlinuz
-//     > gdb  (in the REPL)
-//
-// The replay.bin trace is written inside the artifact directory and the
-// manifest.json is updated so that subsequent `openthesis debug` invocations
-// can find it automatically.
-//
-// Only the TCG and patched-QEMU backends support record/replay; Firecracker
-// and gVisor do not have QEMU's built-in rr mechanism. Use `openthesis replay`
-// with those backends for plain deterministic re-execution.
+// cmdRecord implements `openthesis record --artifact <dir> --config <cfg>`.
+// Re-runs a violation with QEMU record/replay and writes replay.bin into the
+// artifact directory. Only TCG and patched-QEMU backends support rr.
 func cmdRecord(args []string) int {
 	fs := flag.NewFlagSet("record", flag.ExitOnError)
 	artifactDir := fs.String("artifact", otctx.ResolveArtifact(""), "path to violation artifact directory (required)")
@@ -180,7 +165,6 @@ Flags:
 		fmt.Printf("  violation reproduced: step %d\n", result.Matched.Step)
 	}
 
-	// Verify the trace file was actually written.
 	if _, err := os.Stat(replayFile); err != nil {
 		fmt.Fprintf(os.Stderr, "\nerror: replay.bin not found after recording: %v\n", err)
 		fmt.Fprintln(os.Stderr, "  QEMU record/replay may not be supported on this system.")
@@ -193,7 +177,6 @@ Flags:
 	}))
 	fmt.Println()
 
-	// Update the artifact manifest with the replay.bin path.
 	artifact.ReplayFile = replayFile
 	manifestData, err := json.MarshalIndent(artifact, "", "  ")
 	if err == nil {
@@ -201,7 +184,6 @@ Flags:
 		_ = os.WriteFile(filepath.Join(absArtifact, "artifact.json"), manifestData, 0o644)
 	}
 
-	// Write a replay-gdb.sh helper so the user has a ready-made command.
 	kernelPath := testCfg.KernelPath
 	writeReplayGDBScript(absArtifact, replayFile, kernelPath, *qemu, memMB, 1234)
 

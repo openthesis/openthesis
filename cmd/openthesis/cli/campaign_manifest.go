@@ -105,7 +105,6 @@ func saveCampaignManifest(stateDir string, m *CampaignManifest) error {
 // <stateDir>/violations/ pointing to any violations found in roundDir.
 // It returns the list of violation IDs created.
 func recordRound(stateDir, roundDir string, meta RoundMeta) ([]string, error) {
-	// Write per-round meta.json.
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal round meta: %w", err)
@@ -114,7 +113,6 @@ func recordRound(stateDir, roundDir string, meta RoundMeta) ([]string, error) {
 		return nil, fmt.Errorf("write round meta: %w", err)
 	}
 
-	// Scan roundDir/violations/ and create symlinks in stateDir/violations/.
 	violSrc := filepath.Join(roundDir, "violations")
 	entries, err := os.ReadDir(violSrc)
 	if err != nil {
@@ -188,7 +186,7 @@ func otStateBase() string {
 // sanitizeCampaignName replaces characters that are unsafe for directory names.
 func sanitizeCampaignName(name string) string {
 	b := make([]byte, 0, len(name))
-	for i := 0; i < len(name); i++ {
+	for i := range len(name) {
 		c := name[i]
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' {
 			b = append(b, c)

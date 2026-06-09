@@ -78,24 +78,16 @@ func filterAfter(entries []fault.ScheduleEntry, stepCutoff uint64) []fault.Sched
 }
 
 // ComputeLikelihood determines when a violation became inevitable by probing
-// the reproduction rate at VM snapshot branch points.
-//
-// For each of 5 checkpoints spanning 0% to 100% of the violation step,
-// it:
-//  1. Runs a "setup replay" with the full fault schedule up to that step,
-//     saving the VM's state (Raft log, committed data, leader election) as a
-//     branch snapshot. For the Firecracker backend this is a true hypervisor
-//     snapshot; for other backends it falls back to schedule truncation.
-//  2. Runs N continuation trials from that saved snapshot, injecting only the
-//     faults that occurred after the branch point.
-//
-// This ensures the system's internal state at each branch point is preserved
-// exactly as it was during the original violation run - unlike schedule
-// truncation, which starts from root and may diverge in leader election, log
-// state, and other non-deterministic initialization.
-//
-// The resulting probability curve reveals when the violation became likely:
-// a spike from near-zero to high probability indicates the causal window.
+// the reproduction rate at VM snapshot branch points. For each of 5 checkpoints
+// spanning 0% to 100% of the violation step, it runs a setup replay with the
+// full fault schedule up to that step, saving the VM's state as a branch
+// snapshot (a true hypervisor snapshot on Firecracker; schedule truncation on
+// other backends), then runs N continuation trials from that snapshot injecting
+// only the faults after the branch point. This preserves the system's internal
+// state exactly as it was during the original run, unlike schedule truncation
+// which may diverge in leader election or log state. The resulting probability
+// curve reveals the causal window: a spike from near-zero to high probability
+// pinpoints when the violation became likely.
 //
 // cfg.FaultSchedulePath or artifact.FaultSchedule must be set.
 // cfg.Seed defaults to artifact.Seed.

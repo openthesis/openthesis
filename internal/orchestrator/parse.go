@@ -12,6 +12,20 @@ type parsedLifecycle struct {
 	details   map[string]any
 }
 
+// decodeStatusDetails unmarshals a JSON payload into a {Status, Details} body
+// and appends a parsedLifecycle with the given eventType to results.
+// Returns the updated slice.
+func decodeStatusDetails(results []parsedLifecycle, eventType string, payload json.RawMessage) []parsedLifecycle {
+	var body struct {
+		Status  string         `json:"status"`
+		Details map[string]any `json:"details"`
+	}
+	if json.Unmarshal(payload, &body) == nil {
+		results = append(results, parsedLifecycle{eventType: eventType, details: body.Details})
+	}
+	return results
+}
+
 // parseLifecycleOutput scans JSONL data for OpenThesis lifecycle events.
 func parseLifecycleOutput(data []byte) []parsedLifecycle {
 	var results []parsedLifecycle
@@ -28,16 +42,7 @@ func parseLifecycleOutput(data []byte) []parsedLifecycle {
 		}
 
 		if payload, ok := raw["openthesis_setup_complete"]; ok {
-			var body struct {
-				Status  string         `json:"status"`
-				Details map[string]any `json:"details"`
-			}
-			if json.Unmarshal(payload, &body) == nil {
-				results = append(results, parsedLifecycle{
-					eventType: "setup_complete",
-					details:   body.Details,
-				})
-			}
+			results = decodeStatusDetails(results, "setup_complete", payload)
 		}
 
 		if payload, ok := raw["openthesis_send_event"]; ok {
@@ -54,42 +59,15 @@ func parseLifecycleOutput(data []byte) []parsedLifecycle {
 		}
 
 		if payload, ok := raw["openthesis_teardown"]; ok {
-			var body struct {
-				Status  string         `json:"status"`
-				Details map[string]any `json:"details"`
-			}
-			if json.Unmarshal(payload, &body) == nil {
-				results = append(results, parsedLifecycle{
-					eventType: "teardown",
-					details:   body.Details,
-				})
-			}
+			results = decodeStatusDetails(results, "teardown", payload)
 		}
 
 		if payload, ok := raw["openthesis_prefork"]; ok {
-			var body struct {
-				Status  string         `json:"status"`
-				Details map[string]any `json:"details"`
-			}
-			if json.Unmarshal(payload, &body) == nil {
-				results = append(results, parsedLifecycle{
-					eventType: "openthesis_prefork",
-					details:   body.Details,
-				})
-			}
+			results = decodeStatusDetails(results, "openthesis_prefork", payload)
 		}
 
 		if payload, ok := raw["openthesis_burst_done"]; ok {
-			var body struct {
-				Status  string         `json:"status"`
-				Details map[string]any `json:"details"`
-			}
-			if json.Unmarshal(payload, &body) == nil {
-				results = append(results, parsedLifecycle{
-					eventType: "openthesis_burst_done",
-					details:   body.Details,
-				})
-			}
+			results = decodeStatusDetails(results, "openthesis_burst_done", payload)
 		}
 
 		if payload, ok := raw["openthesis_stop_faults"]; ok {
@@ -323,15 +301,15 @@ func parseRandomChoiceOutput(data []byte) []parsedRandomChoice {
 	return results
 }
 
+var strategyNames = map[string]explorer.Strategy{
+	"breadth": explorer.StrategyBreadthFirst,
+	"depth":   explorer.StrategyDepthFirst,
+	"mcts":    explorer.StrategyMCTS,
+}
+
 func parseStrategy(s string) explorer.Strategy {
-	switch s {
-	case "breadth":
-		return explorer.StrategyBreadthFirst
-	case "depth":
-		return explorer.StrategyDepthFirst
-	case "mcts":
-		return explorer.StrategyMCTS
-	default:
-		return explorer.StrategyCoverageGuided
+	if strat, ok := strategyNames[s]; ok {
+		return strat
 	}
+	return explorer.StrategyCoverageGuided
 }

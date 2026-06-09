@@ -20,9 +20,8 @@ import (
 )
 
 // cmdBranch implements `openthesis branch --artifact <dir> --config <cfg>`.
-// It performs causal attribution by running N parallel replay branches with
-// each fault kind individually removed, revealing which fault is responsible
-// for the violation.
+// Runs N replay branches with each fault kind individually removed to identify
+// which fault is causally responsible for the violation.
 func cmdBranch(args []string) int {
 	fs := flag.NewFlagSet("branch", flag.ExitOnError)
 	artifactDir := fs.String("artifact", "", "path to violation artifact directory (required)")
@@ -133,8 +132,6 @@ Flags:
 	fmt.Fprintf(os.Stderr, "  property:          %s\n", c.red(artifact.Property))
 	fmt.Fprintf(os.Stderr, "  trials per config: %d\n\n", *trials)
 
-	var progressMu strings.Builder
-	_ = progressMu
 	progressFn := orchestrator.BranchProgressFunc(func(faultKind string, trial, total int, reproduced bool) {
 		kind := "baseline"
 		if faultKind != "" {
@@ -204,7 +201,6 @@ Flags:
 	}
 	fmt.Fprintln(os.Stderr)
 
-	// Machine-readable JSON summary to stdout.
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(result)

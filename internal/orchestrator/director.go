@@ -153,7 +153,6 @@ func (d *CampaignDirector) Run(ctx context.Context, progress chan<- DirectorStat
 		seed := d.cfg.BaseSeed + uint64(d.round)*phiStride
 		roundStart := time.Now()
 
-		// Apply escalation to fault config.
 		testCfg := d.escalator.Apply(d.cfg.TestConfig)
 		testCfg.Exploration.Seed = seed
 
@@ -199,7 +198,6 @@ func (d *CampaignDirector) Run(ctx context.Context, progress chan<- DirectorStat
 			edges = result.Explorer.TotalEdges
 			violationCount = len(result.Explorer.Violations)
 
-			// Persist violations.
 			if violationCount > 0 {
 				recs := store.ViolationsFromExplorer(
 					result.Explorer.Violations,
@@ -212,7 +210,6 @@ func (d *CampaignDirector) Run(ctx context.Context, progress chan<- DirectorStat
 				}
 			}
 
-			// Persist fault arm history.
 			if result.Report != nil && len(result.Report.FaultArms) > 0 {
 				armStats := make([]fault.ArmStats, len(result.Report.FaultArms))
 				for i, a := range result.Report.FaultArms {
@@ -227,7 +224,6 @@ func (d *CampaignDirector) Run(ctx context.Context, progress chan<- DirectorStat
 				}
 			}
 
-			// Regression detection.
 			if len(result.Explorer.PropertyCounts) > 0 {
 				snap := buildAssertionSnapshot(result.Explorer.PropertyCounts, d.round, seed)
 				alerts, err := d.regression.Record(snap)
@@ -240,17 +236,11 @@ func (d *CampaignDirector) Run(ctx context.Context, progress chan<- DirectorStat
 				}
 			}
 
-			// Update saturation detector using round-over-round edge growth.
-			// The pool's NewEdges counter is not corpus-adjusted for the parallel path,
-			// so we compare TotalEdges against the previous round instead. If coverage
-			// is flat across rounds, we're saturated.
 			edgeGrowth := int64(edges) - int64(d.prevTotalEdges)
 			if edgeGrowth < 0 {
 				edgeGrowth = 0
 			}
 			d.prevTotalEdges = edges
-			// Scale growth into a per-burst estimate: spread the round's growth
-			// evenly across the estimated burst count so the window fills correctly.
 			burstEstimate := estimateBursts(states, d.cfg.Parallel)
 			if burstEstimate <= 0 {
 				burstEstimate = 1
@@ -276,7 +266,6 @@ func (d *CampaignDirector) Run(ctx context.Context, progress chan<- DirectorStat
 				"multiplier", d.escalator.Multiplier())
 		}
 
-		// Reset evolver on violation (exploration found something - keep going).
 		if violationCount > 0 {
 			d.evolver.Reset()
 		}

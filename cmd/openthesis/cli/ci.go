@@ -1,12 +1,3 @@
-// Package cli - ci.go implements the `openthesis ci` command.
-//
-// Designed for CI/CD pipelines:
-//   - Runs exploration with CI-appropriate defaults (5m, parallel=4)
-//   - Exits 0 if no NEW violations, exits 1 if new violations found
-//   - Emits GitHub Actions workflow commands (::error::) for annotations
-//   - Posts a PR comment when GITHUB_TOKEN + GITHUB_REPOSITORY + PR_NUMBER are set
-//   - Writes JUnit XML to --output (default: openthesis-results.xml)
-//   - Prints clean non-ANSI output suitable for CI logs
 package cli
 
 import (

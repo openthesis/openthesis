@@ -7,12 +7,35 @@ import (
 )
 
 // Tree manages a tree of VM snapshots for state space exploration.
-// Invariants (from formal spec):
+// Invariants:
 //   - No orphan snapshots (every non-root has existing parent)
 //   - Parent depth < child depth
 //   - Exactly one root
 //   - Children links are bidirectional
 //   - Current snapshot exists
+//
+// Each snapshot holds a full copy of VM state at one burst boundary.
+// Depth increases downward. IDs are tree-local sequential integers.
+//
+//	root (ID=0, depth=0)
+//	 |
+//	 +-- snap A (ID=1, depth=1, parentID=0)  <- burst from root
+//	 |    |
+//	 |    +-- snap C (ID=3, depth=2, parentID=1)  <- burst from A
+//	 |    |
+//	 |    +-- snap D (ID=4, depth=2, parentID=1)  <- burst from A, different seed
+//	 |
+//	 +-- snap B (ID=2, depth=1, parentID=0)  <- burst from root, different faults
+//	      |
+//	      +-- snap E (ID=5, depth=2, parentID=2)
+//
+// The GC walker (Prune) starts from each frontier entry and walks to root,
+// marking ancestors "keep". Everything unmarked is deleted except root.
+// Low-scoring frontier entries are Trim()'d first so their subtrees lose
+// the keep flag. Depth is unbounded; the caller caps it via exploration config.
+//
+//	frontier = {C, E}  =>  keep: root, A, C, B, E
+//	                        delete: D  (not in frontier, not ancestor of C or E)
 type Tree struct {
 	mu        sync.RWMutex
 	snapshots map[ID]*Snapshot
@@ -181,7 +204,7 @@ func (t *Tree) PathToRoot(id ID) []ID {
 		current = snap.ParentID
 	}
 
-	// Reverse so the path is root → violation.
+	// Reverse so the path is root -> violation.
 	path := make([]ID, len(reversed))
 	for i, v := range reversed {
 		path[len(reversed)-1-i] = v

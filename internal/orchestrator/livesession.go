@@ -171,13 +171,7 @@ func (ls *LiveSession) Exec(ctx context.Context, cmd string, timeoutSeconds int)
 
 	ls.lastUsed = time.Now()
 
-	msg := struct {
-		Type    string `json:"type"`
-		Payload struct {
-			Cmd            string `json:"cmd"`
-			TimeoutSeconds int    `json:"timeout_seconds"`
-		} `json:"payload"`
-	}{Type: "exec"}
+	msg := execMsg{Type: "exec"}
 	msg.Payload.Cmd = cmd
 	msg.Payload.TimeoutSeconds = timeoutSeconds
 

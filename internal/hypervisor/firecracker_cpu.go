@@ -3,6 +3,7 @@ package hypervisor
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -43,7 +44,7 @@ func newIsolatedCPUPool() (*isolatedCPUPool, error) {
 func (p *isolatedCPUPool) next() (int, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for i := 0; i < len(p.cpus); i++ {
+	for i := range len(p.cpus) {
 		slot := (p.idx + i) % len(p.cpus)
 		if p.free[slot] {
 			p.free[slot] = false
@@ -78,19 +79,20 @@ func parseCPUList(s string) ([]int, error) {
 			continue
 		}
 		if dash := strings.Index(part, "-"); dash >= 0 {
-			var lo, hi int
-			if _, err := fmt.Sscanf(part[:dash], "%d", &lo); err != nil {
+			lo, err := strconv.Atoi(part[:dash])
+			if err != nil {
 				return nil, fmt.Errorf("cpu list parse %q: %w", part, err)
 			}
-			if _, err := fmt.Sscanf(part[dash+1:], "%d", &hi); err != nil {
+			hi, err := strconv.Atoi(part[dash+1:])
+			if err != nil {
 				return nil, fmt.Errorf("cpu list parse %q: %w", part, err)
 			}
 			for c := lo; c <= hi; c++ {
 				cpus = append(cpus, c)
 			}
 		} else {
-			var c int
-			if _, err := fmt.Sscanf(part, "%d", &c); err != nil {
+			c, err := strconv.Atoi(part)
+			if err != nil {
 				return nil, fmt.Errorf("cpu list parse %q: %w", part, err)
 			}
 			cpus = append(cpus, c)

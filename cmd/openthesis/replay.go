@@ -75,9 +75,6 @@ func cmdReplay(args []string) int {
 		RequirePMC: true, // replay must be deterministic; refuse to start without PMC
 	}
 
-	// If a replay file is provided, enable QEMU record/replay mode.
-	// This launches QEMU in replay mode with a GDB server for time-travel debugging.
-	// Use: gdb -ex "target remote :1234" -ex "reverse-continue" vmlinux
 	if *replayFile != "" {
 		if _, err := os.Stat(*replayFile); err != nil {
 			slog.Error("replay file not found", "path", *replayFile, "err", err)
@@ -116,21 +113,13 @@ func cmdReplay(args []string) int {
 		"timeline", dbg.Timeline(),
 	)
 
-	// Block until interrupted.
 	<-ctx.Done()
 	slog.Info("replay interrupted")
 	return 0
 }
 
-// cmdReplayArtifact implements `openthesis replay --artifact <dir>`:
-// a deterministic reproduction of a previously recorded violation.
-//
-// It loads the artifact manifest, reconstructs a RunConfig pointing at the
-// bundled fault schedule, drives the orchestrator through a fresh run, and
-// compares the resulting violations against the recorded ones. Exit code
-// 0 means the violation reproduced; exit code 2 means it did not (a signal
-// worth acting on; the system may be non-deterministic). Exit code 1 is
-// reserved for infrastructural failures (bad artifact, boot error, etc.).
+// cmdReplayArtifact implements `openthesis replay --artifact <dir>`.
+// Exit codes: 0=reproduced, 1=infrastructure failure, 2=did not reproduce (--verify only).
 func cmdReplayArtifact(args []string) int {
 	fs := flag.NewFlagSet("replay-artifact", flag.ExitOnError)
 	artifactDir := fs.String("artifact", otctx.ResolveArtifact(""), "path to violation artifact directory")
@@ -197,17 +186,11 @@ func cmdReplayArtifact(args []string) int {
 		return 1
 	}
 
-	// The recorded seed takes precedence over whatever is in the test
-	// config: deterministic replay must use the same PRNG seed as the
-	// original run.
 	testCfg.Exploration.Seed = artifact.Seed
 	if *duration != "" {
 		testCfg.Duration = *duration
 	}
 
-	// Backend selection: the artifact's recorded backend is canonical,
-	// but the operator may override it when cross-checking (e.g. replay
-	// a Firecracker artifact under TCG as a differential test).
 	backendStr := artifact.Backend
 	if *backendOverride != "" {
 		backendStr = *backendOverride
@@ -304,13 +287,9 @@ func cmdReplayArtifact(args []string) int {
 	return 0
 }
 
-// cmdShrink implements `openthesis shrink --artifact <dir> --config <cfg.json>`:
-// ddmin minimization of a violation's fault schedule.
-//
-// Iteratively replays the exploration with subsets of the original fault
-// schedule until the smallest subset that still triggers the violation is
-// found. Writes the minimized schedule to --output (default:
-// <artifact-dir>/fault-schedule-minimal.json).
+// cmdShrink implements `openthesis shrink --artifact <dir> --config <cfg.json>`.
+// Minimizes the fault schedule via ddmin; writes result to --output
+// (default: <artifact-dir>/fault-schedule-minimal.json).
 func cmdShrink(args []string) int {
 	fs := flag.NewFlagSet("shrink", flag.ExitOnError)
 	artifactDir := fs.String("artifact", "", "path to violation artifact directory (required)")
@@ -426,13 +405,11 @@ func cmdShrink(args []string) int {
 		fmt.Fprintf(os.Stderr, "%s", line)
 		lastLine = line
 		if reproduced {
-			// Print newline on successful reduction so history is visible.
 			fmt.Fprintf(os.Stderr, "\n")
 			lastLine = ""
 		}
 	})
 	if !isTerminal(os.Stderr) {
-		// Non-TTY (CI): just use slog for progress; no ANSI tricks.
 		progressFn = nil
 	}
 

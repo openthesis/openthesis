@@ -55,7 +55,6 @@ func DefaultVMConfig(name string, seed uint64) VMConfig {
 //
 // This means guest time.Sleep(500ms) completes in microseconds of real
 // time. The workload can complete hundreds of iterations per burst.
-// QEMUArgs builds the QEMU command-line arguments from a VMConfig.
 // The qemuBinary path is used to detect the guest architecture: a binary
 // named qemu-system-aarch64 produces arm64 machine flags, anything else
 // produces x86_64 flags. Pass "" to default to x86_64.
@@ -71,12 +70,10 @@ func QEMUArgsForBinary(binary string, cfg VMConfig, qmpSocket, serialSocket, con
 func qemuArgsForBinary(binary string, cfg VMConfig, qmpSocket, serialSocket, consoleLog string) []string {
 	arch := guestArchFromBinary(binary)
 
-	// Build icount flags. When record/replay is enabled, add rr= and rrfile=.
 	icountFlags := "shift=7,sleep=off,align=off"
 	if cfg.RecordReplay == "record" || cfg.RecordReplay == "replay" {
 		icountFlags += fmt.Sprintf(",rr=%s,rrfile=%s", cfg.RecordReplay, cfg.ReplayFile)
 		if cfg.RecordReplay == "record" {
-			// Create an initial snapshot at recording start so replay can begin from it.
 			icountFlags += ",rrsnapshot=init"
 		}
 	}
@@ -120,7 +117,6 @@ func qemuArgsForBinary(binary string, cfg VMConfig, qmpSocket, serialSocket, con
 		if strings.HasSuffix(cfg.RootFSPath, ".qcow2") {
 			format = "qcow2"
 		}
-		// Record/replay requires the blkreplay driver wrapper for deterministic I/O.
 		if cfg.RecordReplay != "" {
 			args = append(args,
 				"-drive", fmt.Sprintf("file=%s,format=%s,if=none,id=img-direct,snapshot=on", cfg.RootFSPath, format),
@@ -139,14 +135,12 @@ func qemuArgsForBinary(binary string, cfg VMConfig, qmpSocket, serialSocket, con
 	)
 
 	args = append(args,
-		"-serial", fmt.Sprintf("file:%s", consoleLog), // kernel console output to log file
+		"-serial", fmt.Sprintf("file:%s", consoleLog),
 		"-chardev", fmt.Sprintf("socket,id=virtserial0,path=%s,server=on,wait=off", serialSocket),
 		"-device", "virtio-serial",
-		"-device", "virtserialport,chardev=virtserial0,name=agent.0", // creates /dev/vport0p1 in guest
+		"-device", "virtserialport,chardev=virtserial0,name=agent.0",
 	)
 
-	// Deterministic MAC so network-level replays match.
-	// Record/replay needs filter-replay on the network backend.
 	args = append(args,
 		"-netdev", "user,id=net0",
 		"-device", fmt.Sprintf("virtio-net-pci,netdev=net0,mac=%s", DeterministicMAC(cfg.Seed)),
@@ -155,9 +149,6 @@ func qemuArgsForBinary(binary string, cfg VMConfig, qmpSocket, serialSocket, con
 		args = append(args, "-object", "filter-replay,id=replay,netdev=net0")
 	}
 
-	// GDB server for time-travel debugging. -S pauses execution at startup;
-	// the GDB client must send "continue" to start or "reverse-continue" to
-	// replay backwards from the end.
 	if cfg.GDBPort > 0 && cfg.RecordReplay == "replay" {
 		args = append(args, "-gdb", fmt.Sprintf("tcp::%d", cfg.GDBPort), "-S")
 	}
@@ -174,7 +165,6 @@ func qemuArgsForBinary(binary string, cfg VMConfig, qmpSocket, serialSocket, con
 //   - Uses memory-backend-file on /dev/shm instead of -m for shared memory
 //   - Uses -numa node,memdev=mem to attach the shared backend
 func PatchedQEMUArgs(cfg VMConfig, qmpSocket, serialSocket, consoleLog string) []string {
-	// Build icount flags. When record/replay is enabled, add rr= and rrfile=.
 	icountFlags := "shift=7,sleep=off,align=off"
 	if cfg.RecordReplay == "record" || cfg.RecordReplay == "replay" {
 		icountFlags += fmt.Sprintf(",rr=%s,rrfile=%s", cfg.RecordReplay, cfg.ReplayFile)
@@ -210,7 +200,6 @@ func PatchedQEMUArgs(cfg VMConfig, qmpSocket, serialSocket, consoleLog string) [
 		if strings.HasSuffix(cfg.RootFSPath, ".qcow2") {
 			format = "qcow2"
 		}
-		// Record/replay requires the blkreplay driver wrapper for deterministic I/O.
 		if cfg.RecordReplay != "" {
 			args = append(args,
 				"-drive", fmt.Sprintf("file=%s,format=%s,if=none,id=img-direct,snapshot=on", cfg.RootFSPath, format),
@@ -235,7 +224,6 @@ func PatchedQEMUArgs(cfg VMConfig, qmpSocket, serialSocket, consoleLog string) [
 		"-device", "virtserialport,chardev=virtserial0,name=agent.0",
 	)
 
-	// Deterministic MAC so network-level replays match.
 	args = append(args,
 		"-netdev", "user,id=net0",
 		"-device", fmt.Sprintf("virtio-net-pci,netdev=net0,mac=%s", DeterministicMAC(cfg.Seed)),
@@ -251,7 +239,7 @@ func PatchedQEMUArgs(cfg VMConfig, qmpSocket, serialSocket, consoleLog string) [
 	return args
 }
 
-// KernelCmdline returns the kernel command line for deterministic boot.
+// KernelCmdline returns the kernel command line for x86_64 deterministic boot.
 // Each flag eliminates a source of non-determinism:
 //   - nokaslr: disables KASLR so code addresses are fixed
 //   - random.trust_cpu=off: prevents seeding from hardware RDRAND
@@ -268,8 +256,6 @@ func PatchedQEMUArgs(cfg VMConfig, qmpSocket, serialSocket, consoleLog string) [
 //     The Go runtime reads GORANDSEED in runtime.randinit() to seed the global PRNG
 //     deterministically, making map iteration, select, math/rand, and the goroutine
 //     scheduler reproducible across runs with the same seed.
-//
-// KernelCmdline returns the kernel command line for x86_64 deterministic boot.
 func KernelCmdline(seed uint64) string {
 	return KernelCmdlineForArch(seed, "x86_64")
 }
@@ -304,14 +290,13 @@ func KernelCmdlineForArch(seed uint64, arch string) string {
 // The locally-administered bit is set (02:xx:xx:xx:xx:xx) to avoid collisions
 // with real hardware OUIs.
 func DeterministicMAC(seed uint64) string {
-	// Mix the seed with SplitMix64 constants for good bit distribution.
 	z := seed + 0x9e3779b97f4a7c15
 	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
 	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
 	z ^= (z >> 31)
 
 	b := [6]byte{
-		0x02, // locally administered, unicast
+		0x02,
 		byte(z >> 8),
 		byte(z >> 16),
 		byte(z >> 24),

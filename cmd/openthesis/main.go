@@ -29,7 +29,6 @@ func main() {
 
 	subcmd := os.Args[1]
 
-	// Thin-client subcommands that require a running server.
 	thinClientCmds := map[string]func([]string, *apiclient.Client) int{
 		"project":  cli.CmdProject,
 		"env":      cli.CmdEnv,
@@ -69,10 +68,6 @@ func main() {
 		}
 		os.Exit(cmdRun(os.Args[2:]))
 	case "replay":
-		// Routing precedence (flags determine mode):
-		//   --finding / --token  → thin client (delegates to server)
-		//   --artifact           → local deterministic reproduction
-		//   (default)            → legacy single-snapshot restore
 		switch {
 		case hasFlag(os.Args[2:], "--finding", "--token"):
 			client := newAPIClient(os.Args[2:])
@@ -99,9 +94,6 @@ func main() {
 	case "debug":
 		os.Exit(cmdDebug(os.Args[2:]))
 	case "report":
-		// Routing precedence:
-		//   `report generate` subcommand or --test flag → thin client
-		//   (default) → local HTML report generation
 		switch {
 		case len(os.Args) > 2 && os.Args[2] == "generate":
 			client := newAPIClient(os.Args[3:])
@@ -121,8 +113,6 @@ func main() {
 	case "status":
 		os.Exit(cli.CmdStatus(os.Args[2:]))
 	case "serve":
-		// API server mode requires at least one explicit API flag (--addr, --qemu, etc.).
-		// Everything else routes to the local report viewer, including bare `serve` and `serve --help`.
 		if hasAPIServerFlags(os.Args[2:]) {
 			os.Exit(cmdServe(os.Args[2:]))
 		}
@@ -192,7 +182,6 @@ Run "openthesis <command> --help" for flags specific to each command.
 `)
 }
 
-// newAPIClient extracts --server and --api-key from args and returns a Client.
 func newAPIClient(args []string) *apiclient.Client {
 	server := os.Getenv("OPENTHESIS_SERVER")
 	apiKey := os.Getenv("OPENTHESIS_API_KEY")
@@ -211,7 +200,6 @@ func newAPIClient(args []string) *apiclient.Client {
 	return apiclient.New(server, apiKey)
 }
 
-// trimServerFlag removes --server and --api-key (and their values) from args.
 func trimServerFlag(args []string) []string {
 	skip := map[string]bool{"--server": true, "--api-key": true}
 	out := make([]string, 0, len(args))
@@ -235,7 +223,6 @@ func hasAPIServerFlags(args []string) bool {
 	return hasFlag(args, "--addr", "--qemu", "--runsc", "--kernel", "--init-binary")
 }
 
-// hasFlag returns true if any of the given flag names appear in args.
 func hasFlag(args []string, flags ...string) bool {
 	fm := make(map[string]bool, len(flags))
 	for _, f := range flags {
@@ -301,10 +288,7 @@ func defaultStateDir() string {
 }
 
 // realUserHomeDir returns the home directory of the real (pre-sudo) user.
-// Tries three sources in order:
-//  1. SUDO_USER env var (set by sudo when invoked directly)
-//  2. /proc/self/loginuid (survives sudo -s / sudo su / nested sudo)
-//  3. os.UserHomeDir() fallback
+// Tries SUDO_USER, /proc/self/loginuid, then os.UserHomeDir().
 func realUserHomeDir() string {
 	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" && sudoUser != "root" {
 		if u, err := osuser.Lookup(sudoUser); err == nil {

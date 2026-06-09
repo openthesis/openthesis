@@ -16,16 +16,23 @@ const (
 )
 
 // CoverageTracker tracks edge coverage using an AFL-style bitmap,
-// augmented with IJON-style feedback channels for deeper state-space
-// exploration.
-// AFL technical details: https://lcamtuf.coredump.cx/afl/technical_details.txt
-// IJON (maximizing inputs): https://github.com/RUB-SysSec/ijon (IEEE S&P 2020)
+// augmented with IJON-style feedback channels.
+// AFL: https://lcamtuf.coredump.cx/afl/technical_details.txt
+// IJON: https://github.com/RUB-SysSec/ijon (IEEE S&P 2020)
 //
-// Three feedback channels:
-//  1. Bitmap: standard AFL edge coverage (from guest instrumentation)
-//  2. Max map: IJON_MAX hill-climbing (from guidance.MaximizeInt)
-//  3. State/assertion hashing: IJON_SET-style (from guidance.Explore
-//     and assertion novelty), hashed directly into the bitmap
+// A (src_pc, dst_pc) pair is hashed into a bitmap slot:
+//
+//   (src_pc, dst_pc) -> FNV-1a -> slot = hash % mapSize
+//
+//   bitmap[slot]   uint8   hit count, saturating at 255
+//   virgin[slot]   0xFF = never hit; 0x00 = seen
+//   edgeHits[slot] uint32  across-run frequency (FairFuzz scoring)
+//
+// Three feedback channels feed novelty into the bitmap:
+//
+//   channel 1: bitmap  - KCOV edge hits drained from guest at burst boundary
+//   channel 2: maxMap  - IJON_MAX per-name maximum; new max -> bitmap edge
+//   channel 3: virgin  - IJON_SET and assertion novelty hashed into bitmap
 type CoverageTracker struct {
 	mu         sync.RWMutex
 	mapSize    int     // number of edge slots (power of two)
@@ -139,7 +146,7 @@ func (c *CoverageTracker) Update(edges []byte) bool {
 // For "maximize" signals (IJON_MAX): tracks in a separate max map.
 // When a value exceeds the previous maximum for that name, the state is
 // marked interesting. The value is also bucketed and hashed into the bitmap
-// so that crossing thresholds (0→1, 10→20, 100→200) creates coverage edges.
+// so that crossing thresholds (0->1, 10->20, 100->200) creates coverage edges.
 func (c *CoverageTracker) UpdateGuidance(guidanceType, name string, value int64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -373,10 +380,14 @@ func (c *CoverageTracker) Hash() uint64 {
 }
 
 // hitBucket maps a raw hit count to an AFL-style bucket index.
-// AFL uses logarithmic buckets so that hitting an edge once vs twice is
-// treated differently, but hitting it 100 vs 127 times is not.
-// Bucket boundaries: 1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128+.
-// https://lcamtuf.coredump.cx/afl/technical_details.txt ("Detecting new behaviors")
+// https://lcamtuf.coredump.cx/afl/technical_details.txt
+//
+// Hit counts are bucketed logarithmically. Hitting an edge once vs twice
+// is distinct; hitting it 100 vs 127 times is not. A bucket transition
+// counts as new coverage regardless of the raw count.
+//
+//   count : 0  1  2  3  4-7  8-15  16-31  32-127  128+
+//   bucket: 0  1  2  3   4    5      6       7      8
 func hitBucket(count uint8) uint8 {
 	switch {
 	case count == 0:

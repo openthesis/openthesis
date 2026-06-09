@@ -20,12 +20,28 @@ import (
 	"github.com/openthesis/openthesis/internal/snapshot"
 )
 
-// explore runs the full phased exploration loop using burst-run-observe.
+// explore runs the burst-run-observe loop. The workload runs continuously
+// inside the guest. Bursts are bounded by PMC instruction count; coverage
+// and assertions are drained between each burst.
 //
-// Instead of sending individual commands per step, the workload runs
-// continuously inside the guest. Exploration uses QMP stop/cont to
-// control execution in short bursts (~5ms), draining coverage and
-// assertions between each burst.
+//	+-----------------------------------------------+
+//	| frontier: priority queue, scored UCB1/AFLFast |
+//	+-----------------------------------------------+
+//	     |
+//	     v  PopFrontier: pick highest-scoring snapshot
+//	restore VM  (~5ms in-place mmap+CPU restore, ~55ms kill+restart fallback)
+//	     |
+//	     v  SetSeed + inject faults (drop/delay/partition, hang/terminate)
+//	run burst  (N instructions via PMC, shift=7: 1 insn = 128ns virtual)
+//	     |
+//	     v  flush_coverage + drain vsock output
+//	collect coverage (KCOV delta over vsock, or SHM bitmap for patched backend)
+//	     |
+//	     +-- new edges? --> takeSnapshotPaused, push child to frontier
+//	     |                  update UCB1 reward, MCTS backpropagate
+//	     +-- violation? --> ReportViolation, save artifact, maybe stop
+//	     |
+//	     v  pop next frontier entry, or restart from root
 func (o *Orchestrator) explore(ctx context.Context) (*explorer.Result, error) {
 	start := time.Now()
 	duration := o.cfg.TestConfig.ParsedDuration()

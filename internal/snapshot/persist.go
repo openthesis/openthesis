@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,9 +10,8 @@ import (
 )
 
 // treeState is the on-disk representation of a snapshot tree.
-// We only persist the history (never-pruned log of all nodes) plus enough
-// metadata to reconstruct topology for the notebook. The live snapshot map
-// is NOT persisted; snapshots themselves live in the hypervisor.
+// Only the history (a never-pruned log of all nodes) plus metadata is persisted.
+// The live snapshot map is not persisted; snapshots themselves live in the hypervisor.
 type treeState struct {
 	NextID  ID         `json:"next_id"`
 	Current ID         `json:"current"`
@@ -20,7 +20,6 @@ type treeState struct {
 
 // SaveTree writes the tree's full node history to path as JSON.
 // The parent directory is created if it does not exist.
-// Safe to call concurrently with Append (acquires read lock on history).
 func SaveTree(t *Tree, path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("snapshot persist: mkdir: %w", err)
@@ -40,7 +39,6 @@ func SaveTree(t *Tree, path string) error {
 		return fmt.Errorf("snapshot persist: marshal: %w", err)
 	}
 
-	// Write atomically via tmp file + rename.
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return fmt.Errorf("snapshot persist: write: %w", err)
@@ -53,9 +51,8 @@ func SaveTree(t *Tree, path string) error {
 }
 
 // LoadTree reconstructs a Tree from a previously saved state file.
-// The returned tree has the history restored but an empty live snapshot map
-// (hypervisor snapshots are not available after a cold restart). It is
-// suitable for offline analysis and the notebook API; not for live exploration.
+// The returned tree has the history restored but an empty live snapshot map;
+// suitable for offline analysis, not for live exploration.
 func LoadTree(path string) (*Tree, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -67,7 +64,6 @@ func LoadTree(path string) (*Tree, error) {
 		return nil, fmt.Errorf("snapshot persist: unmarshal: %w", err)
 	}
 
-	// Rebuild the live snapshot map from history so that topology queries work.
 	snaps := make(map[ID]*Snapshot, len(state.History))
 	root := &Snapshot{
 		ID:       RootID,
@@ -96,23 +92,11 @@ func LoadTree(path string) (*Tree, error) {
 		snaps[n.ID] = snap
 	}
 
-	// Wire up Children links.
-	// Determinism: sort keys, Go map iteration is randomized.
-	// The order of parent.Children entries is observable downstream in
-	// Ancestors/PathToRoot/MCTS selection, so load order must be stable.
 	snapIDs := make([]ID, 0, len(snaps))
 	for id := range snaps {
 		snapIDs = append(snapIDs, id)
 	}
-	slices.SortFunc(snapIDs, func(a, b ID) int {
-		if a < b {
-			return -1
-		}
-		if a > b {
-			return 1
-		}
-		return 0
-	})
+	slices.SortFunc(snapIDs, func(a, b ID) int { return cmp.Compare(a, b) })
 	for _, id := range snapIDs {
 		if id == RootID {
 			continue

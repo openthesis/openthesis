@@ -27,11 +27,6 @@ type SometimesAllEval struct {
 
 // RecordSometimesAllEval updates the SometimesAll tracker with a new evaluation.
 // Returns the boost to add to the frontier entry's SometimesBoost.
-//
-// Boost formula:
-//   - Progress toward more simultaneous sub-goals: (count/total) * 5000
-//   - New best count: +3000
-//   - Full conjunction achieved: +10000
 func RecordSometimesAllEval(
 	tracker map[string]*SometimesAllState,
 	eval SometimesAllEval,
@@ -48,15 +43,12 @@ func RecordSometimesAllEval(
 
 	boost := 0.0
 
-	// Base boost proportional to satisfaction ratio.
 	if eval.TotalCount > 0 {
 		boost += float64(eval.SatisfiedCount) / float64(eval.TotalCount) * 5000.0
 	}
 
-	// New best; we achieved more simultaneous sub-goals than ever before.
 	if eval.SatisfiedCount > state.BestCount {
 		state.BestCount = eval.SatisfiedCount
-		// Copy the sub-goal state.
 		state.BestSubGoals = make(map[string]bool, len(eval.SubGoals))
 		for k, v := range eval.SubGoals {
 			state.BestSubGoals[k] = v
@@ -64,7 +56,6 @@ func RecordSometimesAllEval(
 		boost += 3000.0
 	}
 
-	// Full conjunction achieved.
 	if eval.SatisfiedCount == eval.TotalCount && eval.TotalCount > 0 && !state.Satisfied {
 		state.Satisfied = true
 		boost += 10000.0
@@ -73,11 +64,9 @@ func RecordSometimesAllEval(
 	return boost
 }
 
-// SometimesAllCoverageKey generates a unique hash key for the current
-// combination of satisfied sub-goals. Used to register novel combinations
-// as coverage in the bitmap.
+// SometimesAllCoverageKey generates a stable key for the current combination of
+// satisfied sub-goals, used to register novel combinations as coverage in the bitmap.
 func SometimesAllCoverageKey(name string, subGoals map[string]bool) string {
-	// Sort true sub-goals for deterministic key.
 	var trueGoals []string
 	for k, v := range subGoals {
 		if v {

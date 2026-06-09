@@ -86,7 +86,6 @@ Flags:
 		return 1
 	}
 
-	// Auto-detect config if not specified.
 	resolvedConfig := *configPath
 	if resolvedConfig == "" {
 		for _, candidate := range []string{
@@ -101,7 +100,6 @@ Flags:
 		}
 	}
 
-	// Optionally load the full report for tree/events.
 	var rpt *report.Report
 	if *reportPath != "" {
 		data, rerr := os.ReadFile(*reportPath)

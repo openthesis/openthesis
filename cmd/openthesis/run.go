@@ -52,14 +52,12 @@ func cmdRun(args []string) int {
 	devAddr := fs.String("dev-addr", os.Getenv("OPENTHESIS_DEV_ADDR"), "start live developer observability dashboard at this address (e.g. :6060)")
 	fs.Parse(args)
 
-	// Ensure state directory exists before computing log path.
 	if err := os.MkdirAll(*stateDir, 0o750); err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot create state directory %s: %v\n", *stateDir, err)
 		fmt.Fprintf(os.Stderr, "       fix: check permissions on %s or pass --state-dir <writable-path>\n", filepath.Dir(*stateDir))
 		return 1
 	}
 
-	// Compute log file path.
 	resolvedLogFile := *logFile
 	if resolvedLogFile == "" {
 		resolvedLogFile = fmt.Sprintf("%s/run-%d.log", *stateDir, time.Now().Unix())
@@ -106,7 +104,6 @@ func cmdRun(args []string) int {
 		return 1
 	}
 
-	// Apply CLI overrides.
 	if *seed != 0 {
 		testCfg.Exploration.Seed = *seed
 	}
@@ -120,8 +117,6 @@ func cmdRun(args []string) int {
 		testCfg.KernelPath = defaultKernelPath()
 	}
 
-	// Config setup_timeout sets the default; CLI --setup-timeout overrides it.
-	// Orchestrator adds a 2-minute buffer so setup_complete arrives before timeout.
 	setupDur, _ := time.ParseDuration(*setupTimeout)
 	if *setupTimeout == "5m" && testCfg.SetupTimeout != "" {
 		// CLI was at default; use config value + 2m buffer for orchestrator wait.
@@ -129,7 +124,6 @@ func cmdRun(args []string) int {
 			setupDur = d + 2*time.Minute
 		}
 	}
-	// Use config memory_mb as the base; --memory flag overrides when non-zero.
 	memMB := testCfg.MemoryMB
 	if *memory != 0 {
 		memMB = *memory
@@ -152,9 +146,6 @@ func cmdRun(args []string) int {
 		return 1
 	}
 
-	// Auto-select the patched QEMU binary when --backend patched is used, unless
-	// the user explicitly overrode --qemu. The patched build installs as
-	// qemu-system-x86_64-patched to avoid clobbering the stock TCG binary.
 	if b == hypervisor.BackendPatched && *qemu == defaultQEMU() {
 		if p := defaultQEMUPatched(); p != *qemu {
 			*qemu = p
@@ -179,12 +170,8 @@ func cmdRun(args []string) int {
 		slog.Info("record/replay enabled", "replay_file", replayFile)
 	}
 
-	// Create the progress channel for the live TUI. Use a modest buffer so
-	// the orchestrator never blocks on a slow TUI render.
 	progressCh := make(chan orchestrator.ProgressEvent, 64)
 
-	// Start live developer observability server if --dev-addr was given.
-	// ctx is declared below; forward-reference resolved by starting server after ctx.
 	var obs *devobs.Observer
 	if *devAddr != "" {
 		obs = devobs.New()
@@ -225,7 +212,6 @@ func cmdRun(args []string) int {
 		return 1
 	}
 
-	// Run the orchestrator in a goroutine so the TUI can run on the main goroutine.
 	type runOutcome struct {
 		result *orchestrator.RunResult
 		err    error
@@ -237,7 +223,6 @@ func cmdRun(args []string) int {
 		close(progressCh)
 	}()
 
-	// Launch the live TUI (blocks until ProgressDone or q/ctrl+c).
 	if !*jsonLog {
 		dur := testCfg.ParsedDuration()
 		cmdtui.Run(cmdtui.Config{
@@ -247,14 +232,12 @@ func cmdRun(args []string) int {
 			Duration:    dur,
 		}, progressCh)
 	} else {
-		// JSON mode: drain the channel so the orchestrator goroutine is not blocked.
 		go func() {
 			for range progressCh {
 			}
 		}()
 	}
 
-	// Wait for the orchestrator to finish and collect the result.
 	outcome := <-runDone
 	if outcome.err != nil {
 		printRunError(outcome.err, *configPath, *backend)
@@ -282,8 +265,6 @@ func cmdRun(args []string) int {
 
 	artifactsDir := *stateDir + "/" + result.RunID + "/violations"
 
-	// Stamp each violation with its on-disk artifact directory so that HTML
-	// reports and downstream tools have a direct path without re-deriving it.
 	for i := range result.Report.Violations {
 		vDir := fmt.Sprintf("%s/violation-%03d-%s", artifactsDir, i,
 			report.SanitizeProperty(result.Report.Violations[i].Property))
@@ -292,7 +273,6 @@ func cmdRun(args []string) int {
 		}
 	}
 
-	// Save report to state directory so `openthesis serve` can display it.
 	reportsDir := *stateDir + "/reports"
 	var savedReportPath, savedHTMLPath string
 	if err := os.MkdirAll(reportsDir, 0o750); err == nil {
@@ -303,7 +283,6 @@ func cmdRun(args []string) int {
 			savedReportPath = rptPath
 			slog.Info("report saved", "path", rptPath)
 		}
-		// Auto-generate the self-contained HTML report alongside the JSON.
 		eventsPath := *stateDir + "/" + result.RunID + "/events.jsonl"
 		htmlPath := reportsDir + "/" + result.Report.RunID + ".html"
 		if err := reporthtml.Generate(result.Report, htmlPath, reporthtml.GenerateOptions{EventsPath: eventsPath}); err != nil {
@@ -314,7 +293,6 @@ func cmdRun(args []string) int {
 		}
 	}
 
-	// Persist run history for cross-run regression detection.
 	histDB, _ := history.Load(history.DefaultPath(*stateDir))
 	if histDB != nil {
 		violationKeys := make([]history.ViolationKey, len(result.Report.Violations))
@@ -334,7 +312,6 @@ func cmdRun(args []string) int {
 		}
 	}
 
-	// Auto-shrink: run ddmin on each violation's fault schedule.
 	var shrinkResults map[string]*orchestrator.ShrinkResult
 	if *autoShrink && len(result.Report.Violations) > 0 {
 		shrinkResults = make(map[string]*orchestrator.ShrinkResult)
@@ -379,7 +356,6 @@ func cmdRun(args []string) int {
 		}
 	}
 
-	// Classify violations against run history.
 	var classifications []history.Classification
 	var resolved []history.ViolationKey
 	if histDB != nil {
@@ -390,7 +366,6 @@ func cmdRun(args []string) int {
 		classifications, resolved = histDB.Classify(violationKeys)
 	}
 
-	// Deliver webhook and email notifications (non-fatal).
 	hasEmail := testCfg.Notifications.Email != nil && len(testCfg.Notifications.Email.To) > 0
 	if testCfg.Notifications.WebhookURL != "" || hasEmail {
 		var emailCfg *notify.EmailConfig
@@ -411,7 +386,6 @@ func cmdRun(args []string) int {
 			SlackFormat: testCfg.Notifications.SlackFormat,
 			Email:       emailCfg,
 		}
-		// One notification per violation, status derived from history classification.
 		for i, v := range result.Report.Violations {
 			status := "new"
 			for _, cls := range classifications {
@@ -432,7 +406,6 @@ func cmdRun(args []string) int {
 			}
 			notify.SendViolation(context.Background(), notifyCfg, ev) //nolint:errcheck
 		}
-		// Notify resolved violations.
 		for _, r := range resolved {
 			ev := notify.ViolationEvent{
 				RunID:    result.RunID,
@@ -442,15 +415,12 @@ func cmdRun(args []string) int {
 			}
 			notify.SendViolation(context.Background(), notifyCfg, ev) //nolint:errcheck
 		}
-		// run_complete.
 		notify.SendRunComplete(context.Background(), notifyCfg, result.RunID, //nolint:errcheck
 			result.Report.Summary.TotalStates, len(result.Report.Violations))
 	}
 
-	// Persist context so subsequent commands can omit --config, --state-dir, etc.
 	otctx.UpdateContext(result.RunID, *configPath, *stateDir, *backend, artifactsDir)
 
-	// Print a post-run summary to stderr so it's visible even with --json.
 	printRunSummary(os.Stderr, result, runSummaryOpts{
 		reportPath:      savedReportPath,
 		htmlReportPath:  savedHTMLPath,

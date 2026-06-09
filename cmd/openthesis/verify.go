@@ -465,7 +465,7 @@ func diffViolations(d *diffResult, v1, v2 []report.ViolationEntry) {
 	if len(v2) < n {
 		n = len(v2)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		a, b := v1[i], v2[i]
 		section := fmt.Sprintf("violations[%d]", i)
 		if a.Property != b.Property {
@@ -519,7 +519,7 @@ func diffTree(d *diffResult, t1, t2 []report.TreeNode) {
 	if len(s2) < n {
 		n = len(s2)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		a, b := s1[i], s2[i]
 		section := fmt.Sprintf("tree[%d]", i)
 		if a.ID != b.ID {
@@ -622,7 +622,7 @@ func diffCoverageTimeSeries(d *diffResult, ts1, ts2 []report.CoveragePoint) {
 	if len(ts2) < n {
 		n = len(ts2)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		a, b := ts1[i], ts2[i]
 		if a.Step != b.Step {
 			d.addMinor(fmt.Sprintf("coverage.time_series[%d]", i), "step",

@@ -184,7 +184,6 @@ func applyStatusBadges(entries []artifactEntry, stateDir string) {
 		latestSet[v] = true
 	}
 
-	// Build a map: ViolationKey -> list of run indices (0 = oldest) it appeared in.
 	type occurrence struct {
 		runIdx int
 		runID  string
@@ -218,7 +217,6 @@ func applyStatusBadges(entries []artifactEntry, stateDir string) {
 		inLatest := latestSet[key]
 
 		if !inLatest {
-			// Not in the most recent run.
 			if len(occs) > 0 {
 				entries[i].Status = "RESOLVED"
 			} else {
@@ -228,7 +226,6 @@ func applyStatusBadges(entries []artifactEntry, stateDir string) {
 			continue
 		}
 
-		// It's in the latest run. Count consecutive streak from the latest backwards.
 		consecutive := 0
 		for idx := latestIdx; idx >= 0; idx-- {
 			found := false
@@ -271,7 +268,6 @@ func artifactsList(args []string) int {
 
 	applyStatusBadges(entries, *stateDir)
 
-	// Build table rows.
 	rows := make([][]string, len(entries))
 	for i, e := range entries {
 		prop := e.Artifact.Property
@@ -328,7 +324,6 @@ func artifactsShow(args []string) int {
 	}
 	fmt.Print(KV(pairs))
 
-	// Show reproduce.sh path and content.
 	reproducePath := filepath.Join(match.Dir, "reproduce.sh")
 	if _, err := os.Stat(reproducePath); err == nil {
 		fmt.Printf("\n  %s\n", styleBold.Render("reproduce.sh"))

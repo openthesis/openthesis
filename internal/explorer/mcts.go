@@ -22,11 +22,26 @@ type MCTSNode struct {
 // MCTSSelector implements UCB1-based Monte Carlo Tree Search over the
 // snapshot tree. The snapshot tree IS the MCTS tree.
 // Alphuzz (ACSAC 2022): https://dl.acm.org/doi/epdf/10.1145/3564625.3564660
-// UCB1 formula: x_i + C * sqrt(ln(N) / n_i)
 //
-// Selection walks from root to a leaf using UCB1 at each branch point.
-// Backpropagation credits ancestor snapshots when descendants find new
-// coverage or bugs, giving principled exploration/exploitation tradeoff.
+// UCB1 scores each child as:
+//
+//   score = x_i + C * sqrt(ln(N) / n_i)
+//
+//   x_i  = average reward for child i (exploitation)
+//   n_i  = visit count for child i
+//   N    = visit count of parent
+//   C    = exploration constant (default sqrt(2))
+//
+// Tree structure:
+//
+//   root (N=50)
+//   +-- A (n=30, x=0.6)   <- UCB1 selects best child at each level
+//   |   +-- A1 (n=10)
+//   |   +-- A2 (n=0)      <- unvisited: selected before UCB1 applies
+//   +-- B (n=20, x=0.3)
+//
+// Select: walk root -> leaf via UCB1; unvisited children take priority.
+// Backpropagate: leaf -> root, visits++ and totalReward += reward at each node.
 type MCTSSelector struct {
 	mu    sync.RWMutex
 	nodes map[snapshot.ID]*MCTSNode

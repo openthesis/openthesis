@@ -85,9 +85,9 @@ func CmdInstall(args []string) int {
 }
 
 // findInstallScript searches for deploy/local/install in several locations:
-// 1. $OPENTHESIS_DEPLOY_DIR/local/install
-// 2. Adjacent to the running binary: <binary>/../deploy/local/install
-// 3. Relative to the working directory: ./deploy/local/install
+//   - $OPENTHESIS_DEPLOY_DIR/local/install
+//   - Adjacent to the running binary: <binary>/../deploy/local/install
+//   - Relative to the working directory: ./deploy/local/install
 func findInstallScript() string {
 	const rel = "local/install"
 

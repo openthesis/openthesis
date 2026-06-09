@@ -90,8 +90,6 @@ func runPlain(cfg Config, progressCh <-chan orchestrator.ProgressEvent, w io.Wri
 	}
 }
 
-// -- bubbletea model --
-
 const defaultWindowWidth = 80
 
 type model struct {
@@ -336,8 +334,6 @@ func truncate(s string, max int) string {
 	}
 	return string(runes[:max-3]) + "..."
 }
-
-// -- lipgloss styles --
 
 var (
 	headerStyle = lipgloss.NewStyle().

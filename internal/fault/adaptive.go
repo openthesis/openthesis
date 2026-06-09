@@ -9,15 +9,30 @@ import (
 	"github.com/openthesis/openthesis/internal/prng"
 )
 
-// AdaptiveFaultSelector uses multi-armed bandit (UCB1) to select which
-// fault types to inject based on coverage productivity (MOPT-style).
-// Arms that produce more new coverage get selected more often.
-// MOPT (mutator scheduling via PSO): https://www.usenix.org/conference/usenixsecurity19/presentation/lyu
+// AdaptiveFaultSelector implements multi-armed bandit (UCB1) fault selection.
+// Each fault kind is one arm. Arms that yield more new coverage edges are
+// selected more often (MOPT-style). Reference:
+//   https://www.usenix.org/conference/usenixsecurity19/presentation/lyu
 //
-// Rewards are edge counts (unbounded), so the exploitation term is normalized
-// by the running maximum average reward observed across all arms. This keeps
-// exploitation and exploration on the same scale, preventing high-reward arms
-// from immediately dominating and collapsing exploration.
+// UCB1 arm table after some pulls:
+//
+//  arm:      drop    delay   partition  hang    terminate
+//            ----    -----   ---------  ----    ---------
+//  pulls:     42      18         3       27          0
+//  avgRwd:   1.2     3.8       0.4      2.1          -
+//  exploit:  1.2/M   3.8/M    0.4/M    2.1/M       inf   <- pulls=0 -> inf
+//  explore:  c*sqrt(ln(T)/42)  ...     c*sqrt(...)  inf
+//  score:    E+e     E+e       E+e     E+e          inf   <- terminate wins
+//
+//  score = (avgReward / maxAvgReward) + c * sqrt(ln(totalPulls) / armPulls)
+//           ^-- exploitation (normalized)   ^-- exploration bonus
+//
+// Unvisited arms (pulls=0) score +inf and are drawn first in random order.
+// After all arms are visited, UCB1 balances exploitation vs. exploration via c.
+//
+// Rewards are edge counts (unbounded). The exploitation term is normalized by
+// the running maximum average reward across all arms. This keeps both terms on
+// the same scale and prevents high-reward arms from collapsing exploration.
 type AdaptiveFaultSelector struct {
 	mu        sync.Mutex
 	arms      map[Kind]*FaultArm

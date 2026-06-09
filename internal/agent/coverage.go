@@ -5,20 +5,36 @@ import (
 	"os"
 )
 
+// Full coverage pipeline (guest -> host):
+//
+//   KCOV (kernel paths)        SHM bitmap (libvoidstar)    uprobe hits
+//   -------------------------  --------------------------  ----------------------
+//   /sys/kernel/debug/kcov     /run/kcov_bitmap (64K)      /sys/kernel/
+//   buf[0]=count, buf[1..N]=PC AFL hit counts, MAP_SHARED  debug/tracing
+//         |                          |                           |
+//         v fold (prevPC>>1)^curPC   v copy on flush             v mergeIntoSlice
+//   shared bitmap[64K] <-----------+-----------------------------------------+
+//         |
+//         v diff against prevBitmap
+//   delta bitmap (only sent when new edges appear)
+//         |
+//         v base64 JSON over vsock
+//   host orchestrator: kcovState.flushAndSend -> sendCoverageToHost
+
 // CoverageSource provides edge coverage data from an instrumented process.
 type CoverageSource interface {
 	Name() string
 	Collect() ([]byte, error) // returns edge bitmap
 }
 
-// SharedMemCoverage reads coverage from a shared memory region (like AFL).
+// SharedMemCoverage reads a flat AFL-style bitmap from a shared memory file.
 type SharedMemCoverage struct {
 	name    string
 	shmPath string
 	size    int
 }
 
-// NewSharedMemCoverage creates a coverage source that reads from a shared memory file.
+// NewSharedMemCoverage creates a coverage source backed by a shared memory file.
 func NewSharedMemCoverage(name, shmPath string, size int) *SharedMemCoverage {
 	return &SharedMemCoverage{
 		name:    name,

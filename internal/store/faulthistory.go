@@ -16,16 +16,14 @@ var (
 )
 
 // FaultArmHistory persists UCB1 bandit arm statistics across campaign rounds.
-// Each round's arm stats are merged (halved for staleness decay) into the history
-// so later rounds benefit from accumulated learning without being dominated by
-// potentially out-of-date priors.
+// Each round's stats are merged with halving decay so recent rounds dominate.
 type FaultArmHistory struct {
 	db *bolt.DB
 }
 
 // FaultHistoryRecord is the persisted format for all arm statistics.
 type FaultHistoryRecord struct {
-	Rounds int              `json:"rounds"` // number of rounds contributing to this record
+	Rounds int              `json:"rounds"`
 	Arms   []fault.ArmStats `json:"arms"`
 }
 
@@ -52,11 +50,9 @@ func NewFaultArmHistory(path string) (*FaultArmHistory, error) {
 func (h *FaultArmHistory) Close() error { return h.db.Close() }
 
 // Merge updates the history with arm stats from a completed round.
-// Uses halving decay so recent rounds dominate over stale priors.
 func (h *FaultArmHistory) Merge(stats []fault.ArmStats) error {
 	existing, _ := h.Load()
 
-	// Build index by kind.
 	merged := make(map[fault.Kind]fault.ArmStats)
 	for _, a := range existing.Arms {
 		merged[a.Kind] = a

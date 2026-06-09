@@ -1,6 +1,6 @@
 # OpenThesis
 
-Open-source deterministic hypervisor platform for automated software testing - inspired by [Antithesis](https://antithesis.com/).
+Open-source deterministic hypervisor platform for automated software testing, inspired by [Antithesis](https://antithesis.com/).
 
 > **Status: under active development.** Certain execution paths may not work as intended. The TCG backend is fully deterministic but slow (~100 states/min). The Firecracker backend is fast (~1200 states/min) and fully deterministic when host KVM patches are applied (`make install-host-kernel`); without them (`no_host_patches: true`, the default for examples), it reaches approximately 99% KCOV edge determinism.
 

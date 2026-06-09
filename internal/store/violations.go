@@ -8,7 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
+	"strconv"
 	"time"
 
 	"github.com/openthesis/openthesis/internal/explorer"
@@ -20,15 +21,15 @@ var bucketViolations = []byte("violations")
 
 // ViolationRecord is a persisted violation from a prior campaign round.
 type ViolationRecord struct {
-	ID          string         `json:"id"` // unique: campaign+round+index
+	ID          string         `json:"id"`
 	CampaignID  string         `json:"campaign_id"`
 	Round       int            `json:"round"`
 	Property    string         `json:"property"`
 	Message     string         `json:"message"`
 	Step        uint64         `json:"step"`
 	Seed        uint64         `json:"seed"`
-	FaultKinds  []string       `json:"fault_kinds"`  // active at violation time
-	ArtifactDir string         `json:"artifact_dir"` // path on disk
+	FaultKinds  []string       `json:"fault_kinds"`
+	ArtifactDir string         `json:"artifact_dir"`
 	FoundAt     time.Time      `json:"found_at"`
 	Details     map[string]any `json:"details,omitempty"`
 }
@@ -40,8 +41,7 @@ type FaultProfile struct {
 	FaultRates map[string]float64 `json:"fault_rates"`
 }
 
-// ViolationCorpus is a persistent store of violations backed by bbolt.
-// It is append-only; violations are never deleted (for regression tracking).
+// ViolationCorpus is a persistent, append-only store of violations backed by bbolt.
 type ViolationCorpus struct {
 	db *bolt.DB
 }
@@ -111,7 +111,7 @@ func (c *ViolationCorpus) PropertyNames() ([]string, error) {
 	for n := range seen {
 		names = append(names, n)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	return names, nil
 }
 
@@ -131,7 +131,7 @@ func ViolationsFromExplorer(
 			kinds = fault.MaskToKinds(mask)
 		}
 		records[i] = ViolationRecord{
-			ID:          campaignID + "-" + itoa(round) + "-" + itoa(i),
+			ID:          campaignID + "-" + strconv.Itoa(round) + "-" + strconv.Itoa(i),
 			CampaignID:  campaignID,
 			Round:       round,
 			Property:    v.Property,
@@ -145,18 +145,4 @@ func ViolationsFromExplorer(
 		}
 	}
 	return records
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	buf := [20]byte{}
-	pos := len(buf)
-	for n > 0 {
-		pos--
-		buf[pos] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[pos:])
 }

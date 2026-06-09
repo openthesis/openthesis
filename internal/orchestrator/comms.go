@@ -27,14 +27,8 @@ func (o *Orchestrator) runPhaseCommands(ctx context.Context, kind composer.Comma
 			return
 		}
 		slog.Info("orchestrator: running command", "name", cmd.Name, "kind", cmd.Kind)
-		// Send while paused; buffers on virtio-serial until guest runs.
 		o.sendCommand(ctx, cmd)
 
-		// Deterministic completion: run fixed-size bursts (via advance-quantum)
-		// and check for command_done after each one. Each burst is exactly
-		// burstInsns instructions, so the total is always a multiple of
-		// burstInsns; deterministic across runs. The command_done signal
-		// controls when to stop looping, not the burst size.
 		const (
 			burstInsns uint64 = 50000000   // 50ms virtual time per burst
 			safetyCap  uint64 = 4800000000 // 4.8s virtual time max (enough for cluster setup)
@@ -52,7 +46,6 @@ func (o *Orchestrator) runPhaseCommands(ctx context.Context, kind composer.Comma
 			totalInsns += burstInsns
 			o.currentTimeNS += burstInsns * 128
 
-			// Drain output and check for command_done signal.
 			o.collectCoverage()
 			o.processOutput()
 			if o.listener != nil && o.listener.CheckCommandDone() {
@@ -66,7 +59,6 @@ func (o *Orchestrator) runPhaseCommands(ctx context.Context, kind composer.Comma
 				"cap_insns", safetyCap)
 		}
 
-		// Final drain for FIFO relay.
 		if err := o.hyp.RunForInstructions(ctx, o.vm, drainInsns); err != nil {
 			slog.Debug("orchestrator: command drain failed", "name", cmd.Name, "err", err)
 		}
@@ -120,8 +112,6 @@ func (o *Orchestrator) sendFlushCoverage() {
 	if o.listener == nil {
 		return
 	}
-	// SHM coverage reader is only present for the patched QEMU backend.
-	// When active, skip serial KCOV flush to avoid cross-burst data leakage.
 	if o.covReader != nil {
 		return
 	}

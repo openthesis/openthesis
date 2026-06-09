@@ -59,6 +59,29 @@ const inPlaceRestoreEnabled = true
 // FirecrackerHypervisor manages deterministic VMs using patched Firecracker v1.15.0
 // with the OpenThesis DST patch series applied (deploy/firecracker-patches/).
 //
+// RDTSC gap - without host patches the guest vDSO reads TSC (wall-scaled),
+// which diverges from VirtualClock (PMC-driven). With RDTSC exiting patched
+// into KVM, Firecracker intercepts every RDTSC and returns VirtualClock instead.
+//
+//  Without host patches:          With RDTSC exiting (host kernel patch):
+//  ---------------------          ---------------------------------------
+//  VirtualClock (PMC):   3ms      VirtualClock (PMC):  3ms
+//  TSC (wall-scaled):   10ms      TSC (intercepted):   3ms  <- synced
+//  guest vDSO reads:    10ms      guest vDSO reads:    3ms  OK
+//
+// Burst timeline (runForInstructionsPMC / run-burst ctrl command):
+//
+//  burst-start: PMC=0, TSC=T0                   self-pause at target
+//  |                                            |
+//  v                                            v
+//  +--------+-----+--------+-----+--------+----+
+//  | guest  | KVM | guest  | KVM | guest  | HLT|  virtual time ->
+//  | runs   | exit| runs   | exit| runs   |    |
+//  +--------+-----+--------+-----+--------+----+
+//    PMC++          PMC++          PMC reaches target
+//    TSC <- VirtualClock at each KVM_RUN exit (RDTSC exiting)
+//    PMC pauses when host preempts vCPU thread; TSC does not (gap residual)
+//
 // Determinism guarantees (after patches applied):
 //   - Virtual clock: PMC instruction counting in vCPU loop (patch 0002).
 //     1 virtual ns = 1 retired instruction at 1 GHz synthetic TSC.
@@ -73,9 +96,9 @@ const inPlaceRestoreEnabled = true
 //     submission-order completion, no io_uring async reordering.
 //   - RTC: not present (Firecracker uses PL031 only on AArch64; x86_64 uses
 //     KVM in-kernel RTC which is deterministic given our fixed TSC).
-//   - ACPI PM timer: not present in Firecracker ✓
-//   - HPET: not present in Firecracker ✓
-//   - Watchdog: not present in Firecracker ✓
+//   - ACPI PM timer: not present in Firecracker (absent by design)
+//   - HPET: not present in Firecracker (absent by design)
+//   - Watchdog: not present in Firecracker (absent by design)
 //
 // Control protocol:
 //   - VM lifecycle (boot, pause, resume, snapshot, load): Firecracker HTTP API
@@ -101,7 +124,7 @@ type FirecrackerHypervisor struct {
 	nextSnap     atomic.Uint64
 	configs      map[string]VMConfig
 	cpuPool      *isolatedCPUPool // nil if no isolated CPUs found
-	burstTimeout time.Duration    // wall-clock deadline for run-burst; 0 → 30s default
+	burstTimeout time.Duration    // wall-clock deadline for run-burst; 0 -> 30s default
 }
 
 type fcVM struct {

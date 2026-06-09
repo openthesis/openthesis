@@ -84,14 +84,12 @@ func dialQMP(ctx context.Context, socketPath string) (*qmpClient, error) {
 		dec:  json.NewDecoder(conn),
 	}
 
-	// Read the QMP greeting.
 	var greeting qmpGreeting
 	if err := c.dec.Decode(&greeting); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("qmp read greeting: %w", err)
 	}
 
-	// Negotiate capabilities (we require none beyond the defaults).
 	if _, err := c.Execute("qmp_capabilities", nil); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("qmp negotiate capabilities: %w", err)
@@ -121,7 +119,6 @@ func (c *qmpClient) Execute(cmd string, args any) (json.RawMessage, error) {
 		return nil, fmt.Errorf("qmp execute %s: %w", cmd, err)
 	}
 
-	// Skip asynchronous event messages until we get a return or error.
 	for {
 		var raw json.RawMessage
 		if err := c.dec.Decode(&raw); err != nil {
@@ -133,7 +130,6 @@ func (c *qmpClient) Execute(cmd string, args any) (json.RawMessage, error) {
 			return nil, fmt.Errorf("qmp parse response for %s: %w", cmd, err)
 		}
 
-		// If neither "return" nor "error" is set this is an async event; skip it.
 		if resp.Return == nil && resp.Error == nil {
 			continue
 		}
@@ -320,13 +316,9 @@ func (c *qmpClient) RunUntilICount(instructions uint64) error {
 }
 
 func (c *qmpClient) RunUntilICountCtx(ctx context.Context, instructions uint64) error {
-	// Calculate virtual time delta: instructions * 2^shift nanoseconds.
-	// With shift=7: deltaNS = instructions * 128.
 	const icountShift = 7
 	deltaNS := instructions << icountShift
 
-	// Use openthesis-ctrl run-burst command which sets a QEMU_CLOCK_VIRTUAL
-	// timer and calls vm_stop() in the callback.
 	_, err := c.Execute("openthesis-ctrl", ctrlArgs("run-burst", map[string]any{
 		"delta_ns":     deltaNS,
 		"instructions": instructions,
@@ -335,8 +327,6 @@ func (c *qmpClient) RunUntilICountCtx(ctx context.Context, instructions uint64) 
 		return fmt.Errorf("qmp run-until-icount: %w", err)
 	}
 
-	// run-burst starts the VM asynchronously (vm_start + timer). Wait for
-	// the burst timer to fire and pause the VM before returning.
 	return c.waitForPauseCtx(ctx, 30*time.Second)
 }
 

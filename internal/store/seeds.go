@@ -1,11 +1,12 @@
 package store
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 
 	"github.com/openthesis/openthesis/internal/explorer"
 	bolt "go.etcd.io/bbolt"
@@ -66,10 +67,8 @@ func (s *SeedCorpus) Close() error { return s.db.Close() }
 // Save writes the top-N entries from the given frontier slice to disk.
 // Merges with any previously saved seeds, keeping the top-N by score.
 func (s *SeedCorpus) Save(entries []*explorer.FrontierEntry) error {
-	// Load existing seeds.
 	existing, _ := s.Load()
 
-	// Convert new entries to records and merge.
 	recs := make([]SeedRecord, 0, len(existing)+len(entries))
 	recs = append(recs, existing...)
 	for _, e := range entries {
@@ -85,7 +84,6 @@ func (s *SeedCorpus) Save(entries []*explorer.FrontierEntry) error {
 		})
 	}
 
-	// Deduplicate by SnapshotID, keeping highest score.
 	seen := make(map[string]int)
 	deduped := recs[:0]
 	for _, r := range recs {
@@ -99,7 +97,7 @@ func (s *SeedCorpus) Save(entries []*explorer.FrontierEntry) error {
 		}
 	}
 
-	sort.Slice(deduped, func(i, j int) bool { return deduped[i].Score > deduped[j].Score })
+	slices.SortFunc(deduped, func(a, b SeedRecord) int { return cmp.Compare(b.Score, a.Score) })
 	if len(deduped) > s.maxSize {
 		deduped = deduped[:s.maxSize]
 	}

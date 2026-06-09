@@ -8,7 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/openthesis/openthesis/internal/container"
@@ -190,13 +190,18 @@ func bundleIptablesLegacy(w *cpioWriter) error {
 	for d := range dirSet {
 		sortedDirs = append(sortedDirs, d)
 	}
-	// Sort by length then lexicographic so parents always precede children.
-	for i := 1; i < len(sortedDirs); i++ {
-		for j := i; j > 0 && (len(sortedDirs[j]) < len(sortedDirs[j-1]) ||
-			(len(sortedDirs[j]) == len(sortedDirs[j-1]) && sortedDirs[j] < sortedDirs[j-1])); j-- {
-			sortedDirs[j], sortedDirs[j-1] = sortedDirs[j-1], sortedDirs[j]
+	slices.SortFunc(sortedDirs, func(a, b string) int {
+		if len(a) != len(b) {
+			return len(a) - len(b)
 		}
-	}
+		if a < b {
+			return -1
+		}
+		if a > b {
+			return 1
+		}
+		return 0
+	})
 	for _, d := range sortedDirs {
 		_ = w.writeDir(d)
 	}
@@ -330,12 +335,18 @@ func bundleTC(w *cpioWriter) error {
 	for d := range dirSet {
 		sortedDirs = append(sortedDirs, d)
 	}
-	for i := 1; i < len(sortedDirs); i++ {
-		for j := i; j > 0 && (len(sortedDirs[j]) < len(sortedDirs[j-1]) ||
-			(len(sortedDirs[j]) == len(sortedDirs[j-1]) && sortedDirs[j] < sortedDirs[j-1])); j-- {
-			sortedDirs[j], sortedDirs[j-1] = sortedDirs[j-1], sortedDirs[j]
+	slices.SortFunc(sortedDirs, func(a, b string) int {
+		if len(a) != len(b) {
+			return len(a) - len(b)
 		}
-	}
+		if a < b {
+			return -1
+		}
+		if a > b {
+			return 1
+		}
+		return 0
+	})
 	for _, d := range sortedDirs {
 		_ = w.writeDir(d)
 	}
@@ -410,11 +421,17 @@ func bundleSharedLibsForBinary(w *cpioWriter, binaryPath string, seenPaths map[s
 	for d := range dirSet {
 		sortedDirs = append(sortedDirs, d)
 	}
-	sort.Slice(sortedDirs, func(i, j int) bool {
-		if len(sortedDirs[i]) != len(sortedDirs[j]) {
-			return len(sortedDirs[i]) < len(sortedDirs[j])
+	slices.SortFunc(sortedDirs, func(a, b string) int {
+		if len(a) != len(b) {
+			return len(a) - len(b)
 		}
-		return sortedDirs[i] < sortedDirs[j]
+		if a < b {
+			return -1
+		}
+		if a > b {
+			return 1
+		}
+		return 0
 	})
 	for _, d := range sortedDirs {
 		_ = w.writeDir(d)
@@ -1139,7 +1156,7 @@ func PrepareMultiOCIBundles(cfg *testconfig.Config, stateDir, runID string) (map
 		for k := range node.Env {
 			envKeys = append(envKeys, k)
 		}
-		sort.Strings(envKeys)
+		slices.Sort(envKeys)
 		for _, k := range envKeys {
 			env = append(env, k+"="+node.Env[k])
 		}
@@ -1234,7 +1251,7 @@ func ociSpec(cfg *testconfig.Config, hostOutputDir, hostControlDir string) map[s
 		for k := range node.Env {
 			envKeys = append(envKeys, k)
 		}
-		sort.Strings(envKeys)
+		slices.Sort(envKeys)
 		for _, k := range envKeys {
 			env = append(env, k+"="+node.Env[k])
 		}

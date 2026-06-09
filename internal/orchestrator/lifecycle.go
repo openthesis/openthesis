@@ -33,17 +33,12 @@ func (o *Orchestrator) boot(ctx context.Context, prep *PrepareResult) error {
 		NoHostPatches:       o.cfg.TestConfig.Exploration.NoHostPatches,
 	}
 
-	// For gVisor, RootFSPath is the OCI bundle directory.
-	// For QEMU backends, it's the disk image.
 	if o.cfg.Backend == hypervisor.BackendGVisor {
 		vmCfg.RootFSPath = prep.BundlePath
-		vmCfg.KernelPath = "" // gVisor doesn't use a kernel
-		vmCfg.InitrdPath = "" // gVisor doesn't use an initrd
+		vmCfg.KernelPath = ""
+		vmCfg.InitrdPath = ""
 	} else {
 		kernelPath := o.cfg.TestConfig.KernelPath
-		// QEMU requires a bzImage (vmlinuz), not an uncompressed ELF (vmlinux).
-		// If the config specifies vmlinux and we're using a QEMU backend (TCG or patched),
-		// try to use the sibling vmlinuz instead.
 		if o.cfg.Backend != hypervisor.BackendFirecracker {
 			if strings.HasSuffix(kernelPath, "vmlinux") {
 				candidate := strings.TrimSuffix(kernelPath, "vmlinux") + "vmlinuz"
@@ -58,8 +53,6 @@ func (o *Orchestrator) boot(ctx context.Context, prep *PrepareResult) error {
 		vmCfg.SUTImagePath = prep.SUTImagePath
 	}
 
-	// Fast-path: load Firecracker from a saved root snapshot instead of
-	// booting the kernel. This skips ~50s of VM boot + cluster setup.
 	if o.cfg.Backend == hypervisor.BackendFirecracker && o.cfg.RootSnapshotPath != "" {
 		fcHyp, ok := o.hyp.(*hypervisor.FirecrackerHypervisor)
 		if !ok {
@@ -82,8 +75,6 @@ func (o *Orchestrator) boot(ctx context.Context, prep *PrepareResult) error {
 		}
 		o.vm = vm
 		o.bootedFromSnapshot = true
-		// Save meta so explore() can register the artifact files as the root
-		// snapshot directly, avoiding a second snapshot from this VM.
 		o.fastReplayMeta = meta
 		o.fastReplaySnapFile = snapFile
 		o.fastReplayMemFile = memFile
@@ -101,9 +92,6 @@ normalBoot:
 
 func (o *Orchestrator) connect(ctx context.Context) error {
 	if o.cfg.Backend == hypervisor.BackendFirecracker {
-		// Firecracker uses vsock for guest↔host communication.
-		// The SerialPath is the Firecracker vsock UDS proxy.
-		// The guest listens on vsockGuestPort (1234); we use CONNECT handshake.
 		o.listener = agent.NewListenerVsock(o.vm.SerialPath, 1234)
 	} else {
 		o.listener = agent.NewListener(o.vm.SerialPath)
@@ -199,14 +187,10 @@ func (o *Orchestrator) initFaults() {
 
 	maxRates := o.initFaultMaxRates()
 
-	// Swarm testing: generate a random fault distribution profile.
-	// Each run randomly selects which fault types are active and at what rate,
-	// producing diverse fault injection strategies (TigerBeetle VOPR).
 	if fCfg.SwarmTesting {
 		profile := fault.GenerateSwarmProfile(o.rng.Fork(0x50A2), maxRates)
 		o.swarmProfile = &profile
 
-		// Override configured rates with swarm-sampled rates.
 		o.faultNet = fault.NewNetwork(fault.NetworkConfig{
 			DropRate:               profile.Rate(fault.KindDrop),
 			DelayMin:               delayMin,
@@ -322,11 +306,9 @@ func (o *Orchestrator) initFaults() {
 		})
 	}
 
-	// MOPT-style adaptive fault selection: UCB1 bandit over fault types.
 	if fCfg.AdaptiveFaults {
 		activeRates := make(map[fault.Kind]float64)
 		if o.swarmProfile != nil {
-			// Adaptive selects among swarm-active faults.
 			for k := range o.swarmProfile.ActiveFaults {
 				activeRates[k] = o.swarmProfile.Rates[k]
 			}
@@ -338,13 +320,5 @@ func (o *Orchestrator) initFaults() {
 			"arms", len(activeRates))
 	}
 
-	// Dedicated fault PRNG: seeded from the raw run seed XOR a fixed salt,
-	// NOT forked from o.rng. Forking from o.rng would make the initial state
-	// depend on how many times o.rng has been called before initFaults(),
-	// which can differ between the original run and replay if coverage
-	// diverges. By seeding directly from cfg.Seed we guarantee that for the
-	// same seed, the fault PRNG always starts in the same state, making
-	// fault decisions reproducible across replays even when coverage paths
-	// diverge slightly.
 	o.faultRng = prng.New(o.cfg.Seed ^ 0xFA17FA17_FA17FA17)
 }

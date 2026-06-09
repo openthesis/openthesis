@@ -5,18 +5,19 @@ package main
 // KCOV-based kernel coverage collection for the Firecracker backend.
 // https://docs.kernel.org/dev-tools/kcov.html
 //
-// Coverage model:
-//   - init-process KCOV: traces kernel paths taken by PID 1 (vsock I/O,
-//     process management, /proc reads). Works immediately, no binary changes.
-//   - LD_PRELOAD KCOV (deploy/guest-kcov-preload.c): enables KCOV in each
-//     SUT process; requires dynamically-linked binaries (not static Go).
-//   - Intel PT (future): traces all processes at hardware speed; requires
-//     a Firecracker patch to expose /dev/intel_pt per-VM.
+// Three coverage modes are supported:
+//
+//   init-process KCOV  - traces kernel paths taken by PID 1: vsock I/O,
+//                        process management, /proc reads. No binary changes.
+//   LD_PRELOAD KCOV    - deploy/guest-kcov-preload.c enables KCOV in each
+//                        SUT process. Requires dynamically-linked binaries.
+//   Intel PT (future)  - traces all processes at hardware speed. Requires a
+//                        Firecracker patch to expose /dev/intel_pt per-VM.
 //
 // The shared AFL-style bitmap lives at /run/kcov_bitmap (64 KB, tmpfs).
 // Any process with libkcov_preload.so loaded writes to it; init reads it.
-// init sends the merged bitmap to the host as a "coverage" message every
-// collectInterval.
+// init sends the merged bitmap to the host as a "coverage" message on each
+// burst-boundary flush.
 
 import (
 	"encoding/base64"
@@ -49,11 +50,10 @@ const (
 	// Entry [0] = count of PCs written; entries [1..N] = raw PC values.
 	//
 	// Sized for ~5M-instruction bursts. With CONFIG_KCOV_INSTRUMENT_ALL, every
-	// basic block produces a PC. Worst case ~10 BBs/1000 insns = ~50K PCs per
-	// 5M-insn burst. We use 524288 (8x headroom) to ensure no buffer overflow
-	// between burst-boundary flushes (Phase 3; no wall-clock ticker means we
-	// only flush at burst boundaries, so the buffer must hold a full burst).
-	// Buffer = 524288 * 8 bytes = 4 MiB per init process.
+	// basic block produces a PC. Worst case: ~10 BBs per 1000 insns = ~50K PCs
+	// per 5M-insn burst. 524288 entries gives 8x headroom and prevents overflow
+	// between burst-boundary flushes. There is no wall-clock ticker; the buffer
+	// must hold a full burst. 524288 * 8 bytes = 4 MiB per init process.
 	kcovEntries = 524288
 
 	// bitmapSize is the AFL-style edge bitmap size in bytes.
@@ -71,36 +71,36 @@ const (
 
 // extraKcov holds per-OS-thread KCOV trace buffers opened by long-lived
 // goroutines via enableKcovForCurrentThread(). KCOV is per-task in the
-// kernel: only the OS thread that called KCOV_ENABLE has its kernel paths
+// kernel; only the OS thread that called KCOV_ENABLE has its kernel paths
 // recorded. With GOMAXPROCS unconstrained, the Go runtime may spawn
 // transient Ms for blocked syscalls, and any kernel paths those threads
-// take vanish from coverage. Each long-lived goroutine therefore calls
+// take vanish from coverage. Each long-lived goroutine calls
 // runtime.LockOSThread() and registers its OS thread here so flushAndSend()
 // can drain every per-thread buffer into the shared bitmap.
 //
-// extraKcov is append-only (entries are never removed) so iteration under
-// the read-lock is safe even while a new thread registers concurrently.
+// The slice is append-only. Iteration under the read-lock is safe even while
+// a new thread registers concurrently.
 var (
 	extraKcovMu sync.RWMutex
 	extraKcov   []*kcovThreadState
 )
 
-// kcovThreadState is a minimal per-thread KCOV trace buffer. It does NOT
-// own a bitmap or a lastPC of its own; flushAndSend() folds entries from
-// every per-thread buffer into the primary kcovState's shared bitmap so
-// AFL-style edges remain consistent.
+// kcovThreadState is a minimal per-thread KCOV trace buffer. It has no
+// bitmap and no lastPC of its own. flushAndSend() folds entries from every
+// per-thread buffer into the primary kcovState's shared bitmap so AFL-style
+// edges remain consistent.
 type kcovThreadState struct {
 	fd  int
 	buf []uint64 // mmap of /sys/kernel/debug/kcov for this OS thread
 }
 
-// enableKcovForCurrentThread opens a fresh KCOV fd, KCOV_INIT_TRACE,
-// mmaps the trace buffer, and KCOV_ENABLEs it for the *calling OS thread*.
-// The caller MUST have already invoked runtime.LockOSThread() so the Go
+// enableKcovForCurrentThread opens a fresh KCOV fd, issues KCOV_INIT_TRACE,
+// mmaps the trace buffer, and calls KCOV_ENABLE for the calling OS thread.
+// The caller must have already called runtime.LockOSThread() so the Go
 // runtime keeps the goroutine pinned to that thread for its lifetime.
 //
-// Failures are logged and swallowed: this is purely additive coverage and
-// must never break the init process when KCOV is unavailable.
+// Failures are logged and swallowed. This is purely additive coverage and
+// must not break the init process when KCOV is unavailable.
 func enableKcovForCurrentThread(label string) {
 	fd, err := syscall.Open("/sys/kernel/debug/kcov", syscall.O_RDWR, 0)
 	if err != nil {
@@ -141,8 +141,8 @@ func enableKcovForCurrentThread(label string) {
 //
 //	go func() { lockAndEnableKcov("vsock"); ... }()
 //
-// It pins the goroutine to its current OS thread (so the Go runtime cannot
-// migrate it after a blocking syscall) and registers a fresh KCOV fd for
+// Pins the goroutine to its current OS thread so the Go runtime cannot
+// migrate it after a blocking syscall, then registers a fresh KCOV fd for
 // that thread. Safe to call when KCOV is unavailable; failures are logged.
 func lockAndEnableKcov(label string) {
 	runtime.LockOSThread()
@@ -150,17 +150,42 @@ func lockAndEnableKcov(label string) {
 }
 
 // kcovResetCh is signalled by handleResetCoverage to zero the coverage
-// bitmap before the root snapshot is taken, ensuring the first cov_hash
+// bitmap before the root snapshot is taken. This ensures the first cov_hash
 // is identical across runs regardless of boot-time coverage variance.
 var kcovResetCh = make(chan chan struct{}, 1)
 
 // kcovFlushCh is signalled by handleFlushCoverage to trigger an immediate
-// synchronous KCOV flush at burst boundaries. This replaces wall-clock
-// ticker-driven flushes at burst boundaries so cov_hash is captured at a
-// deterministic virtual-time point (end of burst) rather than at a
-// non-deterministic wall-clock offset within the burst.
+// synchronous KCOV flush at burst boundaries. Replaces wall-clock
+// ticker-driven flushes so cov_hash is captured at a deterministic
+// virtual-time point (end of burst), not a non-deterministic wall-clock
+// offset within the burst.
 var kcovFlushCh = make(chan chan struct{}, 1)
 
+// KCOV ring buffer layout (mmap'd from /sys/kernel/debug/kcov):
+//
+//   offset   size     field
+//   -------  -------  --------------------------------------------------
+//   [0]      uint64   write cursor  (kernel increments after each PC)
+//   [1]      uint64   PC[1]        \
+//   [2]      uint64   PC[2]         > up to kcovEntries-1 raw PCs
+//   ...      ...      ...          /
+//   [N]      uint64   PC[N]         (N = AtomicSwap(buf[0], 0))
+//
+// Guest-to-vsock flow at each burst boundary:
+//
+//   Guest kernel              openthesis-init (collect goroutine)
+//   ----------------------    -------------------------------------------
+//   KCOV writes PCs           flush_coverage vsock cmd arrives
+//   to buf[1..N]              |
+//   buf[0] = count    ------> AtomicSwap(&buf[0], 0) -> N
+//                             prev = s.lastPC
+//                             for i in 1..N:
+//                               slot = ((prev>>1) ^ buf[i]) % 64K
+//                               bitmap[slot]++
+//                               prev = buf[i]
+//                             s.lastPC = buf[N]   <- bridge to next burst
+//                             if bitmap != prevBitmap: send over vsock
+//
 // kcovState holds the live KCOV buffer and the shared edge bitmap.
 type kcovState struct {
 	fd         int
@@ -172,21 +197,20 @@ type kcovState struct {
 	lastGen    uint64           // incremented on every non-empty collect
 }
 
-// startKcov opens KCOV for the current (init) process and launches a goroutine
-// that merges the trace buffer into the shared bitmap and forwards it to the host.
-// Returns immediately if KCOV is unavailable (e.g., kernel not built with CONFIG_KCOV).
+// startKcov opens KCOV for the current (init) process and launches a collect
+// goroutine that merges the trace buffer into the shared bitmap and forwards
+// it to the host. Returns immediately if KCOV is unavailable (kernel not
+// built with CONFIG_KCOV).
 //
-// IMPORTANT: this MUST be called synchronously from main goroutine (which is
-// locked to M0 via runtime.LockOSThread() at the top of main). KCOV is per-task
-// in the Linux kernel; it traces only the OS thread that called KCOV_ENABLE.
-// With GOMAXPROCS=1 and main locked to M0, every goroutine in init runs on M0,
-// so KCOV_ENABLE on M0 captures every kernel path the init process executes.
-// This makes KCOV fully deterministic across runs (proven: same instruction
-// sequence → same kernel paths → same PCs in trace buffer).
+// Must be called from the main goroutine, which is locked to M0 via
+// runtime.LockOSThread() at the top of main. KCOV is per-task in the kernel;
+// it traces only the OS thread that called KCOV_ENABLE. With GOMAXPROCS=1
+// and main locked to M0, every goroutine in init runs on M0, so KCOV_ENABLE
+// on M0 captures every kernel path the init process executes. Same instruction
+// sequence -> same kernel paths -> same PCs in the trace buffer.
 //
-// The collect goroutine reads the shared trace buffer that M0 writes to. It
-// can technically run on any OS thread because reading buf[] doesn't affect
-// what KCOV traces. But with GOMAXPROCS=1 it'll also run on M0.
+// The collect goroutine reads the shared trace buffer that M0 writes to. With
+// GOMAXPROCS=1 it also runs on M0, but that is not required for correctness.
 func startKcov(stopCh <-chan struct{}) {
 	s, err := openKcov()
 	if err != nil {
@@ -207,9 +231,9 @@ type kcovRemoteArg struct {
 
 // tryKcovRemoteEnable registers the KCOV fd for remote coverage from global
 // kernel subsystems (softirq, workqueues). On kernels that support it
-// (CONFIG_KCOV + kernel ≥ 5.3), this causes the per-task trace buffer to also
-// receive PCs from interrupt context handlers associated with this process.
-// Non-fatal: logs and returns on EINVAL (old kernel or feature not built in).
+// (CONFIG_KCOV + kernel >= 5.3), the per-task trace buffer also receives PCs
+// from interrupt context handlers associated with this process. Non-fatal:
+// logs and returns on EINVAL (old kernel or feature not built in).
 func tryKcovRemoteEnable(fd int) {
 	// KCOV_SUBSYSTEM_GLOBAL = 1 (from linux/kcov.h). The common_handle encodes
 	// the subsystem in the top byte: (subsystem << 56) | instance_id.
@@ -236,7 +260,7 @@ func openKcov() (*kcovState, error) {
 		return nil, fmt.Errorf("open /sys/kernel/debug/kcov: %w", err)
 	}
 
-	// Allocate trace buffer.
+	// Allocate the trace buffer in the kernel.
 	if _, _, errno := syscall.Syscall(
 		syscall.SYS_IOCTL, uintptr(fd), ioctlKcovInitTrace, uintptr(kcovEntries),
 	); errno != 0 {
@@ -244,9 +268,9 @@ func openKcov() (*kcovState, error) {
 		return nil, fmt.Errorf("KCOV_INIT_TRACE(entries=%d): %w", kcovEntries, errno)
 	}
 
-	// mmap the trace buffer. The kernel allocates exactly kcovEntries uint64s;
+	// mmap the trace buffer. The kernel allocates exactly kcovEntries uint64s.
 	// buf[0] = count of PCs written, buf[1..kcovEntries-1] = raw PC values.
-	// Note: kcovEntries already includes the count word; do NOT add 1.
+	// kcovEntries already includes the count word; do not add 1.
 	bufLen := kcovEntries * 8
 	raw, err := syscall.Mmap(fd, 0, bufLen, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
@@ -255,9 +279,9 @@ func openKcov() (*kcovState, error) {
 	}
 	buf := unsafe.Slice((*uint64)(unsafe.Pointer(&raw[0])), kcovEntries)
 
-	// Enable KCOV_TRACE_PC for this goroutine's OS thread.
-	// runtime.LockOSThread() ensures the goroutine stays on one OS thread so
-	// KCOV (which is per-task in the kernel) keeps tracing it.
+	// Enable KCOV_TRACE_PC for this goroutine's OS thread. KCOV is per-task
+	// in the kernel; runtime.LockOSThread() keeps the goroutine on one OS
+	// thread so KCOV keeps tracing it.
 	if _, _, errno := syscall.Syscall(
 		syscall.SYS_IOCTL, uintptr(fd), ioctlKcovEnable, uintptr(kcovTracePc),
 	); errno != 0 {
@@ -266,15 +290,15 @@ func openKcov() (*kcovState, error) {
 		return nil, fmt.Errorf("KCOV_ENABLE(mode=%d): %w", kcovTracePc, errno)
 	}
 
-	// Attempt to also enable remote coverage collection for softirq/workqueue
-	// kernel paths. These run in interrupt context on behalf of this process
-	// (e.g., vsock packet processing, network RX softirqs) and are invisible
-	// to per-task KCOV. Remote coverage uses the same trace buffer; the kernel
-	// merges remote PCs alongside per-task PCs when the softirq runs.
-	// This reduces the ~1% KCOV edge variance from interrupt-driven paths.
+	// Attempt to enable remote coverage for softirq/workqueue kernel paths.
+	// These run in interrupt context on behalf of this process (vsock packet
+	// processing, network RX softirqs) and are invisible to per-task KCOV.
+	// Remote coverage uses the same trace buffer; the kernel merges remote
+	// PCs alongside per-task PCs when the softirq runs. This reduces the
+	// ~1% KCOV edge variance from interrupt-driven paths.
 	tryKcovRemoteEnable(fd)
 
-	// Open (or create) the shared bitmap file so LD_PRELOAD processes can also write to it.
+	// Open or create the shared bitmap file so LD_PRELOAD processes can write to it.
 	bitmapFile, err := os.OpenFile(bitmapPath, os.O_RDWR|os.O_CREATE, 0o666)
 	if err != nil {
 		logf("kcov: cannot open bitmap file %s: %v (continuing without shared bitmap)", bitmapPath, err)
@@ -318,15 +342,15 @@ func (s *kcovState) collect(stopCh <-chan struct{}) {
 		case <-stopCh:
 			return
 		case done := <-kcovFlushCh:
-			// Burst-boundary flush triggered by orchestrator after each RunForInstructions.
-			// flush_coverage is the only KCOV sampling trigger (no wall-clock ticker).
+			// Burst-boundary flush. flush_coverage is the only KCOV sampling
+			// trigger; there is no wall-clock ticker.
 			s.flushAndSend()
 			close(done)
 		case done := <-kcovResetCh:
 			// Zero the KCOV trace buffer, shared bitmap, prevBitmap, and lastPC
 			// so the next snapshot's cov_hash reflects only post-reset coverage.
-			// lastPC must be cleared so the first cross-tick edge of the next burst
-			// doesn't inherit a stale PC from before the reset.
+			// lastPC must be cleared; a stale PC from before the reset would
+			// corrupt the first cross-burst edge of the next run.
 			atomic.StoreUint64(&s.buf[0], 0)
 			extraKcovMu.RLock()
 			for _, ts := range extraKcov {
@@ -345,11 +369,10 @@ func (s *kcovState) collect(stopCh <-chan struct{}) {
 	}
 }
 
-// handleFlushCoverage triggers an immediate KCOV bitmap flush synchronously.
+// handleFlushCoverage triggers an immediate synchronous KCOV bitmap flush.
 // Called from the vsock command listener when the host sends "flush_coverage"
-// at the end of each burst. This ensures cov_hash is computed at a deterministic
-// virtual-time point (burst boundary) rather than a non-deterministic wall-clock
-// offset within the burst.
+// at the end of each burst. cov_hash is computed at the burst boundary, not
+// at a non-deterministic wall-clock offset within the burst.
 func handleFlushCoverage() {
 	done := make(chan struct{})
 	select {
@@ -360,10 +383,10 @@ func handleFlushCoverage() {
 	}
 }
 
-// handleResetCoverage zeros all coverage state synchronously.
-// Called from the vsock command listener when the host sends reset_coverage.
-// Blocks until the collect goroutine has completed the reset so the host
-// knows the bitmap is clean before it triggers the root snapshot.
+// handleResetCoverage zeros all coverage state synchronously. Called from
+// the vsock command listener when the host sends reset_coverage. Blocks
+// until the collect goroutine has completed the reset; the host must know
+// the bitmap is clean before triggering the root snapshot.
 func handleResetCoverage() {
 	done := make(chan struct{})
 	select {
@@ -376,13 +399,14 @@ func handleResetCoverage() {
 }
 
 // flushAndSend reads the KCOV trace buffer, folds PC pairs into the shared
-// bitmap, then sends the merged bitmap to the host if it changed.
+// bitmap, merges uprobe and Go-cover data, then sends the bitmap to the host
+// if it changed since the last send.
 func (s *kcovState) flushAndSend() {
-	// First, drain every per-OS-thread KCOV buffer registered by long-lived
-	// goroutines via enableKcovForCurrentThread(). Each buffer is folded into
-	// the same shared bitmap as the primary trace using AFL-style edge
-	// encoding. Per-thread buffers do NOT share s.lastPC (their PC streams
-	// are independent kernel paths), so we use a local prev for each.
+	// Drain every per-OS-thread KCOV buffer registered by long-lived goroutines
+	// via enableKcovForCurrentThread(). Each buffer is folded into the same
+	// shared bitmap using AFL-style edge encoding. Per-thread buffers do not
+	// share s.lastPC; each thread's PC stream is independent, so prev is kept
+	// local per drain.
 	extraKcovMu.RLock()
 	threads := extraKcov
 	extraKcovMu.RUnlock()
@@ -395,26 +419,27 @@ func (s *kcovState) flushAndSend() {
 	if count == 0 && s.bitmap == nil {
 		return
 	}
-	// buf has kcovEntries slots; buf[0] is the count, so max valid PC index is kcovEntries-1.
+	// buf has kcovEntries slots; buf[0] is the count word, so the max valid
+	// PC index is kcovEntries-1.
 	if count > kcovEntries-1 {
 		count = kcovEntries - 1
 	}
 
 	// Fold (prevPC, curPC) pairs into the bitmap using AFL-style edge encoding:
-	// edge_slot = ((prevPC >> 1) XOR curPC) mod bitmapSize
+	//   edge_slot = ((prevPC >> 1) XOR curPC) mod bitmapSize
 	//
-	// The kernel KCOV trace layout: buf[0]=count, buf[1..count]=PCs.
-	// After AtomicSwap, buf[0]=0 and PCs are at buf[1..count].
+	// Kernel KCOV trace: buf[0]=count, buf[1..count]=PCs. After AtomicSwap,
+	// buf[0]=0 and PCs are at buf[1..count].
 	//
-	// Cross-tick continuity: use s.lastPC as the initial prev so that the edge
-	// between the last PC of the previous tick and the first PC of this tick is
-	// never lost. Without this, different ticker-fire boundaries in different runs
-	// cause different cross-boundary edges to be skipped, making cov_hash diverge
-	// even when the VM executes the exact same instruction sequence.
+	// Use s.lastPC as the initial prev so the edge between the last PC of the
+	// previous burst and the first PC of this burst is not lost. Without this,
+	// different burst-boundary positions cause different cross-boundary edges to
+	// be skipped, making cov_hash diverge even across identical instruction
+	// sequences.
 	if count >= 1 {
 		target := s.bitmap
 		if target == nil {
-			// Fallback: use local prevBitmap so we still send something.
+			// No shared file; fall back to prevBitmap so we still send something.
 			target = s.prevBitmap[:]
 		}
 		prev := s.lastPC
@@ -429,14 +454,14 @@ func (s *kcovState) flushAndSend() {
 			}
 			prev = cur
 		}
-		s.lastPC = s.buf[count] // last PC is at buf[count], for next tick
+		s.lastPC = s.buf[count] // save last PC to bridge the next burst
 	}
 
 	// Merge uprobe (userspace) hit counts into the shared bitmap so that
-	// application-level code paths (Raft consensus, leader election, etc.)
-	// are visible to the coverage-guided explorer alongside kernel edges.
-	// globalUprobe is nil-safe: if uprobes are disabled its mergeIntoSlice
-	// is never called (len(probeNames)==0 → collectHits returns nil).
+	// application-level code paths (Raft consensus, leader election) are
+	// visible to the coverage-guided explorer alongside kernel edges.
+	// globalUprobe is nil-safe; if uprobes are disabled mergeIntoSlice is
+	// never called.
 	if globalUprobe != nil {
 		target := s.bitmap
 		if target == nil {
@@ -446,7 +471,7 @@ func (s *kcovState) flushAndSend() {
 	}
 
 	// Merge Go -cover block-level counters into the shared bitmap.
-	// globalGoCover is nil-safe: when GOCOVERDIR is not set the collector is
+	// globalGoCover is nil-safe; when GOCOVERDIR is not set the collector is
 	// disabled and mergeIntoSlice returns immediately.
 	if globalGoCover != nil {
 		target := s.bitmap
@@ -456,8 +481,8 @@ func (s *kcovState) flushAndSend() {
 		globalGoCover.mergeIntoSlice(target)
 	}
 
-	// Merge bitmaps: make a copy to send, using the shared file if available,
-	// or the local prevBitmap otherwise.
+	// Take a snapshot to send. Use the shared file if available, otherwise
+	// fall back to prevBitmap.
 	var sendBuf [bitmapSize]byte
 	if s.bitmap != nil {
 		copy(sendBuf[:], s.bitmap)
@@ -465,8 +490,9 @@ func (s *kcovState) flushAndSend() {
 		sendBuf = s.prevBitmap
 	}
 
-	// Only send if the bitmap changed since last send (prevBitmap tracks last sent state).
-	// This avoids saturating the vsock with redundant 87KB messages on every tick.
+	// Only send if new edges appeared. prevBitmap tracks the last sent state;
+	// skipping unchanged bitmaps prevents saturating the vsock with redundant
+	// 64 KB messages on quiet bursts.
 	if sendBuf == s.prevBitmap {
 		return
 	}
@@ -478,7 +504,7 @@ func (s *kcovState) flushAndSend() {
 
 // foldThreadBuffer drains a per-OS-thread KCOV trace buffer and folds its
 // (prevPC, curPC) pairs into the shared bitmap. Each thread's PC stream is
-// independent, so we keep prev local to this drain (no cross-thread bridging).
+// independent; prev is local to this drain and is not bridged across threads.
 func (s *kcovState) foldThreadBuffer(ts *kcovThreadState) {
 	count := atomic.SwapUint64(&ts.buf[0], 0)
 	if count == 0 {
@@ -504,8 +530,8 @@ func (s *kcovState) foldThreadBuffer(ts *kcovThreadState) {
 	}
 }
 
-// sendCoverageToHost sends an AFL-style edge bitmap to the host via
-// the existing virtio-serial / vsock channel.
+// sendCoverageToHost sends an AFL-style edge bitmap to the host over the
+// virtio-serial / vsock channel.
 func sendCoverageToHost(bitmap []byte) {
 	type coveragePayload struct {
 		Source string `json:"source"`

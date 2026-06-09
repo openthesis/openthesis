@@ -84,15 +84,11 @@ func Shrink(ctx context.Context, cfg RunConfig, artifact *report.Artifact, outPa
 	}, artifact, outPath, progressFn)
 }
 
-// ShrinkWithConfig runs the full multi-phase shrink algorithm:
-//
-//   - Phase 1: ddmin over fault schedule entries (always run)
-//   - Phase 2: seed mutation - tries cfg.SeedMutations alternative seeds to
-//     find one that triggers the violation in fewer steps
-//   - Phase 3: step-count reduction - progressively tightens MaxStates to
-//     confirm the violation manifests as early as possible
-//
-// Each phase builds on the result of the previous one.
+// ShrinkWithConfig runs the full shrink algorithm. It first applies ddmin to
+// minimize the fault schedule, then tries cfg.SeedMutations alternative seeds
+// to find one that triggers the violation in fewer steps, and finally tightens
+// MaxStates to confirm the violation manifests as early as possible. Each pass
+// builds on the result of the previous one.
 func ShrinkWithConfig(ctx context.Context, cfg ShrinkConfig, artifact *report.Artifact, outPath string, progressFn ShrinkProgressFunc) (*ShrinkResult, error) {
 	if artifact == nil {
 		return nil, fmt.Errorf("shrink: artifact is required")
@@ -627,16 +623,3 @@ func setMinus(a, b []fault.ScheduleEntry) []fault.ScheduleEntry {
 	return result
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

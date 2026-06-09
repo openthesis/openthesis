@@ -15,11 +15,8 @@ import (
 )
 
 // cmdTriage implements `openthesis triage --report <report.json>`.
-//
-// It reads a saved JSON report and renders a human-friendly summary:
-// violations with reproduction paths, assertion coverage, snapshot tree
-// shape, and fault attribution. Designed to give an operator an instant
-// understanding of a run's results without opening a browser.
+// Renders a human-friendly summary of violations, assertions, snapshot tree,
+// and fault attribution from a saved JSON report.
 func cmdTriage(args []string) int {
 	fs := flag.NewFlagSet("triage", flag.ExitOnError)
 	reportPath := fs.String("report", "", "path to report JSON file")
@@ -119,7 +116,6 @@ func triagePretty(w *os.File, rpt *report.Report, a *report.Artifact, c *coloriz
 	fmt.Fprintf(bw, "\n%s\n", c.bold("OpenThesis Triage"))
 	fmt.Fprintf(bw, "%s\n\n", strings.Repeat("─", 60))
 
-	// If only an artifact was loaded (no full report), show a focused view.
 	if rpt == nil && a != nil {
 		fmt.Fprintf(bw, "%s\n", c.bold("Violation"))
 		fmt.Fprintf(bw, "  property:  %s\n", c.red(a.Property))
@@ -145,7 +141,6 @@ func triagePretty(w *os.File, rpt *report.Report, a *report.Artifact, c *coloriz
 		return 1
 	}
 
-	// Header: run summary.
 	fmt.Fprintf(bw, "%s\n", c.bold("Run Summary"))
 	fmt.Fprintf(bw, "  run_id:     %s\n", rpt.RunID)
 	fmt.Fprintf(bw, "  seed:       %d\n", rpt.Seed)
@@ -158,7 +153,6 @@ func triagePretty(w *os.File, rpt *report.Report, a *report.Artifact, c *coloriz
 		rpt.Coverage.TotalEdges, rpt.Coverage.Percentage)
 	fmt.Fprintf(bw, "\n")
 
-	// Violations.
 	fmt.Fprintf(bw, "%s", c.bold("Violations"))
 	if rpt.Summary.BugsFound == 0 {
 		fmt.Fprintf(bw, "  %s\n", c.green("none"))
@@ -191,14 +185,12 @@ func triagePretty(w *os.File, rpt *report.Report, a *report.Artifact, c *coloriz
 	}
 	fmt.Fprintf(bw, "\n")
 
-	// Assertions.
 	fmt.Fprintf(bw, "%s\n", c.bold("Assertions"))
 	printAssertionLine(bw, c, "always    ", rpt.Assertions.Always)
 	printAssertionLine(bw, c, "sometimes ", rpt.Assertions.Sometimes)
 	printAssertionLine(bw, c, "reachable ", rpt.Assertions.Reachable)
 	fmt.Fprintf(bw, "\n")
 
-	// Properties.
 	if len(rpt.Properties) > 0 {
 		fmt.Fprintf(bw, "%s\n", c.bold("Properties Checked"))
 		for _, pg := range rpt.Properties {
@@ -214,14 +206,12 @@ func triagePretty(w *os.File, rpt *report.Report, a *report.Artifact, c *coloriz
 		fmt.Fprintf(bw, "\n")
 	}
 
-	// Snapshot tree.
 	if len(rpt.Tree) > 0 {
 		fmt.Fprintf(bw, "%s  (%d nodes)\n", c.bold("Snapshot Tree"), len(rpt.Tree))
 		printTreeSummary(bw, c, rpt.Tree, rpt.TreeEvents)
 		fmt.Fprintf(bw, "\n")
 	}
 
-	// Fault stats.
 	if rpt.FaultStats.TotalWithFaults > 0 || rpt.FaultStats.TotalWithoutFaults > 0 {
 		fmt.Fprintf(bw, "%s\n", c.bold("Fault Attribution"))
 		fmt.Fprintf(bw, "  violations with faults:    %d\n", rpt.FaultStats.TotalWithFaults)
@@ -240,7 +230,6 @@ func triagePretty(w *os.File, rpt *report.Report, a *report.Artifact, c *coloriz
 		fmt.Fprintf(bw, "\n")
 	}
 
-	// Bug findability: p-survive timelines from BugReports.
 	if len(rpt.BugReports) > 0 {
 		fmt.Fprintf(bw, "%s\n", c.bold("Bug Findability"))
 		for _, br := range rpt.BugReports {
@@ -267,8 +256,6 @@ func triagePretty(w *os.File, rpt *report.Report, a *report.Artifact, c *coloriz
 		}
 	}
 
-	// Confidence guidance block: prominent banner for ONGOING violations.
-	// Correlates BugReports with violation messages.
 	if rpt.Summary.BugsFound > 0 {
 		type ongoingEntry struct {
 			property string
@@ -276,7 +263,6 @@ func triagePretty(w *os.File, rpt *report.Report, a *report.Artifact, c *coloriz
 			pSurv    float64
 		}
 		var ongoingEntries []ongoingEntry
-		// Collect entries where p_survive is usable.
 		for _, v := range rpt.Violations {
 			for _, br := range rpt.BugReports {
 				if br.Message == v.Message && br.PSurvival > 0 {
@@ -308,7 +294,6 @@ func triagePretty(w *os.File, rpt *report.Report, a *report.Artifact, c *coloriz
 		}
 	}
 
-	// Reproduction instructions for each violation artifact.
 	if rpt.Summary.BugsFound > 0 {
 		fmt.Fprintf(bw, "%s\n", c.bold("Commands"))
 		fmt.Fprintf(bw, "  openthesis replay  --artifact <dir> --config openthesis.json\n")
@@ -326,13 +311,12 @@ func renderProbSparkline(timeline []report.BugProbabilityPoint, width int) strin
 	if len(timeline) == 0 {
 		return ""
 	}
-	// Downsample to width.
 	step := float64(len(timeline)) / float64(width)
 	if step < 1 {
 		step = 1
 	}
 	var sb strings.Builder
-	for i := 0; i < width; i++ {
+	for i := range width {
 		idx := int(float64(i) * step)
 		if idx >= len(timeline) {
 			break
@@ -364,13 +348,11 @@ func printAssertionLine(bw *bufio.Writer, c *colorizer, label string, g report.A
 }
 
 func printTreeSummary(bw *bufio.Writer, c *colorizer, nodes []report.TreeNode, events []report.TreeEvent) {
-	// Index events by snapshot ID for quick lookup.
 	evBySnap := make(map[uint64][]report.TreeEvent, len(events))
 	for _, e := range events {
 		evBySnap[e.SnapshotID] = append(evBySnap[e.SnapshotID], e)
 	}
 
-	// Sort by (depth, id) for a readable top-down display.
 	sorted := make([]report.TreeNode, len(nodes))
 	copy(sorted, nodes)
 	sort.Slice(sorted, func(i, j int) bool {
@@ -380,7 +362,6 @@ func printTreeSummary(bw *bufio.Writer, c *colorizer, nodes []report.TreeNode, e
 		return sorted[i].ID < sorted[j].ID
 	})
 
-	// Print up to 20 nodes; summarize the rest.
 	limit := 20
 	for i, n := range sorted {
 		if i >= limit {

@@ -1,11 +1,12 @@
 package store
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -93,7 +94,7 @@ func (r *RegressionDetector) Record(snap AssertionSnapshot) ([]RegressionAlert, 
 				})
 			}
 		}
-		sort.Slice(alerts, func(i, j int) bool { return alerts[i].Property < alerts[j].Property })
+		slices.SortFunc(alerts, func(a, b RegressionAlert) int { return cmp.Compare(a.Property, b.Property) })
 	}
 
 	existing = append(existing, snap)

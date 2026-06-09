@@ -9,36 +9,22 @@ import (
 
 // FrontierEntry is a candidate snapshot for further exploration.
 type FrontierEntry struct {
-	SnapshotID     snapshot.ID
-	Score          float64
-	Depth          uint32
-	NewEdges       uint64
-	NoveltyScore   float64 // composite score from max map + state map + assertions
-	RarityScore    float64 // FairFuzz-style: sum(1/frequency) for rare edges (P2)
-	SometimesBoost float64 // bonus for proximity to unmet Sometimes assertions (P0)
-	Energy         int     // AFLFast-style: branches to allocate for this entry (P1)
-	CreatedAtStep  uint64  // step when this entry was created, for staleness decay (P3)
-	PathHash       uint64  // coverage path hash for frequency tracking (P1)
-	FaultKindMask  uint16  // bitmask of fault.KindMask values active when this snapshot was taken
-	ReachableBoost float64 // bonus for snapshots that first reached a Reachable assertion
-	// SaturationScore is 1.0 for fully unsaturated subtrees, approaching 0 for
-	// exhausted subtrees. Used by adaptive burst duration to shorten time on dead-ends.
-	SaturationScore float64
-	// RecentNewEdges is the raw new-edge count at the time this entry was pushed
-	// to the frontier. Used by adaptive burst to give more time to recently-novel states.
-	RecentNewEdges uint64
-	// ActiveFaultKind is the fault kind injected when this snapshot was created.
-	// Non-empty means the SUT is running under an active fault during the next burst.
-	ActiveFaultKind string
-	// GlobalSaturation is [0, 1]: 0 = coverage actively growing, 1 = fully saturated.
-	// Set by Explorer.PushFrontier from MarginalRate(). Used by the scorer to shift
-	// from coverage-primary to violation-primary weighting as exploration matures.
-	GlobalSaturation float64
-	// FaultActiveEvalScore counts assertion evaluations that occurred while a fault
-	// was active during the burst that created this snapshot. A nonzero score means
-	// the SUT was under fault pressure at the assertion site - the defining precondition
-	// for finding violations. Used by the scorer to boost these states over ones where
-	// faults and assertions are temporally decoupled.
+	SnapshotID           snapshot.ID
+	Score                float64
+	Depth                uint32
+	NewEdges             uint64
+	NoveltyScore         float64
+	RarityScore          float64
+	SometimesBoost       float64
+	Energy               int
+	CreatedAtStep        uint64
+	PathHash             uint64
+	FaultKindMask        uint16
+	ReachableBoost       float64
+	SaturationScore      float64
+	RecentNewEdges       uint64
+	ActiveFaultKind      string
+	GlobalSaturation     float64
 	FaultActiveEvalScore float64
 	index                int // heap index, managed by container/heap
 }
@@ -48,9 +34,7 @@ type frontierHeap []*FrontierEntry
 
 func (h frontierHeap) Len() int { return len(h) }
 
-// Less orders entries by descending Score. Determinism: ties are broken by
-// ascending SnapshotID so two runs with the same scores produce byte-identical
-// heap ordering (container/heap does not otherwise guarantee tie stability).
+// Less orders entries by descending Score, with ascending SnapshotID as tiebreaker.
 func (h frontierHeap) Less(i, j int) bool {
 	if h[i].Score != h[j].Score {
 		return h[i].Score > h[j].Score
@@ -127,15 +111,10 @@ func (f *Frontier) IDs() []snapshot.ID {
 
 // Trim keeps only the top n highest-scoring entries. Returns the snapshot IDs
 // of all dropped entries so the caller can delete the corresponding snapshots.
-// No-op if the frontier already has n or fewer entries.
 func (f *Frontier) Trim(n int) []snapshot.ID {
 	if len(f.h) <= n {
 		return nil
 	}
-	// Sort descending by score to identify the top n.
-	// Determinism: tie-break by ascending SnapshotID so two runs that produce
-	// the same score distribution trim identical entries (slices.SortFunc is
-	// not stable, so a tie-breaker on a stable field is required).
 	all := make([]*FrontierEntry, len(f.h))
 	copy(all, f.h)
 	slices.SortFunc(all, func(a, b *FrontierEntry) int {
@@ -159,7 +138,6 @@ func (f *Frontier) Trim(n int) []snapshot.ID {
 		dropped = append(dropped, e.SnapshotID)
 	}
 
-	// Rebuild heap with only the top n entries.
 	f.h = frontierHeap(all[:n])
 	for i, e := range f.h {
 		e.index = i

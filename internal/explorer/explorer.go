@@ -288,15 +288,6 @@ func (e *Explorer) SaveCorpus() error {
 }
 
 // Run performs exploration until completion or context cancellation.
-//
-// Algorithm:
-//  1. Start VM from root, collect initial coverage
-//  2. Take checkpoint if new coverage found
-//  3. Pop highest-scoring frontier entry
-//  4. Restore snapshot, inject new entropy (different seed)
-//  5. Run forward, collect coverage, record violations
-//  6. If new coverage: push checkpoint to frontier
-//  7. Repeat until maxStates, maxDuration, or context done
 func (e *Explorer) Run(ctx context.Context, vm *hypervisor.VM) (*Result, error) {
 	start := time.Now()
 	deadline := start.Add(e.cfg.MaxDuration)
@@ -391,10 +382,8 @@ func (e *Explorer) Run(ctx context.Context, vm *hypervisor.VM) (*Result, error) 
 }
 
 // ReportViolation records a property violation.
-// Automatically extracts the snapshot path from root to the violating state;
-// this path is the minimal execution trace for shrinking (ddmin over fault schedules).
+// Extracts the snapshot path from root to the violating state for use in shrinking.
 func (e *Explorer) ReportViolation(v Violation) {
-	// Extract path and fault mask from snapshot (outside lock; tree has its own lock).
 	if v.SnapshotID != 0 {
 		v.Path = e.tree.PathToRoot(v.SnapshotID)
 		if snap, err := e.tree.Get(v.SnapshotID); err == nil {
@@ -421,15 +410,11 @@ func (e *Explorer) ViolationCount() int {
 }
 
 // RecordAssertionEval records a full assertion evaluation for findability analysis.
-// Unlike RecordAssertion (which only counts), this stores every evaluation.
-// To keep memory bounded, we sample: record all failures, and 1-in-10 passes.
-//
-// Per-property counts are tracked on every call (before sampling) so totals are exact.
+// Per-property counts are exact; evaluations are sampled (all failures, 1-in-10 passes).
 func (e *Explorer) RecordAssertionEval(eval AssertionEval) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Track exact per-property counts (every evaluation, before sampling).
 	key := eval.AssertType + "\x00" + eval.Message
 	pc := e.propertyCounts[key]
 	if pc == nil {
@@ -446,9 +431,6 @@ func (e *Explorer) RecordAssertionEval(eval AssertionEval) {
 		pc.Failed++
 	}
 
-	// Track Sometimes evaluation for this step.
-	// When a Sometimes is satisfied for the first time, mark it globally.
-	// Per-step tracking drives frontier scoring toward unmet goals.
 	if eval.AssertType == "sometimes" {
 		if eval.Condition {
 			e.sometimesSatisfied[eval.Message] = true
@@ -458,7 +440,6 @@ func (e *Explorer) RecordAssertionEval(eval AssertionEval) {
 		}
 	}
 
-	// SometimesAll: treated as both "sometimes" (for P0) and sub-goal tracker.
 	if eval.AssertType == "sometimes_all" {
 		if eval.Condition {
 			e.sometimesSatisfied[eval.Message] = true
@@ -468,9 +449,6 @@ func (e *Explorer) RecordAssertionEval(eval AssertionEval) {
 		}
 	}
 
-	// Track Reachable assertions for first-reach frontier boost.
-	// condition==true means the code was reached (Reachable assertion passed).
-	// condition==false means it has not been reached yet (proximity signal).
 	if eval.AssertType == "reachable" {
 		if eval.Condition && !e.reachableSeen[eval.Message] {
 			e.reachableSeen[eval.Message] = true
@@ -482,8 +460,6 @@ func (e *Explorer) RecordAssertionEval(eval AssertionEval) {
 		}
 	}
 
-	// Always record failures. For passes: record the first 5 evals per property
-	// (guarantees timeline data), then sample at 10% to bound memory.
 	if eval.Condition && pc.Total > 5 && e.states%10 != 0 {
 		return
 	}
@@ -504,7 +480,6 @@ func (e *Explorer) RecordAssertion(assertType string, condition bool) {
 			e.assertions.AlwaysFailed++
 		}
 	case "unreachable":
-		// Unreachable assertions that fire are always violations (code was reached).
 		e.assertions.AlwaysTotal++
 		e.assertions.AlwaysFailed++
 	case "sometimes", "sometimes_all":
@@ -537,7 +512,6 @@ func (e *Explorer) runForward(ctx context.Context, vm *hypervisor.VM, parentID s
 		return parentID, nil
 	}
 
-	// Ask the hypervisor to capture VM state.
 	hypSnapID, err := e.hyp.Snapshot(ctx, vm)
 	if err != nil {
 		return parentID, fmt.Errorf("explorer snapshot: %w", err)
@@ -546,7 +520,6 @@ func (e *Explorer) runForward(ctx context.Context, vm *hypervisor.VM, parentID s
 	covHash := e.coverage.Hash()
 	rngState := e.rng.State()
 
-	// Store the hypervisor-assigned snapshot ID so restore can map back.
 	childID, err := e.tree.Create(parentID, hypSnapID, 0, covHash, rngState, 0, 0)
 	if err != nil {
 		return parentID, fmt.Errorf("explorer create snapshot: %w", err)
@@ -556,12 +529,6 @@ func (e *Explorer) runForward(ctx context.Context, vm *hypervisor.VM, parentID s
 }
 
 // PushFrontier scores a snapshot and adds it to the exploration frontier.
-// Incorporates:
-//   - IJON-style novelty (max map, state-space, assertion novelty)
-//   - P0: Sometimes-assertion-driven exploration
-//   - P1: AFLFast-style power schedule (energy ∝ 1/path frequency)
-//   - P2: FairFuzz-style rare-edge scoring (edges weighted by 1/hit_count)
-//   - P3: Staleness tracking (CreatedAtStep for decay)
 func (e *Explorer) PushFrontier(id snapshot.ID) {
 	snap, err := e.tree.Get(id)
 	if err != nil {
@@ -570,25 +537,14 @@ func (e *Explorer) PushFrontier(id snapshot.ID) {
 
 	e.mu.Lock()
 
-	// Collect per-step novelty from IJON-style feedback channels.
 	newMax, newExplore, newAsserts := e.coverage.StepNovelty()
 
-	// Assertion-driven novelty weights (properties primary).
-	// Assertion novelty is the dominant IJON signal; new assertion situations
-	// (new fault+state combos, new code reaching assertions) drive exploration.
-	//   Assertion novelty: 3000x (primary: new situations involving properties)
-	//   MaximizeInt hits:  1000x (secondary: hill-climbing toward deep states)
-	//   Explore hits:       300x (tertiary: diverse state-space coverage)
 	noveltyScore := float64(newAsserts)*3000 +
 		float64(newMax)*1000 +
 		float64(newExplore)*300
 
-	// FairFuzz-style rare-edge rarity score.
-	// sum(1/edgeHits[i]) for edges newly discovered this step.
-	// Rare edges (low hit count) contribute more.
 	rarityScore := e.coverage.StepEdgeRarity()
 
-	// Boost states that evaluated unmet Sometimes assertions.
 	sometimesBoost := 0.0
 	for msg, condition := range e.stepSometimesEvals {
 		if condition && !e.sometimesSatisfied[msg] {
@@ -599,7 +555,6 @@ func (e *Explorer) PushFrontier(id snapshot.ID) {
 		}
 	}
 
-	// SometimesAll sub-goal chasing.
 	for _, eval := range e.stepSometimesAllEvals {
 		boost := RecordSometimesAllEval(e.sometimesAllTracker, eval)
 		sometimesBoost += boost
@@ -608,10 +563,6 @@ func (e *Explorer) PushFrontier(id snapshot.ID) {
 		e.coverage.RecordAssertionNovelty(covKey)
 	}
 
-	// Reachable-assertion proximity boost.
-	// +4000 for the first time a Reachable assertion fires (code first reached).
-	// +1500 for each Reachable that still hasn't fired (proximity signal: keep
-	// exploring paths that evaluate but haven't yet reached this code).
 	reachableBoost := 0.0
 	for msg, firstReach := range e.stepReachableEvals {
 		if firstReach {
@@ -621,7 +572,6 @@ func (e *Explorer) PushFrontier(id snapshot.ID) {
 		}
 	}
 
-	// Track path frequency for AFLFast power schedule.
 	pathHash := e.coverage.Hash()
 	e.pathFrequency[pathHash]++
 
@@ -634,14 +584,6 @@ func (e *Explorer) PushFrontier(id snapshot.ID) {
 	detCov := e.deterministicCoverage
 	e.mu.Unlock()
 	if detCov {
-		// In deterministic-coverage mode (patched QEMU backend), all vsock-derived
-		// score components are excluded. vsock assertion/guidance events arrive with
-		// non-deterministic timing relative to burst boundaries, so NoveltyScore,
-		// SometimesBoost, ReachableBoost, and the cumulative newEdges counter all
-		// vary between otherwise-identical runs. The only deterministic signals are
-		// RarityScore (from SHM KCOV, flushed at burst boundaries) and faultDiversity
-		// (from the deterministic fault RNG). These are sufficient tiebreakers; the
-		// frontier's SnapshotID tiebreaker in Less() ensures stable tie resolution.
 		newEdges = 0
 		noveltyScore = 0
 		sometimesBoost = 0
@@ -650,11 +592,6 @@ func (e *Explorer) PushFrontier(id snapshot.ID) {
 
 	stepNewEdgesForEntry := e.coverage.NewEdges()
 
-	// Global saturation: how much coverage has flattened across the whole run.
-	// MarginalRate < 0.1 edge/burst = fully saturated (sat=1).
-	// MarginalRate > 2.0 edges/burst = actively growing (sat=0).
-	// Clamped to [0, 1] and used by the scorer to shift from coverage-primary
-	// to violation-primary weighting.
 	marginal := e.MarginalRate()
 	globalSat := 1.0 - clampF64((marginal-0.1)/1.9, 0.0, 1.0)
 
@@ -673,10 +610,6 @@ func (e *Explorer) PushFrontier(id snapshot.ID) {
 		GlobalSaturation: globalSat,
 	}
 
-	// Subtree saturation: discount entries in locally-exhausted subtrees.
-	// Assertion-driven boosts are protected from this discount so violation-prone
-	// states stay explorable even when their subtree's coverage is exhausted.
-	// Coverage-based signals (edges, rarity, novelty) are discounted.
 	subtreeRoot := SubtreeRoot(e.tree, id)
 	satScore := 1.0
 	if !detCov {
@@ -685,35 +618,23 @@ func (e *Explorer) PushFrontier(id snapshot.ID) {
 	entry.SaturationScore = satScore
 
 	rawScore := e.scorer.Score(entry)
-	// Assertion boosts stay at full strength regardless of subtree saturation:
-	// a saturated subtree may still be the best path toward a violation.
 	assertionBase := entry.SometimesBoost + entry.ReachableBoost
 	coverageScore := rawScore - assertionBase
 	entry.Score = assertionBase + coverageScore*satScore
 	if detCov {
-		// Energy=1 normalizes expansion counts across runs. The AFLFast power
-		// schedule (computeEnergy) uses pathFrequency[pathHash] where pathHash
-		// is computed from the full coverage bitmap including vsock-derived edges.
-		// Different vsock timing → different pathHash → different energy → different
-		// number of bursts from the same parent → divergent tree structure.
-		// With energy=1, each frontier entry gets exactly one burst, eliminating
-		// this non-determinism at the cost of AFLFast scheduling efficiency.
 		entry.Energy = 1
 	} else {
 		entry.Energy = e.computeEnergy(entry)
 	}
 
-	// MCTS: register node and use frontier as fallback.
 	if e.mcts != nil {
 		e.mcts.RegisterNode(id, snap.ParentID, snap.Depth)
 	}
 	e.frontier.Push(entry)
 
-	// Record discovery for saturation tracking.
-	stepNewEdges := e.coverage.NewEdges() // cumulative, but delta is ok for rate
+	stepNewEdges := e.coverage.NewEdges()
 	e.saturation.RecordDiscovery(subtreeRoot, stepNewEdges)
 
-	// Reset step counters so the next frontier push starts fresh.
 	e.coverage.ResetStepNovelty()
 	e.mu.Lock()
 	e.stepSometimesEvals = make(map[string]bool)
@@ -722,11 +643,8 @@ func (e *Explorer) PushFrontier(id snapshot.ID) {
 	e.mu.Unlock()
 }
 
-// ClearStepAssertionEvals zeroes the per-step assertion maps AND the coverage
-// assertion-novelty counter so that the next PushFrontier call assigns zero
-// novelty/reachability boosts. Use this when coverage is read from a
-// deterministic SHM source (patched QEMU backend) and vsock assertion delivery
-// timing would otherwise cause non-deterministic frontier scoring between runs.
+// ClearStepAssertionEvals zeroes the per-step assertion maps and the coverage
+// assertion-novelty counter so the next PushFrontier assigns zero novelty/reachability boosts.
 func (e *Explorer) ClearStepAssertionEvals() {
 	e.mu.Lock()
 	e.stepSometimesEvals = make(map[string]bool)
@@ -736,12 +654,8 @@ func (e *Explorer) ClearStepAssertionEvals() {
 	e.coverage.ClearStepAssertionNovelty()
 }
 
-// SetDeterministicCoverage controls whether PushFrontier zeroes the NewEdges
-// field in each frontier entry before computing its score. When true, the
-// cumulative newEdges counter (which includes vsock-timing-dependent
-// assertion/guidance contributions) is excluded from scoring. The effective
-// score formula becomes: RarityScore*500 + faultDiversity - Depth.
-// Must be called before exploration begins.
+// SetDeterministicCoverage controls whether PushFrontier excludes vsock-derived
+// score components. Must be called before exploration begins.
 func (e *Explorer) SetDeterministicCoverage(v bool) {
 	e.mu.Lock()
 	e.deterministicCoverage = v
@@ -749,9 +663,7 @@ func (e *Explorer) SetDeterministicCoverage(v bool) {
 }
 
 // computeEnergy returns the number of branches to allocate for this entry.
-// AFLFast-style: entries with rare coverage paths get more energy (branches),
-// entries on frequently-exercised paths get fewer. This prevents wasting
-// branches on thoroughly-explored states.
+// Entries with rare coverage paths get more energy; frequently-visited paths get fewer.
 func (e *Explorer) computeEnergy(entry *FrontierEntry) int {
 	e.mu.Lock()
 	freq := e.pathFrequency[entry.PathHash]
@@ -763,12 +675,10 @@ func (e *Explorer) computeEnergy(entry *FrontierEntry) int {
 	base := e.cfg.BranchFactor
 	energy := float64(base) / float64(freq)
 
-	// Assertion-driven energy boost: entries near unmet goals get 2x energy.
 	if entry.SometimesBoost > 0 || entry.ReachableBoost > 0 {
 		energy *= 2
 	}
 
-	// Clamp to [1, 4*base].
 	maxEnergy := base * 4
 	if energy < 1 {
 		return 1
@@ -780,14 +690,10 @@ func (e *Explorer) computeEnergy(entry *FrontierEntry) int {
 }
 
 // PopFrontier removes and returns the highest-scoring frontier entry.
-//
-// When MCTS is enabled, selection walks the snapshot tree using UCB1
-// instead of popping from the max-heap.
-//
-// Otherwise, applies staleness decay (P3): entries older than 50 steps
-// lose 10% priority per pop and are re-pushed.
+// When MCTS is enabled, selection walks the snapshot tree via UCB1.
+// Otherwise, staleness decay applies: entries older than 50 steps lose 10%
+// priority per pop and are re-pushed.
 func (e *Explorer) PopFrontier() *FrontierEntry {
-	// MCTS: select via UCB1 tree walk.
 	if e.mcts != nil {
 		selectedID := e.mcts.Select(e.rng)
 		snap, err := e.tree.Get(selectedID)
@@ -806,11 +712,10 @@ func (e *Explorer) PopFrontier() *FrontierEntry {
 	return e.popFrontierHeap()
 }
 
-// popFrontierHeap is the heap-based selection with staleness decay.
 func (e *Explorer) popFrontierHeap() *FrontierEntry {
 	currentStep := e.States()
 
-	for attempts := 0; attempts < 3; attempts++ {
+	for range 3 {
 		entry := e.frontier.Pop()
 		if entry == nil {
 			return nil
@@ -825,7 +730,6 @@ func (e *Explorer) popFrontierHeap() *FrontierEntry {
 		return entry
 	}
 
-	// After max retries, return whatever is on top.
 	return e.frontier.Pop()
 }
 
@@ -854,9 +758,6 @@ func (e *Explorer) UpdateSaturation() {
 	}
 	e.saturation.mu.RUnlock()
 
-	// Determinism: sort keys, Go map iteration is randomized. UpdateChao1
-	// emits "subtree saturated" slog lines whose ordering is observable in
-	// captured logs.
 	slices.SortFunc(roots, func(a, b snapshot.ID) int {
 		if a < b {
 			return -1
@@ -883,10 +784,7 @@ func (e *Explorer) Frontier() *Frontier { return e.frontier }
 // Coverage returns the coverage tracker.
 func (e *Explorer) Coverage() *CoverageTracker { return e.coverage }
 
-// SometimesAllTracker returns the internal SometimesAll state tracker map so
-// callers (e.g. the serial orchestrator path) can call the package-level
-// RecordSometimesAllEval function directly and inspect the returned boost
-// without going through the deferred PushFrontier path.
+// SometimesAllTracker returns the internal SometimesAll state tracker map.
 func (e *Explorer) SometimesAllTracker() map[string]*SometimesAllState {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -911,7 +809,6 @@ func (e *Explorer) PropertyCounts() map[string]*PropertyCount {
 }
 
 // RecordBurst records the new-edge count for one burst, advancing the marginal window.
-// Called by the orchestrator after each burst so MarginalRate reflects recent coverage velocity.
 func (e *Explorer) RecordBurst(newEdges int) {
 	e.mu.Lock()
 	e.marginalWindow[e.marginalPos%e.marginalWindowSize] = newEdges
@@ -920,7 +817,7 @@ func (e *Explorer) RecordBurst(newEdges int) {
 }
 
 // MarginalRate returns the rolling average of new edges per burst over the last window.
-// Returns 1.0 if no bursts have been recorded yet (optimistic: don't declare saturation early).
+// Returns 1.0 if no bursts have been recorded yet.
 func (e *Explorer) MarginalRate() float64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -969,10 +866,6 @@ func (e *Explorer) BuildResult(start time.Time) *Result {
 	copy(result.Violations, e.violations)
 	copy(result.AssertionEvals, e.assertionEvals)
 
-	// Copy per-property counts.
-	// Determinism: sort keys, Go map iteration is randomized. PropertyCounts
-	// is serialized into reports (JSON, HTML) and consumed by downstream
-	// tooling; entry order must be stable across runs.
 	pcKeys := make([]string, 0, len(e.propertyCounts))
 	for k := range e.propertyCounts {
 		pcKeys = append(pcKeys, k)
@@ -984,7 +877,6 @@ func (e *Explorer) BuildResult(start time.Time) *Result {
 		result.PropertyCounts = append(result.PropertyCounts, &cp)
 	}
 
-	// Copy SometimesAll tracker state (deep copy - each state owns a map).
 	if len(e.sometimesAllTracker) > 0 {
 		result.SometimesAllStates = make(map[string]*SometimesAllState, len(e.sometimesAllTracker))
 		for name, st := range e.sometimesAllTracker {

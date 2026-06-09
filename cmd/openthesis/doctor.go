@@ -275,7 +275,6 @@ func gvisorChecks() []check {
 	}
 }
 
-// fcVersion attempts to run `firecracker --version` and returns " (vX.Y.Z)" or "".
 func fcVersion(p string) string {
 	out, err := exec.Command(p, "--version").Output()
 	if err != nil {
@@ -290,7 +289,6 @@ func fcVersion(p string) string {
 	return ""
 }
 
-// hasCapNetAdmin reads /proc/self/status to check for CAP_NET_ADMIN.
 func hasCapNetAdmin() bool {
 	data, err := os.ReadFile("/proc/self/status")
 	if err != nil {
@@ -311,7 +309,6 @@ func hasCapNetAdmin() bool {
 	return false
 }
 
-// ANSI color helpers - only emit sequences on TTY stderr.
 func green(s string) string {
 	if !isTerminal(os.Stderr) {
 		return s

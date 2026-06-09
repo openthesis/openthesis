@@ -24,12 +24,7 @@ import (
 )
 
 // cmdInvestigate implements `openthesis investigate --artifact <dir>`.
-// It loads a violation artifact, reads the event log from the originating run,
-// and produces a human-readable causal chain of faults and assertions leading
-// to the violation.
-//
-// With --likelihood it also computes the Bug Likelihood Over Time curve by
-// running parallel replays with progressively truncated fault schedules.
+// Prints the causal fault/assertion chain; --likelihood adds a probability-over-time curve.
 func cmdInvestigate(args []string) int {
 	fs := flag.NewFlagSet("investigate", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -59,7 +54,6 @@ func cmdInvestigate(args []string) int {
 		return 1
 	}
 
-	// Load artifact.
 	artifact, err := report.LoadBundle(absArtifactDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: load artifact: %v\n", err)
@@ -80,7 +74,6 @@ func cmdInvestigate(args []string) int {
 
 	evFile := *eventsPath
 	if evFile == "" {
-		// Heuristic: artifact is at {runDir}/violations/{bundle}/; events.jsonl is at {runDir}/events.jsonl.
 		evFile = filepath.Join(absArtifactDir, "..", "..", "events.jsonl")
 	}
 	evFile = filepath.Clean(evFile)
@@ -164,7 +157,6 @@ func runLikelihood(w io.Writer, artifact *report.Artifact, artifactDir, configPa
 	var probBar [5]int // checkpoint index → progress bar dots
 	progressFn := func(label string, trial, total int, reproduced bool) {
 		if !jsonOut {
-			// Find the probe index by label order.
 			labels := []string{"0%", "25%", "50%", "75%", "100%"}
 			for i, l := range labels {
 				if l == label {
@@ -217,7 +209,6 @@ func printLikelihoodResult(w io.Writer, r *orchestrator.LikelihoodResult, elapse
 	fmt.Fprintf(w, "  Violation: step %d\n", r.ViolationStep)
 	fmt.Fprintf(w, "  Computed in %s\n\n", elapsed.Round(time.Second))
 
-	// Chart: horizontal bar chart of probabilities.
 	fmt.Fprintf(w, "  P(bug) by fault schedule coverage:\n\n")
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, p := range r.Probes {
@@ -293,7 +284,6 @@ func loadCausalEvents(evFile string, violationStep uint64) (faults []eventstore.
 
 // printCausalChain renders the sequence of faults and key assertion events.
 func printCausalChain(w io.Writer, faults, asserts []eventstore.Event, violationStep uint64) {
-	// Merge and sort all events by step.
 	type entry struct {
 		step    uint64
 		vtime   uint64
@@ -330,7 +320,6 @@ func printCausalChain(w io.Writer, faults, asserts []eventstore.Event, violation
 		})
 	}
 
-	// Include assertion FAILURES leading up to violation (last 5).
 	type assertEntry struct {
 		step    uint64
 		vtime   uint64
@@ -349,7 +338,6 @@ func printCausalChain(w io.Writer, faults, asserts []eventstore.Event, violation
 			})
 		}
 	}
-	// Keep only the last 5 assertion failures.
 	if len(assertFails) > 5 {
 		assertFails = assertFails[len(assertFails)-5:]
 	}
@@ -410,7 +398,6 @@ func printFaultScheduleSummary(w io.Writer, schedulePath string, violationStep u
 		return
 	}
 
-	// Count by kind.
 	byKind := make(map[string]int)
 	for _, e := range sched.Entries {
 		byKind[e.FaultKind]++
@@ -430,22 +417,18 @@ func printInvestigateCommands(w io.Writer, artifactDir, configPath string, artif
 		backend = "firecracker"
 	}
 
-	fmt.Fprintf(w, "  # Reproduce the violation deterministically:\n")
 	fmt.Fprintf(w, "  openthesis replay --backend %s \\\n", backend)
 	fmt.Fprintf(w, "    --artifact %s \\\n", artifactDir)
 	fmt.Fprintf(w, "    --config %s --verify\n\n", configPath)
 
-	fmt.Fprintf(w, "  # Minimize the fault schedule to the simplest reproducer:\n")
 	fmt.Fprintf(w, "  openthesis shrink --backend %s \\\n", backend)
 	fmt.Fprintf(w, "    --artifact %s \\\n", artifactDir)
 	fmt.Fprintf(w, "    --config %s\n\n", configPath)
 
-	fmt.Fprintf(w, "  # Find which fault type is causally responsible:\n")
 	fmt.Fprintf(w, "  openthesis branch --backend %s \\\n", backend)
 	fmt.Fprintf(w, "    --artifact %s \\\n", artifactDir)
 	fmt.Fprintf(w, "    --config %s\n\n", configPath)
 
-	fmt.Fprintf(w, "  # Compute when the bug became inevitable (5 min):\n")
 	fmt.Fprintf(w, "  openthesis investigate --likelihood --backend %s \\\n", backend)
 	fmt.Fprintf(w, "    --artifact %s \\\n", artifactDir)
 	fmt.Fprintf(w, "    --config %s\n\n", configPath)
