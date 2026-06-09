@@ -1,0 +1,41 @@
+--- /tmp/x86.c.orig
++++ /usr/src/linux-source-6.8.0/arch/x86/kvm/x86.c
+@@ -4787,6 +4787,9 @@
+ 	case KVM_CAP_RDTSC_EXITING:
+ 		r = 1;
+ 		break;
++	case KVM_CAP_HLT_USER_EXIT:
++		r = 1;
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -6468,6 +6471,13 @@
+ 	case KVM_CAP_RDTSC_EXITING:
+ 		r = -EINVAL;
+ 		if (cap->flags || cap->args[0])
+ 			break;
+ 		kvm->arch.rdtsc_exiting = true;
+ 		r = 0;
+ 		break;
++	case KVM_CAP_HLT_USER_EXIT:
++		r = -EINVAL;
++		if (cap->flags || cap->args[0])
++			break;
++		kvm->arch.hlt_user_exit = true;
++		r = 0;
++		break;
+ 	case KVM_CAP_SPLIT_IRQCHIP: {
+@@ -9683,6 +9689,12 @@
+ int kvm_emulate_halt(struct kvm_vcpu *vcpu)
+ {
+ 	int ret = kvm_skip_emulated_instruction(vcpu);
++
++	if (vcpu->kvm->arch.hlt_user_exit) {
++		vcpu->run->exit_reason = KVM_EXIT_HLT;
++		return 0;
++	}
++
+ 	/*
+ 	 * TODO: we might be squashing a GUESTDBG_SINGLESTEP-triggered
+ 	 * KVM_EXIT_DEBUG here.

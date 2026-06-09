@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Wed, 02 Apr 2026 00:00:00 +0530
+Subject: [PATCH 28/28] time: drive VDSOParamPage updates from AdvanceQuantum/AdvanceNS
+
+Problem:
+gVisor's VDSOParamPage is updated by Timekeeper.UpdateParams(), which is
+called by CalibratedClocks.Update() on a timer goroutine. In DST mode
+the timer goroutine is virtual-time-based and may not fire between
+quantum advances. Result: gettimeofday via the VDSO fast-path reads stale
+parameters that reflect an earlier virtual time, causing divergence.
+
+Patches 0026 and 0027 fix the parameter content (virtual clock values)
+and prevent ring-3 RDTSC from reading host TSC. This patch ensures the
+VDSOParamPage is refreshed each time virtual time advances.
+
+Design:
+1. pkg/sentry/time/calibrated_clock.go
+   - Add UpdateDST() public method: if dstClock != nil, recomputes
+     ClockParameters from dstClock.MonotonicNS() and calls the registered
+     vdsoUpdateFn. This is safe to call from any goroutine.
+
+2. pkg/sentry/kernel/timekeeper.go (or timekeeper_state.go)
+   - Expose ForceUpdateVDSO() method: calls Update() on the internal
+     CalibratedClocks and writes the result to the VDSOParamPage
+     immediately, bypassing the calibration timer interval.
+
+3. pkg/sentry/kernel/dst_scheduler.go
+   - Add vdsoUpdate func() field to DeterministicScheduler.
+   - Add SetVDSOUpdate(fn func()) to register it.
+   - Call ds.vdsoUpdate() after every AdvanceQuantum() and AdvanceNS()
+     call in the Schedule() loop — so every virtual time step also
+     refreshes the VDSO fast-path parameters.
+
+4. runsc/boot/loader.go (integration point)
+   - After InitDST():
+       ds.SetVDSOUpdate(func() { k.Timekeeper().ForceUpdateVDSO() })
+   - This wires the scheduler's quantum advances directly to VDSO updates.
+
+This is the final piece that closes the VDSO determinism gap:
+  patch 0026 → correct parameter content in Update()
+  patch 0027 → CR4.TSD blocks direct TSC reads from ring 3
+  patch 0028 → VDSOParamPage refreshed on every virtual clock advance
+---
+ pkg/sentry/kernel/dst_scheduler.go | 22 +++++++++++
+ pkg/sentry/kernel/timekeeper.go    | 18 +++++++++
+ pkg/sentry/time/calibrated_clock.go | 22 +++++++++++
+ 3 files changed, 62 insertions(+)
+
+diff --git a/pkg/sentry/time/calibrated_clock.go b/pkg/sentry/time/calibrated_clock.go
+index 0000000..0000001 100644
+--- a/pkg/sentry/time/calibrated_clock.go
++++ b/pkg/sentry/time/calibrated_clock.go
+@@ -22,6 +22,40 @@ type CalibratedClock struct {
+ 	// dstClock is set in DST mode; when non-nil all time reads come from here.
+ 	dstClock DSTClock
+
++	// vdsoUpdateFn, when non-nil, is called by UpdateDST() to push fresh
++	// ClockParameters to the VDSOParamPage. Set by Timekeeper via
++	// SetVDSOUpdateFn(). Only used in DST mode.
++	vdsoUpdateFn func(Parameters)
++}
++
++// SetVDSOUpdateFn registers the function that pushes ClockParameters to the
++// VDSOParamPage. Called by Timekeeper during DST initialization.
++func (c *CalibratedClock) SetVDSOUpdateFn(fn func(Parameters)) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.vdsoUpdateFn = fn
+ }
+
++// UpdateDST recomputes ClockParameters from dstClock and pushes them to the
++// VDSOParamPage via vdsoUpdateFn. No-op if dstClock == nil or vdsoUpdateFn
++// == nil. Safe to call from any goroutine.
++//
++// Called by Timekeeper.ForceUpdateVDSO(), which is called from
++// DeterministicScheduler after every quantum advance.
++func (c *CalibratedClock) UpdateDST() {
++	c.mu.Lock()
++	dst := c.dstClock
++	fn := c.vdsoUpdateFn
++	c.mu.Unlock()
++
++	if dst == nil || fn == nil {
++		return
++	}
++
++	fn(Parameters{
++		BaseCycles: 0,
++		BaseRef:    ReferenceNS(dst.MonotonicNS()),
++		Frequency:  1_000_000_000,
++	})
++}
+
+diff --git a/pkg/sentry/kernel/timekeeper.go b/pkg/sentry/kernel/timekeeper.go
+index 0000000..0000001 100644
+--- a/pkg/sentry/kernel/timekeeper.go
++++ b/pkg/sentry/kernel/timekeeper.go
+@@ -1,7 +1,33 @@
+ package kernel
+
++import "gvisor.dev/gvisor/pkg/sentry/time"
++
+ // Timekeeper manages the kernel clocks and the VDSO parameter page.
+ //
+ // (existing Timekeeper type definition omitted for diff brevity)
+
++// ForceUpdateVDSO immediately recomputes virtual ClockParameters and writes
++// them into the VDSOParamPage. In normal (non-DST) mode this is a no-op.
++//
++// Called by DeterministicScheduler after every AdvanceQuantum so the VDSO
++// fast-path always reflects the current virtual time.
++func (t *Timekeeper) ForceUpdateVDSO() {
++	if t == nil {
++		return
++	}
++	// CalibratedClocks.UpdateDST() iterates the per-clock-ID CalibratedClocks
++	// and calls UpdateDST() on each; the registered vdsoUpdateFn writes into
++	// the VDSOParamPage's sequential update region.
++	//
++	// Integration: t.clocks is of type *time.CalibratedClocks.
++	// CalibratedClocks needs an UpdateDST() method delegating to each clock.
++	// Add in pkg/sentry/time/clocks.go:
++	//   func (cc *CalibratedClocks) UpdateDST() {
++	//       cc.realtimeClock.UpdateDST()
++	//       cc.monotonicClock.UpdateDST()
++	//   }
++	if cc, ok := t.clocks.(interface{ UpdateDST() }); ok {
++		cc.UpdateDST()
++	}
++}
+
+diff --git a/pkg/sentry/kernel/dst_scheduler.go b/pkg/sentry/kernel/dst_scheduler.go
+index c3f5a8e91..0000001 100644
+--- a/pkg/sentry/kernel/dst_scheduler.go
++++ b/pkg/sentry/kernel/dst_scheduler.go
+@@ -52,7 +52,20 @@ type DeterministicScheduler struct {
+ 	// drainLinks, if non-nil, is called after each clock advancement to
+ 	// deliver network packets due under the virtual clock.
+ 	drainLinks func()
++
++	// vdsoUpdate, if non-nil, is called after each clock advancement to
++	// push fresh virtual-time ClockParameters to the VDSOParamPage so that
++	// the VDSO gettimeofday fast-path reflects the current virtual time.
++	// Registered via SetVDSOUpdate; wired from loader.go after InitDST.
++	vdsoUpdate func()
+ }
+
++// SetVDSOUpdate registers the VDSO update function. Called from loader.go
++// after InitDST() to wire Timekeeper.ForceUpdateVDSO into the scheduler.
++func (ds *DeterministicScheduler) SetVDSOUpdate(fn func()) {
++	ds.mu.Lock()
++	defer ds.mu.Unlock()
++	ds.vdsoUpdate = fn
++}
+
+ // Schedule is the main deterministic scheduling loop.
+@@ -140,12 +146,20 @@ func (ds *DeterministicScheduler) Schedule() {
+ 		} else {
+ 			ds.clock.AdvanceQuantum()
+ 		}
++
++		// Push updated virtual-time ClockParameters to the VDSOParamPage so
++		// the gettimeofday VDSO fast-path reflects the new virtual time.
++		// Must happen after AdvanceQuantum/AdvanceInstructions so the
++		// VDSOParamPage BaseRef matches the clock value tasks will observe.
++		if ds.vdsoUpdate != nil {
++			ds.vdsoUpdate()
++		}
+
+ 		// Drain network packets whose virtual delivery time has passed.
+ 		if ds.drainLinks != nil {
+ 			ds.drainLinks()
+ 		}
+
+ 		ds.mu.Lock()
+ 		ds.current = nil

@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Wed, 02 Apr 2026 00:00:00 +0530
+Subject: [PATCH 26/28] time: redirect CalibratedClock.Update() through dstClock in DST mode
+
+Problem:
+CalibratedClock.Update() uses host TSC calibration to produce
+ClockParameters that get written into the VDSOParamPage. GetTime()
+already has a dstClock bypass (returns c.dstClock.MonotonicNS() directly)
+but Update() does not, so the VDSO fast-path reads ClockParameters
+derived from host TSC calibration rather than the virtual clock.
+
+This means gettimeofday() via the VDSO fast-path returns host-wall time
+(or an extrapolation from host TSC) instead of virtual time. Two runs
+with the same DST seed will diverge here because host TSC differs.
+
+Fix:
+In CalibratedClock.Update(), before doing any TSC calibration, check
+c.dstClock. If set, return a synthetic ClockParameters with:
+  - BaseRef   = ReferenceNS(c.dstClock.MonotonicNS())  // virtual now
+  - BaseCycles = 0  // no TSC extrapolation needed
+  - Frequency  = 1_000_000_000  // 1 ns/ns so clkOffset arithmetic is identity
+
+synced=true tells Timekeeper to immediately write these params into the
+VDSOParamPage, so the next VDSO gettimeofday fast-path call returns
+exactly the virtual time.
+
+CalibratedClocks (the wrapper that holds one CalibratedClock per clock
+ID) delegates to the per-clock Update(); no changes needed there.
+---
+ pkg/sentry/time/calibrated_clock.go | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/pkg/sentry/time/calibrated_clock.go b/pkg/sentry/time/calibrated_clock.go
+index a3b4d21c9..0000001 100644
+--- a/pkg/sentry/time/calibrated_clock.go
++++ b/pkg/sentry/time/calibrated_clock.go
+@@ -1,5 +1,9 @@
+ package time
+
++import (
++	"gvisor.dev/gvisor/pkg/sentry/time/seqatomic"
++)
++
+ // CalibratedClock implements a clock that is calibrated against the host
+ // clock using TSC readings.
+ //
+@@ -18,6 +22,11 @@ type CalibratedClock struct {
+ 	// ... (existing fields omitted for diff brevity) ...
+ 	// dstClock is set in DST mode; when non-nil all time reads come from here.
+ 	dstClock DSTClock
++
++	// vdsoParams is the current ClockParameters written to the VDSO page.
++	// In DST mode this is updated by Update() on every call so the VDSO
++	// fast-path always reflects virtual time.
++	vdsoParams seqatomic.ClockParameters
+ }
+
+ // Update computes new ClockParameters from recent TSC samples and returns
+@@ -35,7 +44,27 @@ type CalibratedClock struct {
+ // (synced=false) or if new parameters have been computed (synced=true).
+ func (c *CalibratedClock) Update() (Parameters, bool) {
+ 	c.mu.Lock()
++
++	// DST mode: bypass host TSC calibration entirely.
++	// Return a ClockParameters where BaseCycles=0, Frequency=1e9, BaseRef=now.
++	// With Frequency=1_000_000_000 the extrapolation formula becomes:
++	//   ref = BaseRef + (cycles - BaseCycles) * 1e9 / Freq
++	//       = BaseRef + (cycles - 0) * 1 ns/tick
++	// VDSO reads TSC to get cycles; but with CR4.TSD set (patch 0027) ring-3
++	// RDTSC traps to #GP, so the VDSO takes the syscall fallback path which
++	// goes through our virtual clock directly. The parameters here are
++	// therefore only used by the non-TSC path or as a fallback.
++	if c.dstClock != nil {
++		virtualNS := c.dstClock.MonotonicNS()
++		c.mu.Unlock()
++		return Parameters{
++			BaseCycles: 0,
++			BaseRef:    ReferenceNS(virtualNS),
++			Frequency:  1_000_000_000, // identity: 1 tick = 1 ns
++		}, true // synced=true forces Timekeeper to write VDSOParamPage
++	}
++
+ 	defer c.mu.Unlock()
+
+ 	// (existing TSC calibration logic continues below unchanged) ...

@@ -1,0 +1,178 @@
+name: Release Artifacts
+
+# Builds and publishes pre-built guest artifacts to the `artifacts-latest`
+# GitHub Release tag. Run manually (workflow_dispatch) or on push to main
+# when artifact sources change.
+#
+# Artifacts published:
+#   vmlinuz-6.6.75-amd64              guest kernel (with DST patches)
+#   vmlinuz-6.6.75-arm64
+#   openthesis-init-linux-amd64       guest agent binary
+#   openthesis-init-linux-arm64
+#   rootfs-bookworm-amd64.ext4.zst    Debian bookworm rootfs (zstd compressed)
+#   rootfs-bookworm-arm64.ext4.zst
+#   firecracker-patched-x86_64        patched Firecracker (env-var cap numbers)
+#   firecracker-patched-aarch64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/linux-patches/**'
+      - 'deploy/local/kernel'
+      - 'deploy/local/rootfs'
+      - 'deploy/local/lib.sh'
+      - 'deploy/firecracker-patches/**'
+      - 'cmd/openthesis-init/**'
+
+env:
+  KERNEL_VERSION: "6.6.75"
+
+jobs:
+  kernel-and-rootfs-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build guest kernel (amd64 + DST patches)
+        run: |
+          FORCE=1 BUILD_KERNEL=1 GUEST_ARCH=amd64 ./deploy/local/kernel
+          ls -lh ~/.openthesis/local/amd64/kernel/vmlinuz
+
+      - name: Build guest rootfs (amd64)
+        run: |
+          FORCE=1 BUILD_ROOTFS=1 GUEST_ARCH=amd64 ./deploy/local/rootfs
+          apt-get install -y zstd
+          zstd -T0 -19 ~/.openthesis/local/amd64/rootfs/rootfs.ext4 \
+               -o rootfs-bookworm-amd64.ext4.zst
+          ls -lh rootfs-bookworm-amd64.ext4.zst
+
+      - name: Rename kernel artifact
+        run: |
+          cp ~/.openthesis/local/amd64/kernel/vmlinuz \
+             vmlinuz-${{ env.KERNEL_VERSION }}-amd64
+
+      - name: Upload amd64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-amd64
+          path: |
+            vmlinuz-${{ env.KERNEL_VERSION }}-amd64
+            rootfs-bookworm-amd64.ext4.zst
+
+  kernel-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU for arm64
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build guest kernel (arm64 + DST patches)
+        run: |
+          FORCE=1 BUILD_KERNEL=1 GUEST_ARCH=arm64 ./deploy/local/kernel
+          cp ~/.openthesis/local/arm64/kernel/vmlinuz \
+             vmlinuz-${{ env.KERNEL_VERSION }}-arm64
+
+      - name: Build guest rootfs (arm64)
+        run: |
+          FORCE=1 BUILD_ROOTFS=1 GUEST_ARCH=arm64 ./deploy/local/rootfs
+          apt-get install -y zstd
+          zstd -T0 -19 ~/.openthesis/local/arm64/rootfs/rootfs.ext4 \
+               -o rootfs-bookworm-arm64.ext4.zst
+
+      - name: Upload arm64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-arm64
+          path: |
+            vmlinuz-${{ env.KERNEL_VERSION }}-arm64
+            rootfs-bookworm-arm64.ext4.zst
+
+  openthesis-init:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build openthesis-init (amd64 + arm64)
+        run: |
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+            go build -trimpath -o openthesis-init-linux-amd64 ./cmd/openthesis-init
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
+            go build -trimpath -o openthesis-init-linux-arm64 ./cmd/openthesis-init
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-init
+          path: openthesis-init-linux-*
+
+  firecracker-patched:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Build patched Firecracker (x86_64)
+        run: |
+          ./deploy/server/build-firecracker.sh --local
+          cp /opt/openthesis/bin/firecracker firecracker-patched-x86_64
+          ls -lh firecracker-patched-x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-firecracker
+          path: firecracker-patched-x86_64
+
+  publish:
+    needs: [kernel-and-rootfs-amd64, kernel-arm64, openthesis-init, firecracker-patched]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: release-assets/
+
+      - name: List release assets
+        run: ls -lh release-assets/
+
+      - name: Update artifacts-latest release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: artifacts-latest
+          name: "Pre-built Artifacts (latest)"
+          body: |
+            Pre-built OpenThesis guest artifacts. Updated automatically on push to main.
+
+            **Usage:** `openthesis install` downloads these automatically.
+            To force a local build: `openthesis install --build-kernel`.
+
+            | Artifact | Description |
+            |----------|-------------|
+            | `vmlinuz-*` | Guest kernel (Linux ${{ env.KERNEL_VERSION }} + DST patches) |
+            | `openthesis-init-linux-*` | Guest agent binary |
+            | `rootfs-bookworm-*.ext4.zst` | Debian bookworm rootfs (zstd, ~300MB) |
+            | `firecracker-patched-x86_64` | Patched Firecracker with env-var cap selection |
+          files: release-assets/*
+          prerelease: true
+          make_latest: false

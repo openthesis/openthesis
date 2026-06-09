@@ -1,0 +1,63 @@
+From d8e777d047f508fb62d095e019c0737a0efb49d7 Mon Sep 17 00:00:00 2001
+From: OpenThesis Build <openthesis@localhost>
+Date: Sun, 5 Apr 2026 03:08:49 +0000
+Subject: [PATCH 3/6]  vmm: add seeded SplitMix64 PRNG
+
+Patch 0003: dst-seeded-rng
+- Add dst/prng.rs with SplitMix64 PRNG (deterministic, serializable)
+- Add dst_prng field to Entropy device (replaces aws-lc-rs when set)
+---
+ src/vmm/src/devices/virtio/rng/device.rs |  1 +
+ src/vmm/src/dst/prng.rs                  | 28 ++++++++++++++++++++++++
+ 2 files changed, 29 insertions(+)
+ create mode 100644 src/vmm/src/dst/prng.rs
+
+diff --git a/src/vmm/src/devices/virtio/rng/device.rs b/src/vmm/src/devices/virtio/rng/device.rs
+index 2c599f49..b163922d 100644
+--- a/src/vmm/src/devices/virtio/rng/device.rs
++++ b/src/vmm/src/devices/virtio/rng/device.rs
+@@ -55,6 +55,7 @@ pub struct Entropy {
+     rate_limiter: RateLimiter,
+ 
+     buffer: IoVecBufferMut,
++    pub dst_prng: Option<std::sync::Arc<std::sync::Mutex<crate::dst::prng::SplitMix64>>>,
+ }
+ 
+ impl Entropy {
+diff --git a/src/vmm/src/dst/prng.rs b/src/vmm/src/dst/prng.rs
+new file mode 100644
+index 00000000..60596b10
+--- /dev/null
++++ b/src/vmm/src/dst/prng.rs
+@@ -0,0 +1,28 @@
++use serde::{Serialize, Deserialize};
++
++#[derive(Debug, Serialize, Deserialize)]
++pub struct SplitMix64 { state: u64 }
++
++impl SplitMix64 {
++    pub fn new(seed: u64) -> Self { Self { state: seed } }
++    pub fn next_u64(&mut self) -> u64 {
++        self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
++        let mut z = self.state;
++        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
++        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
++        z ^ (z >> 31)
++    }
++    pub fn fill_bytes(&mut self, buf: &mut [u8]) {
++        let mut i = 0;
++        while i < buf.len() {
++            let val = self.next_u64();
++            let bytes = val.to_le_bytes();
++            let remaining = buf.len() - i;
++            let copy_len = remaining.min(8);
++            buf[i..i + copy_len].copy_from_slice(&bytes[..copy_len]);
++            i += copy_len;
++        }
++    }
++    pub fn state(&self) -> u64 { self.state }
++    pub fn set_state(&mut self, s: u64) { self.state = s; }
++}
+-- 
+2.43.0
+

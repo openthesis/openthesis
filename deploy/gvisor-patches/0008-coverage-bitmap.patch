@@ -1,0 +1,189 @@
+From 86be604c65995f3acd57cf3a712bb336a8aad373 Mon Sep 17 00:00:00 2001
+From: OpenThesis <openthesis@openthesis.dev>
+Date: Tue, 10 Mar 2026 00:00:00 +0000
+Subject: [PATCH 08/11] sentry/kernel: add shared-memory AFL-style coverage
+ bitmap
+
+Implement coverage collection via a shared memory bitmap. The Sentry
+creates a memfd, maps it, and records a bit for each unique control
+flow edge (PC pair) observed during syscall dispatch. The host reads
+the bitmap directly via the memfd file descriptor -- no IPC or
+serialization overhead.
+
+The bitmap uses AFL-style edge coverage: each edge is identified by
+XOR(current_PC, previous_PC >> 1), mapped to a bit position via
+modular hashing. Default size is 64KB (512K bits).
+
+The coverage bitmap is exposed to the OpenThesis control plane via
+the control socket's "coverage" command (patch 7), which returns
+the /proc/self/fd path and bitmap size.
+
+Integration notes:
+  - pkg/sentry/kernel/kernel.go: add CoverageBitmap field, initialize
+    it during DST mode startup.
+  - pkg/sentry/kernel/task_syscall.go: after each syscall dispatch,
+    call CoverageBitmap.RecordEdge(pc) with the syscall handler's PC.
+---
+ pkg/sentry/kernel/dst_coverage.go | 150 ++++++++++++++++++++++++++++++
+ 1 file changed, 150 insertions(+)
+ create mode 100644 pkg/sentry/kernel/dst_coverage.go
+
+diff --git a/pkg/sentry/kernel/dst_coverage.go b/pkg/sentry/kernel/dst_coverage.go
+new file mode 100644
+index 000000000..d2fbd2bc0
+--- /dev/null
++++ b/pkg/sentry/kernel/dst_coverage.go
+@@ -0,0 +1,150 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++
++package kernel
++
++import (
++	"fmt"
++	"math/bits"
++	"sync"
++
++	"golang.org/x/sys/unix"
++)
++
++const (
++	// DefaultCoverageBitmapSize is 64KB (512K edge slots).
++	DefaultCoverageBitmapSize = 65536
++
++	// coverageMemfdName is the name used for the memfd.
++	coverageMemfdName = "openthesis-coverage"
++)
++
++// CoverageBitmap provides shared-memory code coverage collection using
++// an AFL-style edge coverage bitmap. The bitmap is backed by a memfd
++// so the host process can read it directly via mmap without any IPC.
++//
++// Edge coverage tracks transitions between basic blocks (PC pairs),
++// not just which blocks were visited. This provides better sensitivity
++// for the explorer's coverage-guided state space search.
++type CoverageBitmap struct {
++	mu sync.Mutex
++
++	// fd is the memfd file descriptor.
++	fd int
++
++	// bitmap is the mmap'd coverage bitmap.
++	bitmap []byte
++
++	// size is the bitmap size in bytes.
++	size int
++
++	// prevPC tracks the previous PC for edge coverage.
++	// Edge hash = current_PC XOR (prevPC >> 1).
++	prevPC uint64
++
++	// totalEdges is the number of unique edges recorded since last reset.
++	totalEdges int
++}
++
++// NewCoverageBitmap creates a new coverage bitmap backed by a memfd.
++// The memfd is created with MFD_CLOEXEC cleared so it can be passed
++// to the host via /proc/self/fd/N.
++func NewCoverageBitmap(size int) (*CoverageBitmap, error) {
++	if size <= 0 {
++		size = DefaultCoverageBitmapSize
++	}
++
++	fd, err := unix.MemfdCreate(coverageMemfdName, 0)
++	if err != nil {
++		return nil, fmt.Errorf("memfd_create(%s): %w", coverageMemfdName, err)
++	}
++
++	if err := unix.Ftruncate(fd, int64(size)); err != nil {
++		unix.Close(fd)
++		return nil, fmt.Errorf("ftruncate coverage memfd to %d: %w", size, err)
++	}
++
++	bitmap, err := unix.Mmap(fd, 0, size,
++		unix.PROT_READ|unix.PROT_WRITE,
++		unix.MAP_SHARED,
++	)
++	if err != nil {
++		unix.Close(fd)
++		return nil, fmt.Errorf("mmap coverage memfd: %w", err)
++	}
++
++	return &CoverageBitmap{
++		fd:     fd,
++		bitmap: bitmap,
++		size:   size,
++	}, nil
++}
++
++// RecordEdge records a control flow edge from the previous PC to the
++// current PC. Uses AFL-style hashing: hash = (pc ^ (prevPC >> 1)).
++//
++// This is called from the syscall dispatch path (task_syscall.go) after
++// each syscall handler returns. The PC is typically obtained from
++// runtime.Callers or from the task's register state.
++func (cb *CoverageBitmap) RecordEdge(pc uint64) {
++	cb.mu.Lock()
++
++	hash := (pc ^ (cb.prevPC >> 1)) % uint64(cb.size*8)
++	byteIdx := hash / 8
++	bitIdx := uint(hash % 8)
++	mask := byte(1 << bitIdx)
++
++	if cb.bitmap[byteIdx]&mask == 0 {
++		cb.bitmap[byteIdx] |= mask
++		cb.totalEdges++
++	}
++
++	cb.prevPC = pc
++
++	cb.mu.Unlock()
++}
++
++// FD returns the memfd file descriptor for sharing with the host.
++// The host can mmap this fd to read coverage data directly.
++func (cb *CoverageBitmap) FD() int {
++	return cb.fd
++}
++
++// Size returns the bitmap size in bytes.
++func (cb *CoverageBitmap) Size() int {
++	return cb.size
++}
++
++// Count returns the number of unique edges seen since last reset.
++// This scans the bitmap, which is O(size) but accurate.
++func (cb *CoverageBitmap) Count() int {
++	cb.mu.Lock()
++	defer cb.mu.Unlock()
++
++	count := 0
++	for _, b := range cb.bitmap {
++		count += bits.OnesCount8(b)
++	}
++	return count
++}
++
++// Reset clears the bitmap and resets the edge counter.
++// Called between exploration episodes.
++func (cb *CoverageBitmap) Reset() {
++	cb.mu.Lock()
++	defer cb.mu.Unlock()
++
++	for i := range cb.bitmap {
++		cb.bitmap[i] = 0
++	}
++	cb.prevPC = 0
++	cb.totalEdges = 0
++}
++
++// Close unmaps the bitmap and closes the memfd.
++func (cb *CoverageBitmap) Close() error {
+-- 
+2.43.0
+

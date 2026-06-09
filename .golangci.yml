@@ -1,0 +1,35 @@
+version: "2"
+
+run:
+  go: "1.22"
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - gocritic
+    - unconvert
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - shadow
+        - fieldalignment
+  exclusions:
+    # std-error-handling covers: Close, Flush, Remove(All), Setenv, print/println/printf, stdout/stderr
+    presets:
+      - std-error-handling
+    rules:
+      # Additional unchecked-error patterns that are not actionable
+      - linters: [errcheck]
+        text: "Error return value of .*(Copy|Encode|Write|Append|Munmap|MkdirAll|Sscanf|Sethostname|Reboot|Wait|Kill|Pause|SetCurrent|DeleteSnapshot|writeFile|Parse|Stop|Sync|WriteJSON).*is not checked"
+      # Functions returning error where the call site has no recovery path
+      - linters: [errcheck]
+        text: "Error return value is not checked"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

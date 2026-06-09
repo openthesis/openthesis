@@ -1,0 +1,63 @@
+--- /tmp/svm.c.orig	2026-06-06 00:00:00.000000000 +0000
++++ /usr/src/linux-6.18.7/arch/x86/kvm/svm/svm.c	2026-06-06 00:00:00.000000000 +0000
+@@ -996,6 +996,11 @@
+ 			svm_set_intercept(svm, INTERCEPT_RDTSCP);
+ 	}
+ 
++	if (vcpu->kvm->arch.rdtsc_exiting) {
++		svm_set_intercept(svm, INTERCEPT_RDTSC);
++		svm_set_intercept(svm, INTERCEPT_RDTSCP);
++	}
++
+ 	if (guest_cpuid_is_intel_compatible(vcpu)) {
+ 		svm_set_intercept(svm, INTERCEPT_VMLOAD);
+ 		svm_set_intercept(svm, INTERCEPT_VMSAVE);
+@@ -3151,6 +3156,31 @@
+ 	return 0;
+ }
+ 
++static int svm_complete_rdtsc_exit(struct kvm_vcpu *vcpu)
++{
++	u64 tsc = vcpu->run->rdtsc.tsc_value;
++	kvm_rax_write(vcpu, (u32)tsc);
++	kvm_rdx_write(vcpu, tsc >> 32);
++	/* Ensure pending virtio/vsock interrupts are delivered on re-entry */
++	kvm_make_request(KVM_REQ_EVENT, vcpu);
++	return kvm_skip_emulated_instruction(vcpu);
++}
++
++static int svm_handle_rdtsc_exit(struct kvm_vcpu *vcpu)
++{
++	vcpu->run->exit_reason = KVM_EXIT_X86_RDTSC;
++	vcpu->run->rdtsc.tsc_value = 0;
++	vcpu->arch.complete_userspace_io = svm_complete_rdtsc_exit;
++	return 0;
++}
++
++static int svm_handle_rdtscp_exit(struct kvm_vcpu *vcpu)
++{
++	if (vcpu->kvm->arch.rdtsc_exiting)
++		return svm_handle_rdtsc_exit(vcpu);
++	return kvm_handle_invalid_op(vcpu);
++}
++
+ static int (*const svm_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+ 	[SVM_EXIT_READ_CR0]			= cr_interception,
+ 	[SVM_EXIT_READ_CR3]			= cr_interception,
+@@ -3188,6 +3218,7 @@
+ 	[SVM_EXIT_NMI]				= nmi_interception,
+ 	[SVM_EXIT_SMI]				= smi_interception,
+ 	[SVM_EXIT_VINTR]			= interrupt_window_interception,
++	[SVM_EXIT_RDTSC]			= svm_handle_rdtsc_exit,
+ 	[SVM_EXIT_RDPMC]			= kvm_emulate_rdpmc,
+ 	[SVM_EXIT_CPUID]			= kvm_emulate_cpuid,
+ 	[SVM_EXIT_IRET]                         = iret_interception,
+@@ -3207,7 +3238,7 @@
+ 	[SVM_EXIT_STGI]				= stgi_interception,
+ 	[SVM_EXIT_CLGI]				= clgi_interception,
+ 	[SVM_EXIT_SKINIT]			= skinit_interception,
+-	[SVM_EXIT_RDTSCP]			= kvm_handle_invalid_op,
++	[SVM_EXIT_RDTSCP]			= svm_handle_rdtscp_exit,
+ 	[SVM_EXIT_WBINVD]                       = kvm_emulate_wbinvd,
+ 	[SVM_EXIT_MONITOR]			= kvm_emulate_monitor,
+ 	[SVM_EXIT_MWAIT]			= kvm_emulate_mwait,

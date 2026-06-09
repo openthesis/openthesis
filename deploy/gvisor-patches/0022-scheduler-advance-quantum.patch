@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Wed, 02 Apr 2026 00:00:00 +0530
+Subject: [PATCH 22/23] sentry/kernel: add AdvanceQuantum(ns) to DeterministicScheduler
+
+The run-burst control command (patch 7) calls sched.AdvanceQuantum(step)
+with a nanosecond argument to drive time-based task wakeups during a burst
+window. However DeterministicScheduler only had an AdvanceQuantum() method
+on the VirtualClock (patch 1), not on the scheduler itself.
+
+This patch adds:
+  - VirtualClock.AdvanceNS(ns int64): raw nanosecond advance (unfrozen only)
+  - DeterministicScheduler.AdvanceQuantum(ns uint64): advances the virtual
+    clock by ns nanoseconds and pings the scheduler wakeup channel so any
+    task waiting on a virtual timer that has now expired will be unblocked
+    and added to the run queue on its next scheduling turn.
+
+This is the minimal fix that makes run-burst functional. Instruction-level
+granularity is handled separately in patch 23.
+---
+ pkg/sentry/kernel/dst_scheduler.go | 10 ++++++++++
+ pkg/sentry/time/virtual_clock.go   | 11 +++++++++++
+ 2 files changed, 21 insertions(+)
+
+diff --git a/pkg/sentry/kernel/dst_scheduler.go b/pkg/sentry/kernel/dst_scheduler.go
+index 3a1bb7d66..b2a04e1c0 100644
+--- a/pkg/sentry/kernel/dst_scheduler.go
++++ b/pkg/sentry/kernel/dst_scheduler.go
+@@ -180,3 +180,14 @@ func (ds *DeterministicScheduler) notify() {
+ 	default:
+ 	}
+ }
++
++// AdvanceQuantum advances the virtual clock by ns nanoseconds and signals
++// the scheduler wakeup channel. Used by the run-burst control command to
++// drive time-based task wakeups without waiting for a full scheduler cycle.
++//
++// Safe to call concurrently with Schedule(); the virtual clock is mutex-
++// protected and the wakeup channel is buffered.
++func (ds *DeterministicScheduler) AdvanceQuantum(ns uint64) {
++	ds.clock.AdvanceNS(int64(ns))
++	ds.notify()
++}
+diff --git a/pkg/sentry/time/virtual_clock.go b/pkg/sentry/time/virtual_clock.go
+index 42851c29f..f3a9c8b12 100644
+--- a/pkg/sentry/time/virtual_clock.go
++++ b/pkg/sentry/time/virtual_clock.go
+@@ -163,4 +163,15 @@ func (vc *VirtualClock) MonotonicNS() int64 {
+ 	defer vc.mu.Unlock()
+ 	return vc.monotonicNS
+ }
++
++// AdvanceNS advances the virtual clock by an arbitrary nanosecond delta.
++// Used by DeterministicScheduler.AdvanceQuantum to drive fine-grained time
++// advancement during a run-burst window. No-op when frozen.
++func (vc *VirtualClock) AdvanceNS(ns int64) {
++	vc.mu.Lock()
++	defer vc.mu.Unlock()
++	if !vc.frozen && ns > 0 {
++		vc.monotonicNS += ns
++	}
++}

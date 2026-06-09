@@ -1,0 +1,178 @@
+# ARM64-only: applied when building for aarch64-unknown-linux-musl
+From 000000000000000000000000000000000000000a Mon Sep 17 00:00:00 2001
+From: OpenThesis Build <openthesis@localhost>
+Date: Fri, 6 Jun 2026 00:00:00 +0000
+Subject: [PATCH 10/10] vmm: arm64 - timer injection via CNTVOFF_EL2 + x86_64 arch guard
+
+Three changes:
+
+1. New file src/vmm/src/dst/arm_timer.rs
+   ARM64 deterministic virtual timer injection via CNTVOFF_EL2.
+   KVM exposes the virtual timer physical offset register as KVM_SET_ONE_REG
+   with the CNTVOFF_EL2 system register ID. Setting this offset makes every
+   guest "mrs x, cntvct_el0" return a deterministic value:
+     CNTVCT_EL0 = CNTPCT_EL0 + CNTVOFF_EL2
+   No host kernel patches are required -- CNTVOFF_EL2 is already fully
+   virtualized by KVM for all EL1 guests.
+
+   Protocol (called from ctrl.rs "set-time" handler on aarch64):
+     1. Read host physical counter CNTPCT_EL0 via inline asm
+     2. Read host counter frequency CNTFRQ_EL0 (Hz)
+     3. Convert desired_virtual_ns to ticks: desired_ticks = ns * freq / 1e9
+     4. offset = desired_ticks - current_physical_ticks  (wrapping u64)
+     5. KVM_SET_ONE_REG(vcpu_fd, KVM_REG_ARM_TIMER_CNTPOFF, offset)
+
+2. src/vmm/src/dst/mod.rs
+   Conditionally compile arm_timer module on aarch64 only.
+
+3. src/vmm/src/vstate/vcpu.rs
+   Wrap the boot-phase "inject raw host rdtsc" block with
+   #[cfg(target_arch = "x86_64")] { ... } so the file compiles on ARM64.
+   The cfg wraps the entire block including the return, not just the let
+   binding -- required because host_tsc and set_rdtsc_response are both
+   x86_64-only.
+   Add a #[cfg(target_arch = "aarch64")] { ... } branch that sets
+   CNTVOFF_EL2 = 0, leaving CNTVCT_EL0 == CNTPCT_EL0 (raw host physical
+   counter at boot). This mirrors the x86_64 host_tsc inject: the guest
+   timer subsystem sees a non-zero monotonic counter from first use.
+   Burst-start "set-time" ctrl commands will subsequently inject a
+   deterministic offset via set_virtual_timer().
+---
+ src/vmm/src/dst/arm_timer.rs | 72 +++++++++++++++++++++++++++++++++++
+ src/vmm/src/dst/mod.rs       |  3 ++
+ src/vmm/src/vstate/vcpu.rs   | 17 ++++++---
+ 3 files changed, 87 insertions(+), 5 deletions(-)
+ create mode 100644 src/vmm/src/dst/arm_timer.rs
+
+diff --git a/src/vmm/src/dst/arm_timer.rs b/src/vmm/src/dst/arm_timer.rs
+new file mode 100644
+index 000000000..b7a2c3f01
+--- /dev/null
++++ b/src/vmm/src/dst/arm_timer.rs
+@@ -0,0 +1,72 @@
++// ARM64 deterministic virtual timer injection via CNTVOFF_EL2.
++// Sets the virtual counter offset so CNTVCT_EL0 = dst_clock.monotonic_ns()
++// when the next burst starts. Called from ctrl.rs "set-time" handler.
++//
++// Protocol:
++//   1. Read host physical counter CNTPCT_EL0
++//   2. offset = desired_virtual_ns - physical_ns_equivalent
++//   3. KVM_SET_ONE_REG(vcpu_fd, KVM_REG_ARM_TIMER_CNTPOFF, offset)
++//
++// Result: every guest mrs x, cntvct_el0 returns deterministic virtual time.
++// No kernel patches required - CNTVOFF_EL2 is already virtualized by KVM.
++
++// CNTVOFF_EL2 KVM register ID.
++// Encoding: KVM_REG_ARM64 | KVM_REG_SIZE_U64 | SYS_REG(op0=3, op1=4, CRn=14, CRm=0, op2=3)
++// kvm_bindings exports this as KVM_REG_ARM_TIMER_CNTPOFF on recent versions;
++// define it inline for compatibility with older kvm-bindings crates.
++const KVM_REG_ARM_TIMER_CNTPOFF: u64 = 0x603200000013df5a;
++
++/// Read the host physical counter register CNTPCT_EL0.
++///
++/// This is the raw hardware counter that increments at CNTFRQ_EL0 Hz (typically
++/// 25 MHz or 1 GHz depending on the platform). CNTVCT_EL0 (virtual counter) is
++/// defined as CNTPCT_EL0 + CNTVOFF_EL2, so to place the guest virtual counter at
++/// a desired tick value we set offset = desired_ticks - current_physical_ticks.
++#[cfg(target_arch = "aarch64")]
++fn read_physical_counter() -> u64 {
++    let cnt: u64;
++    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) cnt) };
++    cnt
++}
++
++/// Read the host counter frequency register CNTFRQ_EL0 (Hz).
++///
++/// Typical values: 25_000_000 (Graviton2), 1_000_000_000 (Apple M-series under QEMU),
++/// 100_000_000 (some Ampere platforms). Used to convert nanoseconds to ticks.
++#[cfg(target_arch = "aarch64")]
++fn read_counter_freq() -> u64 {
++    let freq: u64;
++    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq) };
++    // Guard against corrupt or zero frequency (should never happen on real hardware).
++    if freq == 0 { 25_000_000 } else { freq }
++}
++
++/// Convert a nanosecond value to counter ticks at the platform's CNTFRQ_EL0.
++///
++/// Uses 128-bit intermediate arithmetic to avoid overflow for large ns values
++/// (e.g. 2^63 ns at 1 GHz overflows u64).
++#[cfg(target_arch = "aarch64")]
++fn ns_to_ticks(ns: u64, freq_hz: u64) -> u64 {
++    ((ns as u128 * freq_hz as u128) / 1_000_000_000u128) as u64
++}
++
++/// Inject deterministic virtual time into the guest by writing CNTVOFF_EL2.
++///
++/// After this call, every guest read of CNTVCT_EL0 returns approximately
++/// `virtual_ns` nanoseconds of virtual time (subject to the platform timer
++/// granularity). The offset is latched into KVM and persists across KVM_RUN
++/// iterations until overwritten.
++///
++/// `virtual_ns` is the VirtualClock.monotonic_ns() value at burst-start.
++/// Burst-phase clock advancement (patch 0006) continues to advance dst_clock;
++/// this function is called once per burst-start, not on every KVM exit.
++///
++/// Pass `virtual_ns = 0` during the boot phase to set offset = -CNTPCT_EL0,
++/// which makes CNTVCT_EL0 == 0 at the moment of injection and matches the
++/// x86_64 boot-phase semantics (guest clock starts from a known zero base).
++#[cfg(target_arch = "aarch64")]
++pub fn set_virtual_timer(vcpu_fd: &mut kvm_ioctls::VcpuFd, virtual_ns: u64) -> Result<(), kvm_ioctls::Error> {
++    let freq = read_counter_freq();
++    let desired_ticks = ns_to_ticks(virtual_ns, freq);
++    let physical_ticks = read_physical_counter();
++    // offset may wrap: u64 wrapping subtraction is intentional here.
++    // KVM stores CNTVOFF_EL2 as a signed offset in the hardware register,
++    // but the ABI uses u64 (two's complement). A negative offset is valid;
++    // the guest sees (physical + offset) mod 2^64 which equals desired_ticks.
++    let offset = desired_ticks.wrapping_sub(physical_ticks);
++    vcpu_fd.set_one_reg(KVM_REG_ARM_TIMER_CNTPOFF, &offset.to_le_bytes())
++}
+diff --git a/src/vmm/src/dst/mod.rs b/src/vmm/src/dst/mod.rs
+index 1cff85a05..8d4e21b62 100644
+--- a/src/vmm/src/dst/mod.rs
++++ b/src/vmm/src/dst/mod.rs
+@@ -4,3 +4,6 @@
+ pub mod prng;
+ pub mod net;
+ pub mod ctrl;
+ pub mod rdtsc;
++
++#[cfg(target_arch = "aarch64")]
++pub mod arm_timer;
+diff --git a/src/vmm/src/vstate/vcpu.rs b/src/vmm/src/vstate/vcpu.rs
+index 91db8baa9..c1f2d8403 100644
+--- a/src/vmm/src/vstate/vcpu.rs
++++ b/src/vmm/src/vstate/vcpu.rs
+@@ -511,11 +511,22 @@ impl Vcpu {
+                         }
+                     }
+
+-                        // Boot phase (no burst target): inject raw host rdtsc as the guest TSC.
+-                        // KVM default tsc_offset=0 means guest_tsc == host_tsc.
+-                        // Injecting host_tsc directly keeps ktime_get() and LAPIC deadlines correct.
+-                        let host_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+-                        crate::dst::rdtsc::set_rdtsc_response(&mut self.kvm_vcpu.fd, host_tsc);
+-                        return Ok(VcpuEmulation::Handled);
++                        // Boot phase (no burst target): inject host timer as the guest time reference.
++                        // x86_64: raw host RDTSC (KVM tsc_offset=0 makes guest_tsc == host_tsc).
++                        // aarch64: CNTVOFF_EL2 = -CNTPCT_EL0 so CNTVCT_EL0 starts at 0.
++                        #[cfg(target_arch = "x86_64")]
++                        {
++                            let host_tsc = unsafe { core::arch::x86_64::_rdtsc() };
++                            crate::dst::rdtsc::set_rdtsc_response(&mut self.kvm_vcpu.fd, host_tsc);
++                            return Ok(VcpuEmulation::Handled);
++                        }
++                        #[cfg(target_arch = "aarch64")]
++                        {
++                            if let Err(e) = crate::dst::arm_timer::set_virtual_timer(
++                                &mut self.kvm_vcpu.fd,
++                                0,
++                            ) {
++                                log::warn!("DST: arm64 boot-phase timer inject failed: {}", e);
++                            }
++                            return Ok(VcpuEmulation::Handled);
++                        }
+                     }
+                 }
+                 handle_kvm_exit(&mut self.kvm_vcpu.peripherals, emulation_result)

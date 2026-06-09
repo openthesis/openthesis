@@ -1,0 +1,28 @@
+diff --git a/runsc/config/config.go b/runsc/config/config.go
+index 3d62095a5..4ca151126 100644
+--- a/runsc/config/config.go
++++ b/runsc/config/config.go
+@@ -438,6 +438,11 @@ type Config struct {
+ 	// round. If zero, defaults to 10ms.
+ 	DSTQuantumNS int64 `flag:"openthesis-dst-quantum-ns"`
+ 
++	// DSTSeed is the initial deterministic PRNG seed for this simulation run.
++	// When 0, the RNG is not seeded from outside (uses internal default).
++	// Set via --openthesis-dst-seed to make runs reproducible.
++	DSTSeed uint64 `flag:"openthesis-dst-seed"`
++
+ 	// DSTControlPath is the Unix socket path for the OpenThesis control interface.
+ 	DSTControlPath string `flag:"openthesis-control"`
+ }
+diff --git a/runsc/config/flags.go b/runsc/config/flags.go
+index c939a70c4..232e5467a 100644
+--- a/runsc/config/flags.go
++++ b/runsc/config/flags.go
+@@ -116,7 +116,8 @@ func RegisterFlags(flagSet *flag.FlagSet) {
+ 	flagSet.Bool("openthesis-dst", false, "enable OpenThesis deterministic simulation mode.")
+ 	flagSet.Int64("openthesis-dst-epoch", 0, "OpenThesis virtual clock epoch in nanoseconds since Unix epoch.")
+ 	flagSet.Int64("openthesis-dst-quantum-ns", 0, "OpenThesis virtual scheduler quantum in nanoseconds.")
++	flagSet.Uint64("openthesis-dst-seed", 0, "OpenThesis initial deterministic PRNG seed (0 = default).")
+ 	flagSet.String("openthesis-control", "", "Unix socket path for OpenThesis control API.")
+ 
+ 	// Flags that control sandbox runtime behavior: MM related.

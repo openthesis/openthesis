@@ -1,0 +1,880 @@
+diff --git a/pkg/rand/rand_linux.go b/pkg/rand/rand_linux.go
+index 45e50732c..07f3cb1ef 100644
+--- a/pkg/rand/rand_linux.go
++++ b/pkg/rand/rand_linux.go
+@@ -83,8 +83,30 @@ func SetDeterministicSource(r io.Reader) {
+ 	dstReader = r
+ }
+ 
+-// Reader is the default reader.
+-var Reader io.Reader = &bufferedReader{r: bufio.NewReader(&reader{})}
++// baseReader is the underlying non-deterministic reader used when DST mode
++// is not active.
++var baseReader io.Reader = &bufferedReader{r: bufio.NewReader(&reader{})}
++
++// dstAwareReader is an io.Reader that routes through dstReader when DST mode
++// is active, and falls back to the host entropy reader otherwise.
++// All users of rand.Reader (including Int63n, TCP ISN seeding, ephemeral
++// port allocation, etc.) automatically become deterministic when DST is
++// enabled via SetDeterministicSource.
++type dstAwareReader struct{}
++
++func (r *dstAwareReader) Read(b []byte) (int, error) {
++	dstMu.Lock()
++	dr := dstReader
++	dstMu.Unlock()
++	if dr != nil {
++		return io.ReadFull(dr, b)
++	}
++	return baseReader.Read(b)
++}
++
++// Reader is the default reader. In DST mode (after SetDeterministicSource
++// is called), reads from the deterministic PRNG; otherwise from host entropy.
++var Reader io.Reader = &dstAwareReader{}
+ 
+ // Read reads from the current reader. In DST mode, reads from the
+ // deterministic PRNG; otherwise reads from crypto/rand.
+@@ -95,7 +117,7 @@ func Read(b []byte) (int, error) {
+ 	if dr != nil {
+ 		return io.ReadFull(dr, b)
+ 	}
+-	return io.ReadFull(Reader, b)
++	return io.ReadFull(baseReader, b)
+ }
+ 
+ // Init can be called to make sure /dev/urandom is pre-opened on kernels that
+diff --git a/pkg/sentry/inet/BUILD b/pkg/sentry/inet/BUILD
+index 067656ac7..1001de2ae 100644
+--- a/pkg/sentry/inet/BUILD
++++ b/pkg/sentry/inet/BUILD
+@@ -51,6 +51,7 @@ go_library(
+         "//pkg/atomicbitops",
+         "//pkg/context",
+         "//pkg/refs",
++        "//pkg/rand",
+         "//pkg/sentry/fsimpl/nsfs",
+         "//pkg/sentry/kernel/auth",
+         "//pkg/sentry/socket/netlink/nlmsg",
+diff --git a/pkg/sentry/inet/abstract_socket_namespace.go b/pkg/sentry/inet/abstract_socket_namespace.go
+index e2507b5bf..359c886e9 100644
+--- a/pkg/sentry/inet/abstract_socket_namespace.go
++++ b/pkg/sentry/inet/abstract_socket_namespace.go
+@@ -16,7 +16,7 @@ package inet
+ 
+ import (
+ 	"fmt"
+-	"math/rand"
++	pkgrand "gvisor.dev/gvisor/pkg/rand"
+ 
+ 	"gvisor.dev/gvisor/pkg/context"
+ 	"gvisor.dev/gvisor/pkg/refs"
+@@ -94,7 +94,7 @@ func (a *AbstractSocketNamespace) Bind(ctx context.Context, path string, ep tran
+ 	if path == "" {
+ 		// Autobind feature.
+ 		mask := uint32(0xFFFFF)
+-		r := rand.Uint32()
++		r := pkgrand.Uint32()
+ 		for i := uint32(0); i <= mask; i++ {
+ 			p := fmt.Sprintf("X%05x", (r+i)&mask)
+ 			if _, ok := a.endpoints[p[1:]]; ok {
+diff --git a/pkg/sentry/kernel/BUILD b/pkg/sentry/kernel/BUILD
+index 6e29c5dae..eab629ac6 100644
+--- a/pkg/sentry/kernel/BUILD
++++ b/pkg/sentry/kernel/BUILD
+@@ -349,6 +349,7 @@ go_library(
+         "//pkg/context",
+         "//pkg/coverage",
+         "//pkg/cpuid",
++        "//pkg/rand",
+         "//pkg/devutil",
+         "//pkg/errors",
+         "//pkg/errors/linuxerr",
+diff --git a/pkg/sentry/kernel/dst_init.go b/pkg/sentry/kernel/dst_init.go
+index 6e4f3daa2..93d796e78 100644
+--- a/pkg/sentry/kernel/dst_init.go
++++ b/pkg/sentry/kernel/dst_init.go
+@@ -15,6 +15,7 @@
+ package kernel
+ 
+ import (
++	pkgrand "gvisor.dev/gvisor/pkg/rand"
+ 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+ )
+ 
+@@ -38,6 +39,12 @@ func (k *Kernel) InitDST(
+ 	k.dstSnapshotTree = st
+ 	k.dstSyscallFaultTable = sft
+ 
++	// Wire the DST RNG into pkg/rand so that all sentry-internal rand.Read()
++	// and rand.Reader calls (including TCP ISN generation, ephemeral port
++	// allocation, and mmap layout randomization) use the deterministic PRNG.
++	// This must be called while the sentry is still single-threaded.
++	pkgrand.SetDeterministicSource(rng)
++
+ 	// Start the scheduler loop in the background. It blocks until tasks become
+ 	// runnable, so starting it before container creation is harmless.
+ 	go sched.Schedule()
+diff --git a/pkg/sentry/kernel/dst_rng.go b/pkg/sentry/kernel/dst_rng.go
+index ae838f9fa..7964d0a80 100644
+--- a/pkg/sentry/kernel/dst_rng.go
++++ b/pkg/sentry/kernel/dst_rng.go
+@@ -81,3 +81,20 @@ func (r *DeterministicRNG) Read(b []byte) (int, error) {
+ 	}
+ 	return n, nil
+ }
++
++// Reseed resets the RNG to a new initial seed. Call this before forking a
++// guest process to ensure the child explores a different random path.
++func (r *DeterministicRNG) Reseed(seed uint64) {
++	r.mu.Lock()
++	r.seed = seed
++	// Re-expand seed to 256 bits using SplitMix64 (same as NewDeterministicRNG).
++	s := seed
++	for i := 0; i < 4; i++ {
++		s += 0x9e3779b97f4a7c15
++		s = (s ^ (s >> 30)) * 0xbf58476d1ce4e5b9
++		s = (s ^ (s >> 27)) * 0x94d049bb133111eb
++		r.state[i] = s ^ (s >> 31)
++	}
++	r.counter = 0
++	r.mu.Unlock()
++}
+diff --git a/pkg/sentry/kernel/dst_scheduler.go b/pkg/sentry/kernel/dst_scheduler.go
+index 77ff92304..d33f66f9c 100644
+--- a/pkg/sentry/kernel/dst_scheduler.go
++++ b/pkg/sentry/kernel/dst_scheduler.go
+@@ -39,6 +39,11 @@ type DeterministicScheduler struct {
+ 	// current is the currently executing task (nil if idle).
+ 	current *Task
+ 
++	// currentBlocking is set when the current task has entered a blocking
++	// wait (via TaskBlocking). The scheduler will not re-queue it after the
++	// quantum; MakeRunnable() will re-add it when the event fires.
++	currentBlocking bool
++
+ 	// clock is the virtual clock to advance on each quantum.
+ 	clock *sentryTime.VirtualClock
+ 
+@@ -125,10 +130,12 @@ func (ds *DeterministicScheduler) Schedule() {
+ 		ds.mu.Lock()
+ 		ds.current = nil
+ 
+-		// If the task still has a running resume channel, re-queue it.
+-		if t.deterministicResume != nil {
++		// Re-queue the task only if it didn't enter a blocking wait.
++		// If it called TaskBlocking(), MakeRunnable() will re-add it when woken.
++		if t.deterministicResume != nil && !ds.currentBlocking {
+ 			heap.Push(&ds.runnable, t)
+ 		}
++		ds.currentBlocking = false
+ 		ds.mu.Unlock()
+ 	}
+ }
+@@ -142,6 +149,18 @@ func (ds *DeterministicScheduler) MakeRunnable(t *Task) {
+ 	ds.notify()
+ }
+ 
++// TaskBlocking is called when the current task is about to enter a blocking
++// wait (e.g., waiting for I/O or a futex). The scheduler marks the task as
++// blocking so it won't be re-queued after the current quantum ends.
++// MakeRunnable() will re-add the task when the blocking event fires.
++func (ds *DeterministicScheduler) TaskBlocking(t *Task) {
++	ds.mu.Lock()
++	defer ds.mu.Unlock()
++	if ds.current == t {
++		ds.currentBlocking = true
++	}
++}
++
+ // Pause freezes the scheduler. All tasks stop at their next yield
+ // point. The virtual clock is also frozen. Used before checkpointing.
+ func (ds *DeterministicScheduler) Pause() {
+@@ -195,3 +214,16 @@ func (ds *DeterministicScheduler) notify() {
+ 	default:
+ 	}
+ }
++
++// AdvanceQuantum advances the virtual clock by stepNS nanoseconds and
++// signals the scheduler loop. Called by the DST control socket during
++// run-burst to drive time forward in fixed increments.
++func (ds *DeterministicScheduler) AdvanceQuantum(stepNS uint64) {
++	ds.mu.Lock()
++	clk := ds.clock
++	ds.mu.Unlock()
++	if clk != nil {
++		clk.AdvanceInstructions(stepNS) // reuse: 1 ns per "instruction" at 1 GHz
++	}
++	ds.notify()
++}
+diff --git a/pkg/sentry/kernel/syslog.go b/pkg/sentry/kernel/syslog.go
+index 44cb78465..5567f84eb 100644
+--- a/pkg/sentry/kernel/syslog.go
++++ b/pkg/sentry/kernel/syslog.go
+@@ -16,7 +16,7 @@ package kernel
+ 
+ import (
+ 	"fmt"
+-	"math/rand"
++	pkgrand "gvisor.dev/gvisor/pkg/rand"
+ 
+ 	"gvisor.dev/gvisor/pkg/sync"
+ )
+@@ -89,7 +89,7 @@ func (s *syslog) Log() []byte {
+ 	}
+ 
+ 	selectMessage := func() string {
+-		i := rand.Intn(len(allMessages))
++		i := int(pkgrand.Int63n(int64(len(allMessages))))
+ 		m := allMessages[i]
+ 
+ 		// Delete the selected message.
+@@ -105,11 +105,11 @@ func (s *syslog) Log() []byte {
+ 
+ 	time := 0.1
+ 	for i := 0; i < 10; i++ {
+-		time += rand.Float64() / 2
++		time += (float64(pkgrand.Uint64()>>11) / (1 << 53)) / 2
+ 		s.msg = append(s.msg, []byte(fmt.Sprintf(format, time, selectMessage()))...)
+ 	}
+ 
+-	time += rand.Float64() / 2
++	time += (float64(pkgrand.Uint64()>>11) / (1 << 53)) / 2
+ 	s.msg = append(s.msg, []byte(fmt.Sprintf(format, time, "Ready!"))...)
+ 
+ 	// Return a copy.
+diff --git a/pkg/sentry/kernel/task_sched.go b/pkg/sentry/kernel/task_sched.go
+index 39fe9f014..083cc1f60 100644
+--- a/pkg/sentry/kernel/task_sched.go
++++ b/pkg/sentry/kernel/task_sched.go
+@@ -18,7 +18,7 @@ package kernel
+ 
+ import (
+ 	"fmt"
+-	"math/rand/v2"
++	pkgrand "gvisor.dev/gvisor/pkg/rand"
+ 	"time"
+ 
+ 	"gvisor.dev/gvisor/pkg/abi/linux"
+@@ -259,7 +259,7 @@ func (k *Kernel) runCPUClockTicker() {
+ 				continue
+ 			}
+ 			runningTasks++
+-			if i := rand.IntN(runningTasks); i < len(incTasks) {
++			if i := int(pkgrand.Int63n(int64(runningTasks))); i < len(incTasks) {
+ 				incTasks[i] = t
+ 			}
+ 		}
+@@ -268,9 +268,10 @@ func (k *Kernel) runCPUClockTicker() {
+ 		// Shuffle incTasks to ensure that if multiple tasks are in the same
+ 		// thread group, then all are equally likely to be
+ 		// ThreadGroup.app[Sys]CPUClockLast when a ThreadGroup CPU timer fires.
+-		rand.Shuffle(numIncTasks, func(i, j int) {
+-			incTasks[i], incTasks[j] = incTasks[j], incTasks[i]
+-		})
++		for si := numIncTasks - 1; si > 0; si-- {
++			sj := int(pkgrand.Int63n(int64(si + 1)))
++			incTasks[si], incTasks[sj] = incTasks[sj], incTasks[si]
++		}
+ 		for _, t := range incTasks[:numIncTasks] {
+ 			switch t.TaskGoroutineState() {
+ 			case TaskGoroutineRunningApp:
+diff --git a/pkg/sentry/mm/BUILD b/pkg/sentry/mm/BUILD
+index 6fbf619df..084ebc6d3 100644
+--- a/pkg/sentry/mm/BUILD
++++ b/pkg/sentry/mm/BUILD
+@@ -152,6 +152,7 @@ go_library(
+         "//pkg/abi/linux",
+         "//pkg/atomicbitops",
+         "//pkg/context",
++        "//pkg/rand",
+         "//pkg/errors/linuxerr",
+         "//pkg/hostarch",
+         "//pkg/log",
+diff --git a/pkg/sentry/mm/syscalls.go b/pkg/sentry/mm/syscalls.go
+index 8cfc48a6d..48df15636 100644
+--- a/pkg/sentry/mm/syscalls.go
++++ b/pkg/sentry/mm/syscalls.go
+@@ -16,7 +16,7 @@ package mm
+ 
+ import (
+ 	"fmt"
+-	mrand "math/rand"
++	pkgrand "gvisor.dev/gvisor/pkg/rand"
+ 
+ 	"gvisor.dev/gvisor/pkg/abi/linux"
+ 	"gvisor.dev/gvisor/pkg/context"
+@@ -279,7 +279,7 @@ func (mm *MemoryManager) MapStack(ctx context.Context) (hostarch.AddrRange, erro
+ 
+ 	// Determine the stack's desired location. Unlike Linux, address
+ 	// randomization can't be disabled.
+-	stackEnd := mm.layout.MaxAddr - hostarch.Addr(mrand.Int63n(int64(mm.layout.MaxStackRand))).RoundDown()
++	stackEnd := mm.layout.MaxAddr - hostarch.Addr(pkgrand.Int63n(int64(mm.layout.MaxStackRand))).RoundDown()
+ 	if stackEnd < szaddr {
+ 		return hostarch.AddrRange{}, linuxerr.ENOMEM
+ 	}
+diff --git a/pkg/sentry/platform/kvm/filters.go b/pkg/sentry/platform/kvm/filters.go
+index f57b62465..e20d2207a 100644
+--- a/pkg/sentry/platform/kvm/filters.go
++++ b/pkg/sentry/platform/kvm/filters.go
+@@ -28,9 +28,31 @@ func (k *KVM) SeccompInfo() platform.SeccompInfo {
+ 		PlatformName: "kvm",
+ 		Filters: k.archSyscallFilters().Merge(seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+ 			unix.SYS_IOCTL: seccomp.Or{
++				// Core KVM device ioctls (on /dev/kvm fd)
+ 				seccomp.PerArg{
+ 					seccomp.NonNegativeFD{},
+-					seccomp.EqualTo(KVM_RUN),
++					seccomp.EqualTo(KVM_CREATE_VM),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_GET_VCPU_MMAP_SIZE),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_CHECK_EXTENSION),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_GET_SUPPORTED_CPUID),
++				},
++				// VM-level ioctls (on VM fd)
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_CREATE_VCPU),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_TSS_ADDR),
+ 				},
+ 				seccomp.PerArg{
+ 					seccomp.NonNegativeFD{},
+@@ -40,6 +62,19 @@ func (k *KVM) SeccompInfo() platform.SeccompInfo {
+ 					seccomp.NonNegativeFD{},
+ 					seccomp.EqualTo(KVM_IOEVENTFD),
+ 				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_DEVICE_ATTR),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_ENABLE_CAP),
++				},
++				// vCPU ioctls
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_RUN),
++				},
+ 				seccomp.PerArg{
+ 					seccomp.NonNegativeFD{},
+ 					seccomp.EqualTo(KVM_GET_REGS),
+@@ -48,6 +83,46 @@ func (k *KVM) SeccompInfo() platform.SeccompInfo {
+ 					seccomp.NonNegativeFD{},
+ 					seccomp.EqualTo(KVM_SET_REGS),
+ 				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_GET_SREGS),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_SREGS),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_GET_MSRS),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_MSRS),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_CPUID2),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_SIGNAL_MASK),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_GET_VCPU_EVENTS),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_VCPU_EVENTS),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_GET_TSC_KHZ),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_TSC_KHZ),
++				},
+ 			},
+ 			unix.SYS_MEMBARRIER: seccomp.PerArg{
+ 				seccomp.EqualTo(linux.MEMBARRIER_CMD_PRIVATE_EXPEDITED),
+diff --git a/pkg/sentry/platform/kvm/kvm.go b/pkg/sentry/platform/kvm/kvm.go
+index d9cce0cd6..0ac9f8a39 100644
+--- a/pkg/sentry/platform/kvm/kvm.go
++++ b/pkg/sentry/platform/kvm/kvm.go
+@@ -242,3 +242,9 @@ func (*constructor) Requirements() platform.Requirements {
+ func init() {
+ 	platform.Register("kvm", &constructor{})
+ }
++
++// SetDSTGetTimeNS implements platform.DSTClocker. fn is called before each
++// vCPU quantum to synchronise the guest TSC with the virtual clock.
++func (k *KVM) SetDSTGetTimeNS(fn func() int64) {
++	k.machine.dstGetTimeNS = fn
++}
+diff --git a/pkg/sentry/platform/kvm/kvm_amd64.go b/pkg/sentry/platform/kvm/kvm_amd64.go
+index af921c4da..f54ceefe1 100644
+--- a/pkg/sentry/platform/kvm/kvm_amd64.go
++++ b/pkg/sentry/platform/kvm/kvm_amd64.go
+@@ -245,6 +245,10 @@ func updateGlobalOnce(fd int) error {
+ 	// any virtualization APIs, there is no need to enable this feature.
+ 	cpuid.X86FeatureVMX.Unset(s)
+ 	cpuid.X86FeatureSVM.Unset(s)
++	// Disable RDRAND and RDSEED to force the guest through software entropy
++	// paths (which are routed through gVisor's DST-seeded pkg/rand).
++	cpuid.X86FeatureRDRAND.Unset(s)
++	cpuid.X86FeatureRDSEED.Unset(s)
+ 	ring0.Init(cpuid.FeatureSet{
+ 		Function: s,
+ 	})
+diff --git a/pkg/sentry/platform/kvm/machine.go b/pkg/sentry/platform/kvm/machine.go
+index 3f2d77095..9489b8d1d 100644
+--- a/pkg/sentry/platform/kvm/machine.go
++++ b/pkg/sentry/platform/kvm/machine.go
+@@ -86,6 +86,13 @@ type machine struct {
+ 	// tscControl checks whether cpu supports TSC scaling
+ 	tscControl bool
+ 
++	// dstGetTimeNS, if non-nil, returns the current virtual time in nanoseconds.
++	// Set by SetDSTGetTimeNS when DST mode is active with the KVM platform.
++	dstGetTimeNS func() int64
++
++	// tscFreqKHz is the vCPU TSC frequency in kHz, cached during initArchState.
++	tscFreqKHz uint64
++
+ 	// usedSlots is the set of used physical addresses (not sorted).
+ 	usedSlots []uintptr
+ 
+diff --git a/pkg/sentry/platform/kvm/machine_amd64.go b/pkg/sentry/platform/kvm/machine_amd64.go
+index 830a543a4..4e5fde936 100644
+--- a/pkg/sentry/platform/kvm/machine_amd64.go
++++ b/pkg/sentry/platform/kvm/machine_amd64.go
+@@ -156,6 +156,11 @@ func (c *vCPU) initArchState() error {
+ 		return err
+ 	}
+ 
++	// Cache TSC frequency for DST virtual-time injection.
++	if freq, err := c.getTSCFreq(); err == nil && freq > 0 {
++		c.machine.tscFreqKHz = uint64(freq)
++	}
++
+ 	// Try to enable CPUID faulting. This is required to handle app CPUID
+ 	// correctly, since we always pass the CPUID returned by
+ 	// KVM_GET_SUPPORTED_CPUID to KVM_SET_CPUID2. Note that while hardware
+@@ -377,6 +382,11 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo)
+ 	// See below.
+ 	var vector ring0.Vector
+ 
++	// DST: Synchronise guest TSC with virtual clock before entering VM.
++	if fn := c.machine.dstGetTimeNS; fn != nil {
++		c.setTSCToVirtual(fn())
++	}
++
+ 	// Past this point, stack growth can cause system calls (and a break
+ 	// from guest mode). So we need to ensure that between the bluepill
+ 	// call here and the switch call immediately below, no additional
+diff --git a/pkg/sentry/platform/kvm/machine_amd64_unsafe.go b/pkg/sentry/platform/kvm/machine_amd64_unsafe.go
+index 32a79939a..47a50e93e 100644
+--- a/pkg/sentry/platform/kvm/machine_amd64_unsafe.go
++++ b/pkg/sentry/platform/kvm/machine_amd64_unsafe.go
+@@ -171,6 +171,21 @@ func (c *vCPU) setTSC(value uint64) error {
+ 	return nil
+ }
+ 
++// setTSCToVirtual sets the vCPU TSC so that guest RDTSC returns virtual time.
++// virtualNS is the current virtual monotonic time in nanoseconds.
++//
++//go:nosplit
++func (c *vCPU) setTSCToVirtual(virtualNS int64) {
++	freq := c.machine.tscFreqKHz
++	if freq == 0 || virtualNS <= 0 {
++		return
++	}
++	// TSC ticks = virtualNS_ns * freqKHz / 1_000_000
++	// because freqKHz * 1000 Hz/kHz * 1ns/1e9s = freqKHz/1e6 ticks/ns
++	virtualTSC := uint64(virtualNS) * freq / 1_000_000
++	_ = c.setTSC(virtualTSC)
++}
++
+ func (c *vCPU) enableCPUIDFaulting() error {
+ 	const (
+ 		_MSR_MISC_FEATURES_ENABLE              = 0x140
+diff --git a/pkg/sentry/platform/platform.go b/pkg/sentry/platform/platform.go
+index db5d4a00a..a1d64f7a9 100644
+--- a/pkg/sentry/platform/platform.go
++++ b/pkg/sentry/platform/platform.go
+@@ -640,3 +640,11 @@ func Lookup(name string) (Constructor, error) {
+ 	}
+ 	return p, nil
+ }
++
++// DSTClocker is optionally implemented by platforms that support DST virtual
++// time injection. When implemented, SetDSTGetTimeNS registers a callback used
++// to synchronise the guest's time source (e.g. TSC offset in KVM) with the
++// sentry's virtual clock before each vCPU quantum.
++type DSTClocker interface {
++	SetDSTGetTimeNS(fn func() int64)
++}
+diff --git a/pkg/sentry/socket/netlink/port/BUILD b/pkg/sentry/socket/netlink/port/BUILD
+index 802c16dd8..defdf2b08 100644
+--- a/pkg/sentry/socket/netlink/port/BUILD
++++ b/pkg/sentry/socket/netlink/port/BUILD
+@@ -9,7 +9,7 @@ go_library(
+     name = "port",
+     srcs = ["port.go"],
+     visibility = ["//pkg/sentry:internal"],
+-    deps = ["//pkg/sync"],
++    deps = ["//pkg/rand", "//pkg/sync"],
+ )
+ 
+ go_test(
+diff --git a/pkg/sentry/socket/netlink/port/port.go b/pkg/sentry/socket/netlink/port/port.go
+index 2cd3afc22..eaaca8aa7 100644
+--- a/pkg/sentry/socket/netlink/port/port.go
++++ b/pkg/sentry/socket/netlink/port/port.go
+@@ -23,7 +23,7 @@ package port
+ import (
+ 	"fmt"
+ 	"math"
+-	"math/rand"
++	pkgrand "gvisor.dev/gvisor/pkg/rand"
+ 
+ 	"gvisor.dev/gvisor/pkg/sync"
+ )
+@@ -77,7 +77,7 @@ func (m *Manager) Allocate(protocol int, hint int32) (int32, bool) {
+ 	// Search for any free port in [math.MinInt32, -4096). The positive
+ 	// port space is left open for pid-based allocations. This behavior is
+ 	// consistent with Linux.
+-	start := int32(math.MinInt32 + rand.Int63n(math.MaxInt32-4096+1))
++	start := int32(math.MinInt32 + pkgrand.Int63n(math.MaxInt32-4096+1))
+ 	curr := start
+ 	for {
+ 		if _, ok := proto[curr]; !ok {
+diff --git a/pkg/sentry/syscalls/linux/sys_signal.go b/pkg/sentry/syscalls/linux/sys_signal.go
+index b2ca06f94..69efabe4b 100644
+--- a/pkg/sentry/syscalls/linux/sys_signal.go
++++ b/pkg/sentry/syscalls/linux/sys_signal.go
+@@ -214,6 +214,14 @@ func Tkill(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
+ 	if !mayKill(t, target, sig) {
+ 		return 0, nil, linuxerr.EPERM
+ 	}
++	// DST: Suppress SIGURG and SIGPROF in deterministic mode. Guest Go
++	// runtimes send SIGURG (tgkill) for async goroutine preemption and
++	// SIGPROF for profiling timers — both are non-deterministic in ptrace
++	// mode. The DST scheduler provides deterministic cooperative preemption
++	// at syscall boundaries, so these signals are unnecessary.
++	if t.Kernel().DeterministicMode() && (sig == linux.SIGURG || sig == linux.SIGPROF || sig == linux.SIGVTALRM) {
++		return 0, nil, nil
++	}
+ 	return 0, nil, target.SendSignal(tkillSigInfo(t, target, sig))
+ }
+ 
+@@ -238,6 +246,10 @@ func Tgkill(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
+ 	if !mayKill(t, target, sig) {
+ 		return 0, nil, linuxerr.EPERM
+ 	}
++	// DST: Suppress SIGURG and SIGPROF in deterministic mode (see Tkill above).
++	if t.Kernel().DeterministicMode() && (sig == linux.SIGURG || sig == linux.SIGPROF || sig == linux.SIGVTALRM) {
++		return 0, nil, nil
++	}
+ 	return 0, nil, target.SendSignal(tkillSigInfo(t, target, sig))
+ }
+ 
+diff --git a/pkg/sentry/syscalls/linux/sys_time.go b/pkg/sentry/syscalls/linux/sys_time.go
+index 385e09bc2..2e414ddab 100644
+--- a/pkg/sentry/syscalls/linux/sys_time.go
++++ b/pkg/sentry/syscalls/linux/sys_time.go
+@@ -134,8 +134,17 @@ func getClock(t *kernel.Task, clockID int32) (ktime.Clock, error) {
+ 		//		the closest to suspend time.
+ 		return t.Kernel().MonotonicClock(), nil
+ 	case linux.CLOCK_PROCESS_CPUTIME_ID:
++		// In DST mode, CPU time clocks return virtual monotonic time
++		// so that applications using CLOCK_PROCESS_CPUTIME_ID for timing
++		// decisions get deterministic values.
++		if t.Kernel().DeterministicMode() {
++			return t.Kernel().MonotonicClock(), nil
++		}
+ 		return t.ThreadGroup().CPUClock(), nil
+ 	case linux.CLOCK_THREAD_CPUTIME_ID:
++		if t.Kernel().DeterministicMode() {
++			return t.Kernel().MonotonicClock(), nil
++		}
+ 		return t.CPUClock(), nil
+ 	default:
+ 		return nil, linuxerr.EINVAL
+@@ -304,10 +313,16 @@ func Gettimeofday(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (ui
+ 	}
+ 
+ 	if tz != hostarch.Addr(0) {
+-		// Ask the time package for the timezone.
+-		_, offset := time.Now().Zone()
++		// In DST mode, return UTC (offset=0) for determinism — timezone data
++		// from the host wall clock is a non-deterministic syscall output.
++		// Outside DST mode, return the host timezone for compatibility.
++		var tzMinutesWest int32
++		if !t.Kernel().DeterministicMode() {
++			_, offset := time.Now().Zone()
++			tzMinutesWest = -int32(offset) / 60
++		}
+ 		// This int32 array mimics linux's struct timezone.
+-		timezone := []int32{-int32(offset) / 60, 0}
++		timezone := []int32{tzMinutesWest, 0}
+ 		_, err := primitive.CopyInt32SliceOut(t, tz, timezone)
+ 		return 0, nil, err
+ 	}
+diff --git a/pkg/sentry/time/clocks.go b/pkg/sentry/time/clocks.go
+index 837e86094..42219e4ab 100644
+--- a/pkg/sentry/time/clocks.go
++++ b/pkg/sentry/time/clocks.go
+@@ -29,3 +29,12 @@ type Clocks interface {
+ 	// Realtime.
+ 	GetTime(c ClockID) (int64, error)
+ }
++
++// MutableClock is an optional extension of Clocks for clocks whose time can
++// be set directly. Implemented by VirtualClock in DST mode; not supported by
++// the production CalibratedClocks.
++type MutableClock interface {
++	Clocks
++	// SetTime sets the clock to an absolute nanosecond value.
++	SetTime(id ClockID, nanos int64)
++}
+diff --git a/pkg/sentry/time/virtual_clock.go b/pkg/sentry/time/virtual_clock.go
+index 386dab529..42851c29f 100644
+--- a/pkg/sentry/time/virtual_clock.go
++++ b/pkg/sentry/time/virtual_clock.go
+@@ -123,7 +123,7 @@ func (vc *VirtualClock) Update() (Parameters, bool, Parameters, bool) {
+ 		BaseRef:    ReferenceNS(realtimeNS),
+ 		Frequency:  1000000000,
+ 	}
+-	return monoParams, true, realParams, true
++	return monoParams, false, realParams, false
+ }
+ 
+ // AdvanceQuantum advances the clock by one scheduling quantum.
+@@ -167,3 +167,18 @@ func (vc *VirtualClock) MonotonicNS() int64 {
+ 	defer vc.mu.Unlock()
+ 	return vc.monotonicNS
+ }
++
++// SetTime sets the virtual clock to an absolute nanosecond value for the
++// given clock ID. Used by the DST control socket to synchronize time
++// across snapshot restore and external time injection.
++func (vc *VirtualClock) SetTime(id ClockID, nanos int64) {
++	vc.mu.Lock()
++	defer vc.mu.Unlock()
++	switch id {
++	case Monotonic:
++		vc.monotonicNS = nanos
++	case Realtime:
++		// Adjust epoch so that epoch+monotonicNS == nanos.
++		vc.epoch = time.Unix(0, nanos-vc.monotonicNS)
++	}
++}
+diff --git a/pkg/tcpip/stack/save_restore.go b/pkg/tcpip/stack/save_restore.go
+index 48ed8c782..96e131612 100644
+--- a/pkg/tcpip/stack/save_restore.go
++++ b/pkg/tcpip/stack/save_restore.go
+@@ -16,8 +16,8 @@ package stack
+ 
+ import (
+ 	"context"
++	"encoding/binary"
+ 	"math/rand"
+-	"time"
+ 
+ 	cryptorand "gvisor.dev/gvisor/pkg/rand"
+ )
+@@ -49,6 +49,9 @@ func (s *Stack) beforeSave() {
+ 
+ // afterLoad is invoked by stateify.
+ func (s *Stack) afterLoad(context.Context) {
+-	s.insecureRNG = rand.New(rand.NewSource(time.Now().UnixNano()))
++	// Use DST-seeded PRNG for deterministic snapshot restore.
++	var seed int64
++	binary.Read(cryptorand.Reader, binary.LittleEndian, &seed)
++	s.insecureRNG = rand.New(rand.NewSource(seed))
+ 	s.secureRNG = cryptorand.RNGFrom(cryptorand.Reader)
+ }
+diff --git a/runsc/boot/loader.go b/runsc/boot/loader.go
+index dec663b07..3142f3db2 100644
+--- a/runsc/boot/loader.go
++++ b/runsc/boot/loader.go
+@@ -621,11 +621,15 @@ func New(args Args) (*Loader, error) {
+ 	// When DST mode is requested, wire all deterministic components into the
+ 	// kernel and start the OpenThesis control socket before any tasks run.
+ 	if dstVC != nil {
+-		rng := kernel.NewDeterministicRNG(0)
++		rng := kernel.NewDeterministicRNG(args.Conf.DSTSeed)
+ 		sched := kernel.NewDeterministicScheduler(dstVC, uint64(args.Conf.DSTQuantumNS))
+ 		st := kernel.NewSnapshotTree()
+ 		sft := kernel.NewSyscallFaultTable(rng)
+ 		l.k.InitDST(dstVC, rng, sched, st, sft)
++		// DST: wire virtual clock into KVM platform for TSC offset control.
++		if dc, ok := p.(platform.DSTClocker); ok {
++			dc.SetDSTGetTimeNS(dstVC.MonotonicNS)
++		}
+ 		if err := l.initDSTControlSocket(args.Conf.DSTControlPath); err != nil {
+ 			return nil, fmt.Errorf("dst control socket: %w", err)
+ 		}
+@@ -669,6 +673,20 @@ func New(args Args) (*Loader, error) {
+ 	}
+ 
+ 	cpufs := cpuid.HostFeatureSet()
++	// DST: In deterministic mode, clear RDRAND and RDSEED from the guest CPUID
++	// feature set. In ptrace mode, CPUID is intercepted and emulated; without
++	// this, guest programs that call rdrand/rdseed directly get real hardware
++	// entropy, breaking reproducibility. Clearing these bits forces guest code
++	// through software entropy paths (routed through pkg/rand which is
++	// seeded by the DST seed).
++	if dstVC != nil {
++		// Use Fixed() to produce a Static-backed copy, then unset the features.
++		fs2 := cpufs.Fixed()
++		s := fs2.ToStatic()
++		cpuid.X86FeatureRDRAND.Unset(&s)
++		cpuid.X86FeatureRDSEED.Unset(&s)
++		cpufs = s.ToFeatureSet()
++	}
+ 	if value, ok := args.Spec.Annotations[specutils.AnnotationCPUFeatures]; ok {
+ 		allowedFeatures := make(map[cpuid.Feature]struct{})
+ 		for str := range strings.SplitSeq(value, ",") {
+diff --git a/runsc/config/config.go b/runsc/config/config.go
+index 3d62095a5..4ca151126 100644
+--- a/runsc/config/config.go
++++ b/runsc/config/config.go
+@@ -438,6 +438,11 @@ type Config struct {
+ 	// round. If zero, defaults to 10ms.
+ 	DSTQuantumNS int64 `flag:"openthesis-dst-quantum-ns"`
+ 
++	// DSTSeed is the initial deterministic PRNG seed for this simulation run.
++	// When 0, the RNG is not seeded from outside (uses internal default).
++	// Set via --openthesis-dst-seed to make runs reproducible.
++	DSTSeed uint64 `flag:"openthesis-dst-seed"`
++
+ 	// DSTControlPath is the Unix socket path for the OpenThesis control interface.
+ 	DSTControlPath string `flag:"openthesis-control"`
+ }
+diff --git a/runsc/config/flags.go b/runsc/config/flags.go
+index c939a70c4..232e5467a 100644
+--- a/runsc/config/flags.go
++++ b/runsc/config/flags.go
+@@ -116,6 +116,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
+ 	flagSet.Bool("openthesis-dst", false, "enable OpenThesis deterministic simulation mode.")
+ 	flagSet.Int64("openthesis-dst-epoch", 0, "OpenThesis virtual clock epoch in nanoseconds since Unix epoch.")
+ 	flagSet.Int64("openthesis-dst-quantum-ns", 0, "OpenThesis virtual scheduler quantum in nanoseconds.")
++	flagSet.Uint64("openthesis-dst-seed", 0, "OpenThesis initial deterministic PRNG seed (0 = default).")
+ 	flagSet.String("openthesis-control", "", "Unix socket path for OpenThesis control API.")
+ 
+ 	// Flags that control sandbox runtime behavior: MM related.
+diff --git a/runsc/dst/BUILD b/runsc/dst/BUILD
+index 1be8cd028..4dae66400 100644
+--- a/runsc/dst/BUILD
++++ b/runsc/dst/BUILD
+@@ -3,6 +3,7 @@ load("//tools:defs.bzl", "go_library")
+ go_library(
+     name = "dst",
+     srcs = ["ctrl.go"],
++    stateify = False,
+     visibility = ["//runsc:__subpackages__"],
+     deps = [
+         "//pkg/log",
+diff --git a/runsc/dst/ctrl.go b/runsc/dst/ctrl.go
+index ff722bab5..1d937d8a2 100644
+--- a/runsc/dst/ctrl.go
++++ b/runsc/dst/ctrl.go
+@@ -21,6 +21,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"net"
++	"time"
+ 	"os"
+ 	"path/filepath"
+ 
+@@ -236,3 +237,68 @@ func (cs *ControlServer) dispatch(req controlRequest) controlResponse {
+ 		}
+ 
+ 	case "set-time":
++		nanos := req.Nanos
++		if nanos == 0 {
++			nanos = req.NS
++		}
++		if vc, ok := cs.kernel.VirtualClock().(sentryTime.MutableClock); ok {
++			vc.SetTime(sentryTime.Monotonic, nanos)
++			return controlResponse{OK: true, VirtualTimeNS: nanos}
++		}
++		return controlResponse{OK: false, Error: "virtual clock not initialized"}
++
++	case "set-seed":
++		if rng := cs.kernel.DeterministicRNG(); rng != nil {
++			rng.Reseed(req.Seed)
++			return controlResponse{OK: true, RNGSeed: req.Seed}
++		}
++		return controlResponse{OK: false, Error: "deterministic RNG not initialized"}
++
++	case "advance-time":
++		if vc, ok := cs.kernel.VirtualClock().(sentryTime.MutableClock); ok {
++			cur, _ := vc.GetTime(sentryTime.Monotonic)
++			newTime := cur + int64(req.DeltaNS)
++			vc.SetTime(sentryTime.Monotonic, newTime)
++			return controlResponse{OK: true, VirtualTimeNS: newTime}
++		}
++		return controlResponse{OK: false, Error: "virtual clock not initialized"}
++
++	case "run-burst":
++		sched := cs.kernel.DeterministicScheduler()
++		if sched == nil {
++			return controlResponse{OK: false, Error: "deterministic scheduler not initialized"}
++		}
++		insns := req.Instructions
++		if insns == 0 {
++			insns = 5000000
++		}
++		totalNS := insns * 128
++		sched.Resume()
++		// Give ptraced tasks real wall-clock time to make progress.
++		// The DeterministicScheduler does not yet use task channels for ptrace threads,
++		// so we sleep proportionally to virtual time (1ms per 10ms virtual, min 50ms).
++		wallNS := totalNS / 10
++		if wallNS < 50_000_000 {
++			wallNS = 50_000_000
++		}
++		time.Sleep(time.Duration(wallNS))
++		quantumNS := uint64(10000000)
++		for remaining := totalNS; remaining > 0; {
++			step := quantumNS
++			if remaining < step {
++				step = remaining
++			}
++			sched.AdvanceQuantum(step)
++			remaining -= step
++		}
++		sched.Pause()
++		var vt int64
++		if vc := cs.kernel.VirtualClock(); vc != nil {
++			vt, _ = vc.GetTime(sentryTime.Monotonic)
++		}
++		return controlResponse{OK: true, VirtualTimeNS: vt}
++
++	default:
++		return controlResponse{OK: false, Error: fmt.Sprintf("unknown command: %s", req.Cmd)}
++	}
++}

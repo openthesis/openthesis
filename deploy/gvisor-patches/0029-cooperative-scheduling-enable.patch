@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Wed, 02 Apr 2026 00:00:00 +0530
+Subject: [PATCH 29/31] kernel: re-enable cooperative task scheduling (requires GOMAXPROCS=1 in guest)
+
+Background:
+The DeterministicScheduler (patch 0003) defined deterministicYield and
+deterministicResume channels on Task, but they were never initialized.
+A previous attempt to initialize them deadlocked because GOMAXPROCS>1
+in the guest created multiple sentry Tasks per container with cross-Task
+Go channel/mutex dependencies that the scheduler could not resolve:
+
+  Scheduler runs Task A → A blocks on Go channel waiting for B → B is
+  blocked waiting for scheduler quantum → scheduler waiting for A → deadlock.
+
+Fix:
+With GOMAXPROCS=1 in the guest (set via OCI env, see prepare.go change),
+each container has exactly ONE worker sentry Task. All Go goroutines within
+the container multiplex on that single Task; cross-goroutine dependencies
+are resolved by the Go runtime's own scheduler within the Task, not across
+Tasks. The cooperative scheduler can now safely interleave Tasks from
+different containers at every syscall boundary.
+
+This matches Antithesis's model: one isolated execution unit per service,
+the hypervisor controls which unit runs next.
+
+Changes:
+1. task_run.go — deterministicStart():
+   - Initialize deterministicYield and deterministicResume channels.
+   - Register task with DeterministicScheduler via MakeRunnable(t).
+   - Block on <-t.deterministicResume waiting for first quantum grant.
+     (The task goroutine is now paused until the scheduler picks it.)
+
+2. task_run.go — deterministicExit() (new):
+   - Called from the task's run() exit path before the goroutine returns.
+   - Nils deterministicResume BEFORE sending the final yield signal.
+   - The nil resume tells the scheduler's re-queue check not to re-add
+     this dead task to the runnable queue.
+
+3. task_run.go — dstYield():
+   - Add nil guard: if channels not initialized, return immediately.
+   - Prevents panic/infinite block when channels are nil.
+
+4. dst_scheduler.go — taskYielded():
+   - Add nil guard on t.deterministicYield before sending.
+
+The idle-loop clock advancement (patch 0012: time.After(10ms) calls
+AdvanceQuantum when queue is empty) already handles the case where all
+tasks are blocked on virtual timers. No change needed there.
+---
+ pkg/sentry/kernel/dst_scheduler.go | 6 +++++
+ pkg/sentry/kernel/task_run.go      | 53 +++++++++++++++++++++++++++--
+ 2 files changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/pkg/sentry/kernel/task_run.go b/pkg/sentry/kernel/task_run.go
+index eb266fc67..00be3b14b 100644
+--- a/pkg/sentry/kernel/task_run.go
++++ b/pkg/sentry/kernel/task_run.go
+@@ -235,5 +235,10 @@ func (t *Task) run(threadID uintptr) {
+ 	// (existing run() body ...)
+
++	// On exit: signal the deterministic scheduler that this task is done.
++	// Must be called before the goroutine returns so the scheduler receives
++	// the final yield and does not get stuck waiting forever.
++	defer t.deterministicExit()
++
+ 	// (rest of run() body ...)
+ }
+
+@@ -238,27 +244,73 @@ func (t *Task) dstYield() {
+-	if t.k.DeterministicScheduler() != nil {
+-		t.k.DeterministicScheduler().taskYielded(t)
+-		<-t.deterministicResume
++	// Guard: channels are nil until deterministicStart initializes them.
++	// This is the reverted state — the no-op guard prevents any blocking
++	// or panic when cooperative scheduling is not yet active for this task.
++	if t.deterministicYield == nil || t.deterministicResume == nil {
++		return
+ 	}
++	t.k.DeterministicScheduler().taskYielded(t)
++	<-t.deterministicResume
+ }
+
+ // deterministicRun is called by the scheduler to execute the task
+ // for up to instrQuanta instructions. The task runs on its own
+ // goroutine and calls dstYield() when it reaches a yield point.
+ func (t *Task) deterministicRun(instrQuanta uint64) {
+ 	if t.deterministicResume == nil {
+ 		return
+ 	}
+-	// Signal the task's goroutine to proceed.
++	// Grant the task one quantum: unblock its goroutine.
+ 	t.deterministicResume <- struct{}{}
+-	// Wait for the task to yield back.
++	// Wait for the task to reach a yield point (syscall boundary) or exit.
+ 	<-t.deterministicYield
+ }
+
++// deterministicStart initialises the instruction counter and cooperative
++// scheduling channels for this task's goroutine. Called once per task
++// goroutine at startup (from run()) when DST mode is active.
++//
++// With GOMAXPROCS=1 in the guest, this task is the sole OS thread for the
++// container's application. Blocking here until the scheduler grants the
++// first quantum is safe: no other task in this container is waiting for us.
+ func (t *Task) deterministicStart() {
+ 	if !t.k.DeterministicMode() {
+ 		return
+ 	}
++	// Pin this goroutine to its OS thread so the perf_event instruction
++	// counter (bound to a specific TID) reliably measures this task.
+ 	runtime.LockOSThread()
+ 	t.instrCounter = platform.NewInstructionCounter(unix.Gettid())
++
++	// Initialize cooperative scheduling channels.
++	// Unbuffered: sender blocks until receiver is ready, ensuring strict
++	// handshake semantics between task goroutine and scheduler goroutine.
++	t.deterministicYield = make(chan struct{})
++	t.deterministicResume = make(chan struct{})
++
++	// Register with the scheduler. MakeRunnable adds this task to the
++	// runnable queue and sends a non-blocking wakeup to the scheduler loop.
++	t.k.DeterministicScheduler().MakeRunnable(t)
++
++	// Pause here until the scheduler grants the first quantum.
++	// This ensures tasks don't race ahead before the scheduler is ready
++	// and that the first pick is deterministic (seeded RNG in patch 0030).
++	<-t.deterministicResume
+ }
++
++// deterministicExit signals the scheduler that this task has exited and
++// must not be re-queued. It is deferred from run() so it always fires
++// before the task goroutine terminates.
++//
++// The protocol: nil deterministicResume first (tells the scheduler's
++// re-queue check to skip this task), then send the final yield signal.
++// The scheduler receives the yield via <-t.deterministicYield inside
++// deterministicRun, observes deterministicResume == nil, and skips re-queue.
++func (t *Task) deterministicExit() {
++	if t.deterministicYield == nil {
++		return // cooperative scheduling not active for this task
++	}
++	// Prevent re-queue: nil the resume channel before the final yield.
++	t.deterministicResume = nil
++	// Final yield: unblock the scheduler's deterministicRun.
++	t.deterministicYield <- struct{}{}
++}
+
+diff --git a/pkg/sentry/kernel/dst_scheduler.go b/pkg/sentry/kernel/dst_scheduler.go
+index 3a1bb7d66..0000001 100644
+--- a/pkg/sentry/kernel/dst_scheduler.go
++++ b/pkg/sentry/kernel/dst_scheduler.go
+@@ -192,6 +192,10 @@ func (ds *DeterministicScheduler) TaskCount() int {
+ // the task has reached a yield point and is returning control.
+ func (ds *DeterministicScheduler) taskYielded(t *Task) {
+-	// Signal the scheduler that this task has yielded.
+-	t.deterministicYield <- struct{}{}
++	// Guard: if the task's yield channel was nilled (task is exiting via
++	// deterministicExit), don't attempt to send — that would block forever.
++	if t.deterministicYield == nil {
++		return
++	}
++	t.deterministicYield <- struct{}{}
+ }

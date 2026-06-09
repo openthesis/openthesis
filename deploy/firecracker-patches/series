@@ -1,0 +1,6 @@
+0001-vmm-add-DST-virtual-clock-module.patch
+0002-vmm-add-PMC-instruction-counter-module.patch
+0003-vmm-add-seeded-SplitMix64-PRNG.patch
+0004-vmm-add-CPUID-overrides-TSC-1GHz-DPQ-network-orderin.patch
+0005-vmm-add-DST-ctrl-socket-HLT-handler-restore-in-place.patch
+0006-Replace-fixed-quantum-RDTSC-clock-advancement-with-P.patch

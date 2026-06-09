@@ -1,0 +1,13 @@
+[package]
+name = "openthesis-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "OpenThesis SDK for Rust — deterministic testing assertions and guidance"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

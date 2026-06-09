@@ -1,0 +1,26 @@
+--- /tmp/x86.c.orig	2026-04-25 13:56:33.458152674 +0000
++++ /usr/src/linux-source-6.8.0/arch/x86/kvm/x86.c	2026-04-25 13:56:51.099240857 +0000
+@@ -4784,6 +4784,9 @@
+ 		if (kvm_is_vm_type_supported(KVM_X86_SW_PROTECTED_VM))
+ 			r |= BIT(KVM_X86_SW_PROTECTED_VM);
+ 		break;
++	case KVM_CAP_RDTSC_EXITING:
++		r = 1;
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -6461,6 +6464,13 @@
+ 		kvm->arch.disabled_quirks = cap->args[0];
+ 		r = 0;
+ 		break;
++	case KVM_CAP_RDTSC_EXITING:
++		r = -EINVAL;
++		if (cap->flags || cap->args[0])
++			break;
++		kvm->arch.rdtsc_exiting = true;
++		r = 0;
++		break;
+ 	case KVM_CAP_SPLIT_IRQCHIP: {
+ 		mutex_lock(&kvm->lock);
+ 		r = -EINVAL;

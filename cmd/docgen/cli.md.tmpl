@@ -1,0 +1,55 @@
+---
+generated: {{ .GeneratedAt }}
+---
+
+# CLI Reference
+
+OpenThesis is invoked as `openthesis <command> [flags]`.
+
+!!! note "Auto-generated"
+    This page is generated from the CLI source. Run `make docs` to regenerate it.
+    Do not edit `site/docs/reference/cli.md` directly — changes will be overwritten.
+
+## Global flags
+
+These flags apply to thin-client operations that connect to a running OpenThesis API server.
+
+| Flag | Env var | Description |
+|------|---------|-------------|
+| `--server <addr>` | `OPENTHESIS_SERVER` | Address of the OpenThesis API server |
+| `--api-key <key>` | `OPENTHESIS_API_KEY` | Authentication key for the API server |
+
+---
+
+## Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `OPENTHESIS_STATE_DIR` | Default state directory (overrides `--state-dir` default) |
+| `OPENTHESIS_CONFIG` | Default config file path |
+| `OPENTHESIS_DEV_ADDR` | Default live dashboard address (same as `--dev-addr`) |
+| `OPENTHESIS_OUTPUT_DIR` | SDK output directory — set automatically inside VMs |
+| `OPENTHESIS_SEED` | SDK PRNG seed — set automatically inside VMs |
+
+---
+{{ range .Commands }}
+## `openthesis {{ .Name }}`
+
+{{ .Short }}
+{{ if .Long }}
+{{ .Long }}
+{{ end }}
+{{ if .Examples -}}
+```sh
+{{ .Examples }}
+```
+{{ end }}
+{{ if .Flags -}}
+| Flag | Default | Description |
+|------|---------|-------------|
+{{ range .Flags -}}
+| `--{{ .Name }}` | {{ if .Default }}`{{ .Default }}`{{ else }}&nbsp;{{ end }} | {{ .Usage }} |
+{{ end }}
+{{ end -}}
+---
+{{ end }}

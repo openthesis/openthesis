@@ -1,0 +1,221 @@
+diff --git a/pkg/rand/rand_linux.go b/pkg/rand/rand_linux.go
+index 45e50732c..07f3cb1ef 100644
+--- a/pkg/rand/rand_linux.go
++++ b/pkg/rand/rand_linux.go
+@@ -83,8 +83,30 @@ func SetDeterministicSource(r io.Reader) {
+ 	dstReader = r
+ }
+ 
+-// Reader is the default reader.
+-var Reader io.Reader = &bufferedReader{r: bufio.NewReader(&reader{})}
++// baseReader is the underlying non-deterministic reader used when DST mode
++// is not active.
++var baseReader io.Reader = &bufferedReader{r: bufio.NewReader(&reader{})}
++
++// dstAwareReader is an io.Reader that routes through dstReader when DST mode
++// is active, and falls back to the host entropy reader otherwise.
++// All users of rand.Reader (including Int63n, TCP ISN seeding, ephemeral
++// port allocation, etc.) automatically become deterministic when DST is
++// enabled via SetDeterministicSource.
++type dstAwareReader struct{}
++
++func (r *dstAwareReader) Read(b []byte) (int, error) {
++	dstMu.Lock()
++	dr := dstReader
++	dstMu.Unlock()
++	if dr != nil {
++		return io.ReadFull(dr, b)
++	}
++	return baseReader.Read(b)
++}
++
++// Reader is the default reader. In DST mode (after SetDeterministicSource
++// is called), reads from the deterministic PRNG; otherwise from host entropy.
++var Reader io.Reader = &dstAwareReader{}
+ 
+ // Read reads from the current reader. In DST mode, reads from the
+ // deterministic PRNG; otherwise reads from crypto/rand.
+@@ -95,7 +117,7 @@ func Read(b []byte) (int, error) {
+ 	if dr != nil {
+ 		return io.ReadFull(dr, b)
+ 	}
+-	return io.ReadFull(Reader, b)
++	return io.ReadFull(baseReader, b)
+ }
+ 
+ // Init can be called to make sure /dev/urandom is pre-opened on kernels that
+diff --git a/pkg/sentry/inet/BUILD b/pkg/sentry/inet/BUILD
+index 067656ac7..1001de2ae 100644
+--- a/pkg/sentry/inet/BUILD
++++ b/pkg/sentry/inet/BUILD
+@@ -51,6 +51,7 @@ go_library(
+         "//pkg/atomicbitops",
+         "//pkg/context",
+         "//pkg/refs",
++        "//pkg/rand",
+         "//pkg/sentry/fsimpl/nsfs",
+         "//pkg/sentry/kernel/auth",
+         "//pkg/sentry/socket/netlink/nlmsg",
+diff --git a/pkg/sentry/inet/abstract_socket_namespace.go b/pkg/sentry/inet/abstract_socket_namespace.go
+index e2507b5bf..359c886e9 100644
+--- a/pkg/sentry/inet/abstract_socket_namespace.go
++++ b/pkg/sentry/inet/abstract_socket_namespace.go
+@@ -16,7 +16,7 @@ package inet
+ 
+ import (
+ 	"fmt"
+-	"math/rand"
++	pkgrand "gvisor.dev/gvisor/pkg/rand"
+ 
+ 	"gvisor.dev/gvisor/pkg/context"
+ 	"gvisor.dev/gvisor/pkg/refs"
+@@ -94,7 +94,7 @@ func (a *AbstractSocketNamespace) Bind(ctx context.Context, path string, ep tran
+ 	if path == "" {
+ 		// Autobind feature.
+ 		mask := uint32(0xFFFFF)
+-		r := rand.Uint32()
++		r := pkgrand.Uint32()
+ 		for i := uint32(0); i <= mask; i++ {
+ 			p := fmt.Sprintf("X%05x", (r+i)&mask)
+ 			if _, ok := a.endpoints[p[1:]]; ok {
+diff --git a/pkg/sentry/kernel/syslog.go b/pkg/sentry/kernel/syslog.go
+index 44cb78465..5567f84eb 100644
+--- a/pkg/sentry/kernel/syslog.go
++++ b/pkg/sentry/kernel/syslog.go
+@@ -16,7 +16,7 @@ package kernel
+ 
+ import (
+ 	"fmt"
+-	"math/rand"
++	pkgrand "gvisor.dev/gvisor/pkg/rand"
+ 
+ 	"gvisor.dev/gvisor/pkg/sync"
+ )
+@@ -89,7 +89,7 @@ func (s *syslog) Log() []byte {
+ 	}
+ 
+ 	selectMessage := func() string {
+-		i := rand.Intn(len(allMessages))
++		i := int(pkgrand.Int63n(int64(len(allMessages))))
+ 		m := allMessages[i]
+ 
+ 		// Delete the selected message.
+@@ -105,11 +105,11 @@ func (s *syslog) Log() []byte {
+ 
+ 	time := 0.1
+ 	for i := 0; i < 10; i++ {
+-		time += rand.Float64() / 2
++		time += (float64(pkgrand.Uint64()>>11) / (1 << 53)) / 2
+ 		s.msg = append(s.msg, []byte(fmt.Sprintf(format, time, selectMessage()))...)
+ 	}
+ 
+-	time += rand.Float64() / 2
++	time += (float64(pkgrand.Uint64()>>11) / (1 << 53)) / 2
+ 	s.msg = append(s.msg, []byte(fmt.Sprintf(format, time, "Ready!"))...)
+ 
+ 	// Return a copy.
+diff --git a/pkg/sentry/kernel/task_sched.go b/pkg/sentry/kernel/task_sched.go
+index 39fe9f014..083cc1f60 100644
+--- a/pkg/sentry/kernel/task_sched.go
++++ b/pkg/sentry/kernel/task_sched.go
+@@ -18,7 +18,7 @@ package kernel
+ 
+ import (
+ 	"fmt"
+-	"math/rand/v2"
++	pkgrand "gvisor.dev/gvisor/pkg/rand"
+ 	"time"
+ 
+ 	"gvisor.dev/gvisor/pkg/abi/linux"
+@@ -259,7 +259,7 @@ func (k *Kernel) runCPUClockTicker() {
+ 				continue
+ 			}
+ 			runningTasks++
+-			if i := rand.IntN(runningTasks); i < len(incTasks) {
++			if i := int(pkgrand.Int63n(int64(runningTasks))); i < len(incTasks) {
+ 				incTasks[i] = t
+ 			}
+ 		}
+@@ -268,9 +268,10 @@ func (k *Kernel) runCPUClockTicker() {
+ 		// Shuffle incTasks to ensure that if multiple tasks are in the same
+ 		// thread group, then all are equally likely to be
+ 		// ThreadGroup.app[Sys]CPUClockLast when a ThreadGroup CPU timer fires.
+-		rand.Shuffle(numIncTasks, func(i, j int) {
+-			incTasks[i], incTasks[j] = incTasks[j], incTasks[i]
+-		})
++		for si := numIncTasks - 1; si > 0; si-- {
++			sj := int(pkgrand.Int63n(int64(si + 1)))
++			incTasks[si], incTasks[sj] = incTasks[sj], incTasks[si]
++		}
+ 		for _, t := range incTasks[:numIncTasks] {
+ 			switch t.TaskGoroutineState() {
+ 			case TaskGoroutineRunningApp:
+diff --git a/pkg/sentry/mm/BUILD b/pkg/sentry/mm/BUILD
+index 6fbf619df..084ebc6d3 100644
+--- a/pkg/sentry/mm/BUILD
++++ b/pkg/sentry/mm/BUILD
+@@ -152,6 +152,7 @@ go_library(
+         "//pkg/abi/linux",
+         "//pkg/atomicbitops",
+         "//pkg/context",
++        "//pkg/rand",
+         "//pkg/errors/linuxerr",
+         "//pkg/hostarch",
+         "//pkg/log",
+diff --git a/pkg/sentry/mm/syscalls.go b/pkg/sentry/mm/syscalls.go
+index 8cfc48a6d..48df15636 100644
+--- a/pkg/sentry/mm/syscalls.go
++++ b/pkg/sentry/mm/syscalls.go
+@@ -16,7 +16,7 @@ package mm
+ 
+ import (
+ 	"fmt"
+-	mrand "math/rand"
++	pkgrand "gvisor.dev/gvisor/pkg/rand"
+ 
+ 	"gvisor.dev/gvisor/pkg/abi/linux"
+ 	"gvisor.dev/gvisor/pkg/context"
+@@ -279,7 +279,7 @@ func (mm *MemoryManager) MapStack(ctx context.Context) (hostarch.AddrRange, erro
+ 
+ 	// Determine the stack's desired location. Unlike Linux, address
+ 	// randomization can't be disabled.
+-	stackEnd := mm.layout.MaxAddr - hostarch.Addr(mrand.Int63n(int64(mm.layout.MaxStackRand))).RoundDown()
++	stackEnd := mm.layout.MaxAddr - hostarch.Addr(pkgrand.Int63n(int64(mm.layout.MaxStackRand))).RoundDown()
+ 	if stackEnd < szaddr {
+ 		return hostarch.AddrRange{}, linuxerr.ENOMEM
+ 	}
+diff --git a/pkg/sentry/socket/netlink/port/BUILD b/pkg/sentry/socket/netlink/port/BUILD
+index 802c16dd8..defdf2b08 100644
+--- a/pkg/sentry/socket/netlink/port/BUILD
++++ b/pkg/sentry/socket/netlink/port/BUILD
+@@ -9,7 +9,7 @@ go_library(
+     name = "port",
+     srcs = ["port.go"],
+     visibility = ["//pkg/sentry:internal"],
+-    deps = ["//pkg/sync"],
++    deps = ["//pkg/rand", "//pkg/sync"],
+ )
+ 
+ go_test(
+diff --git a/pkg/sentry/socket/netlink/port/port.go b/pkg/sentry/socket/netlink/port/port.go
+index 2cd3afc22..eaaca8aa7 100644
+--- a/pkg/sentry/socket/netlink/port/port.go
++++ b/pkg/sentry/socket/netlink/port/port.go
+@@ -23,7 +23,7 @@ package port
+ import (
+ 	"fmt"
+ 	"math"
+-	"math/rand"
++	pkgrand "gvisor.dev/gvisor/pkg/rand"
+ 
+ 	"gvisor.dev/gvisor/pkg/sync"
+ )
+@@ -77,8 +77,8 @@ func (m *Manager) Allocate(protocol int, hint int32) (int32, bool) {
+ 	// Search for any free port in [math.MinInt32, -4096). The positive
+ 	// port space is left open for pid-based allocations. This behavior is
+ 	// consistent with Linux.
+-	start := int32(math.MinInt32 + rand.Int63n(math.MaxInt32-4096+1))
++	start := int32(math.MinInt32 + pkgrand.Int63n(math.MaxInt32-4096+1))
+ 	curr := start
+ 	for {
+ 		if _, ok := proto[curr]; !ok {

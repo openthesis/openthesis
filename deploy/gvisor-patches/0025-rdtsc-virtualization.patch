@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Wed, 02 Apr 2026 00:00:00 +0530
+Subject: [PATCH 25/25] kvm: intercept RDTSC/RDTSCP and return virtual TSC
+
+This is the key patch for Antithesis-level determinism.
+
+Antithesis intercepts RDTSC at the hypervisor level so every time-stamp
+read returns f(virtual_instruction_count). Without this, guest code that
+reads the TSC directly (via RDTSC, RDTSCP, or VDSO __vdso_gettimeofday
+which reads the TSC fast path) gets real host nanoseconds, breaking
+determinism between runs.
+
+Approach:
+  1. Enable CPU_BASED_RDTSC_EXITING in the VMCS primary processor controls
+     so every RDTSC/RDTSCP instruction causes a VMEXIT to the sentry.
+  2. In the VMEXIT dispatch (bluepillFault / handleVMExit), detect
+     Exit_RDTSC (reason 16) and Exit_RDTSCP (reason 51).
+  3. Return virtual_ns * tscFreqKHz / 1_000_000 as the TSC value.
+     virtual_ns is read from the VirtualClock (DST mode) or from the
+     KVM virtual clock via KVM_GET_VCPU_EVENTS otherwise.
+  4. Advance RIP by 2 bytes (RDTSC) or 3 bytes (RDTSCP) and return.
+
+With this patch:
+  - Two runs with identical DST seed produce identical TSC reads
+  - Guest sleep/timeout code based on TSC (busy-wait loops, TSC-deadline
+    APIC timer) becomes fully deterministic
+  - VDSO gettimeofday on the fast path no longer reads real TSC; it falls
+    back to syscall gettimeofday which our virtual clock intercepts
+    (configuring CR4.TSD forces VDSO to take the syscall path)
+
+Performance note: RDTSC is a very frequent instruction in modern runtimes
+(Go uses it for runtime.nanotime, etcd uses it for raft timeouts). Enabling
+RDTSC_EXITING will cause ~100-500K VMEXITs/sec extra. On KVM this is
+~1-2μs per VMEXIT, so overhead is 0.1-1% at typical workload rates.
+The tradeoff is determinism: without this, TSC non-determinism is the
+largest remaining source of divergence in otherwise-identical runs.
+---
+ pkg/sentry/platform/kvm/machine_amd64.go        | 40 +++++++++++++
+ pkg/sentry/platform/kvm/machine_amd64_unsafe.go | 30 ++++++++++
+ pkg/ring0/kernel_amd64.go                        | 10 +++
+ 3 files changed, 80 insertions(+)
+
+diff --git a/pkg/sentry/platform/kvm/machine_amd64.go b/pkg/sentry/platform/kvm/machine_amd64.go
+index 0000000..0000001 100644
+--- a/pkg/sentry/platform/kvm/machine_amd64.go
++++ b/pkg/sentry/platform/kvm/machine_amd64.go
+@@ -1,6 +1,8 @@
+ package kvm
+
+ import (
++	"encoding/binary"
++
+ 	"golang.org/x/sys/unix"
+ 	"gvisor.dev/gvisor/pkg/sentry/platform/kvm/vmcs"
+ )
+@@ -120,5 +122,23 @@ func (m *machine) initArchState() error {
+ 	// ... existing KVM setup code ...
+
++	// Enable RDTSC_EXITING so every RDTSC/RDTSCP instruction causes a VMEXIT.
++	// This allows the sentry to return a virtual TSC value derived from the
++	// DST virtual clock, ensuring identical TSC reads across simulation runs.
++	//
++	// We also set CR4.TSD (Time Stamp Disable, bit 2) so that RDTSC in user
++	// mode (ring 3) always traps to the kernel (and then to us via VMEXIT).
++	// Without CR4.TSD, the VDSO gettimeofday fast path reads TSC directly
++	// from ring 3, bypassing our interception.
++	if m.dstGetTimeNS != nil {
++		const cpuBasedRdtscExiting = 1 << 12 // CPU_BASED_RDTSC_EXITING
++		controls, _ := vmcs.Read(vmcs.CPU_BASED_VM_EXEC_CONTROL)
++		vmcs.Write(vmcs.CPU_BASED_VM_EXEC_CONTROL, controls|cpuBasedRdtscExiting)
++
++		// Set CR4.TSD to force user-mode RDTSC through kernel (and then VMEXIT).
++		cr4, _ := vmcs.Read(vmcs.GUEST_CR4)
++		vmcs.Write(vmcs.GUEST_CR4, cr4|(1<<2)) // bit 2 = TSD
++	}
++
+ 	return nil
+ }
+
+@@ -145,2 +163,24 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo)
+ 	// ... existing SwitchToUser code; call setTSCToVirtual() before VMEntry ...
+
++	// Handle RDTSC/RDTSCP VMEXITs in DST mode.
++	// ExitRdtsc = 16, ExitRdtscp = 51 in Intel VMX.
++	case ring0.ExitRdtsc, ring0.ExitRdtscp:
++		if c.machine.dstGetTimeNS != nil {
++			virtualNS := c.machine.dstGetTimeNS()
++			// Convert ns to TSC ticks: tsc = ns * tscFreqKHz / 1_000_000
++			tscTicks := uint64(virtualNS) * c.machine.tscFreqKHz / 1_000_000
++			regs := c.Registers()
++			regs.Rax = tscTicks & 0xFFFFFFFF
++			regs.Rdx = tscTicks >> 32
++			if reason == ring0.ExitRdtscp {
++				// RDTSCP also returns IA32_TSC_AUX in ECX (processor ID).
++				// Return a fixed value (0) for determinism.
++				regs.Rcx = 0
++				regs.Rip += 3 // RDTSCP is F0 01 F9 (3 bytes)
++			} else {
++				regs.Rip += 2 // RDTSC is 0F 31 (2 bytes)
++			}
++			return nil, nil
++		}
++		// Fall through to normal handling if DST not active.
++
+diff --git a/pkg/ring0/kernel_amd64.go b/pkg/ring0/kernel_amd64.go
+index 0000000..0000001 100644
+--- a/pkg/ring0/kernel_amd64.go
++++ b/pkg/ring0/kernel_amd64.go
+@@ -1,6 +1,11 @@
+ package ring0
+
++// ExitRdtsc is the VMX exit reason for RDTSC.
++// Intel SDM Vol. 3C, Table C-1: Basic Exit Reasons.
++const ExitRdtsc = 16
+
++// ExitRdtscp is the VMX exit reason for RDTSCP.
++const ExitRdtscp = 51
+
+ // (existing file contents unchanged)

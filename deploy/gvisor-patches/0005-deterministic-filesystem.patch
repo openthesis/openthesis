@@ -1,0 +1,103 @@
+From db8abb717905bbe23910a3d1b7a7b5fb077176ce Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Sat, 14 Mar 2026 12:04:38 +0530
+Subject: [PATCH 05/11] sentry/fsimpl: deterministic inodes, sorted readdir,
+ fixed timestamps
+
+---
+ pkg/sentry/fsimpl/tmpfs/tmpfs.go | 56 ++++++++++++++++++++++++++++++++
+ pkg/sentry/kernel/timekeeper.go  | 10 ++++++
+ 2 files changed, 66 insertions(+)
+
+diff --git a/pkg/sentry/fsimpl/tmpfs/tmpfs.go b/pkg/sentry/fsimpl/tmpfs/tmpfs.go
+index 0ad089e31..d76911dde 100644
+--- a/pkg/sentry/fsimpl/tmpfs/tmpfs.go
++++ b/pkg/sentry/fsimpl/tmpfs/tmpfs.go
+@@ -1009,3 +1009,59 @@ func parseSize(s string) (uint64, error) {
+ 	}
+ 	return bytes, err
+ }
++
++// ============================================================
++// DST: Deterministic Inode Allocator
++// ============================================================
++
++// DeterministicInodeAllocator provides sequential inode numbers
++// starting from a seed-derived base. This replaces any host-derived
++// or random inode allocation to ensure reproducibility across runs.
++type DeterministicInodeAllocator struct {
++	next atomicbitops.Uint64
++}
++
++// NewDeterministicInodeAllocator creates an allocator starting from a
++// seed-derived base. The base is spread across the inode space to detect
++// inode-dependent bugs (e.g., code that assumes inodes start at 1).
++func NewDeterministicInodeAllocator(seed uint64) *DeterministicInodeAllocator {
++	a := &DeterministicInodeAllocator{}
++	// Spread across inode space using golden ratio hash.
++	base := (seed * 0x9e3779b97f4a7c15) & 0x00FFFFFFFFFFFFFF
++	if base < 2 {
++		base = 2 // inode 1 is reserved for root
++	}
++	a.next.Store(base)
++	return a
++}
++
++// Allocate returns the next deterministic inode number.
++func (a *DeterministicInodeAllocator) Allocate() uint64 {
++	return a.next.Add(1) - 1
++}
++
++// dstInodeMu protects dstInodeAllocator.
++var (
++	dstInodeMu        sync.Mutex
++	dstInodeAllocator *DeterministicInodeAllocator
++)
++
++// SetDSTInodeAllocator installs a deterministic inode allocator.
++// Called during filesystem initialization in DST mode.
++func SetDSTInodeAllocator(a *DeterministicInodeAllocator) {
++	dstInodeMu.Lock()
++	defer dstInodeMu.Unlock()
++	dstInodeAllocator = a
++}
++
++// allocateInodeDST returns the next inode number, using the deterministic
++// allocator if set, or falling back to the default function.
++func allocateInodeDST(defaultNext func() uint64) uint64 {
++	dstInodeMu.Lock()
++	a := dstInodeAllocator
++	dstInodeMu.Unlock()
++	if a != nil {
++		return a.Allocate()
++	}
++	return defaultNext()
++}
+diff --git a/pkg/sentry/kernel/timekeeper.go b/pkg/sentry/kernel/timekeeper.go
+index 75b2986d1..73df266f9 100644
+--- a/pkg/sentry/kernel/timekeeper.go
++++ b/pkg/sentry/kernel/timekeeper.go
+@@ -18,6 +18,7 @@ import (
+ 	"fmt"
+ 	"time"
+ 
++	"gvisor.dev/gvisor/pkg/abi/linux"
+ 	"gvisor.dev/gvisor/pkg/atomicbitops"
+ 	"gvisor.dev/gvisor/pkg/log"
+ 	"gvisor.dev/gvisor/pkg/sentry/ktime"
+@@ -441,3 +442,12 @@ func (r *timekeeperTcpipTimer) NotifyTimer(exp uint64) {
+ 		r.fn()
+ 	}()
+ }
++
++// DSTNow returns the current virtual time as a Linux timespec.
++// Used by filesystem implementations to set deterministic timestamps
++// in DST mode, ensuring all file timestamps are derived from the
++// virtual clock rather than host wall time.
++func (t *Timekeeper) DSTNow() linux.Timespec {
++	ns, _ := t.clocks.GetTime(sentrytime.Realtime)
++	return linux.NsecToTimespec(ns)
++}
+-- 
+2.43.0
+

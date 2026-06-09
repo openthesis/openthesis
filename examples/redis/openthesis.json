@@ -1,0 +1,181 @@
+{
+  "name": "redis-cluster",
+  "description": "6-node Redis Cluster (3 masters + 3 replicas) - tests leader election, slot migration, and data durability under fault injection",
+  "nodes": [
+    {
+      "name": "redis-1",
+      "binary": "./bin/redis-server",
+      "args": [
+        "--port", "7001",
+        "--cluster-enabled", "yes",
+        "--cluster-config-file", "/tmp/redis-nodes-7001.conf",
+        "--cluster-node-timeout", "5000",
+        "--cluster-announce-ip", "127.0.0.1",
+        "--cluster-announce-port", "7001",
+        "--cluster-announce-bus-port", "17001",
+        "--appendonly", "no",
+        "--protected-mode", "no",
+        "--bind", "127.0.0.1",
+        "--loglevel", "warning",
+        "--save", ""
+      ],
+      "fault_probe": ":7001"
+    },
+    {
+      "name": "redis-2",
+      "binary": "./bin/redis-server",
+      "args": [
+        "--port", "7002",
+        "--cluster-enabled", "yes",
+        "--cluster-config-file", "/tmp/redis-nodes-7002.conf",
+        "--cluster-node-timeout", "5000",
+        "--cluster-announce-ip", "127.0.0.1",
+        "--cluster-announce-port", "7002",
+        "--cluster-announce-bus-port", "17002",
+        "--appendonly", "no",
+        "--protected-mode", "no",
+        "--bind", "127.0.0.1",
+        "--loglevel", "warning",
+        "--save", ""
+      ],
+      "fault_probe": ":7002"
+    },
+    {
+      "name": "redis-3",
+      "binary": "./bin/redis-server",
+      "args": [
+        "--port", "7003",
+        "--cluster-enabled", "yes",
+        "--cluster-config-file", "/tmp/redis-nodes-7003.conf",
+        "--cluster-node-timeout", "5000",
+        "--cluster-announce-ip", "127.0.0.1",
+        "--cluster-announce-port", "7003",
+        "--cluster-announce-bus-port", "17003",
+        "--appendonly", "no",
+        "--protected-mode", "no",
+        "--bind", "127.0.0.1",
+        "--loglevel", "warning",
+        "--save", ""
+      ],
+      "fault_probe": ":7003"
+    },
+    {
+      "name": "redis-4",
+      "binary": "./bin/redis-server",
+      "args": [
+        "--port", "7004",
+        "--cluster-enabled", "yes",
+        "--cluster-config-file", "/tmp/redis-nodes-7004.conf",
+        "--cluster-node-timeout", "5000",
+        "--cluster-announce-ip", "127.0.0.1",
+        "--cluster-announce-port", "7004",
+        "--cluster-announce-bus-port", "17004",
+        "--appendonly", "no",
+        "--protected-mode", "no",
+        "--bind", "127.0.0.1",
+        "--loglevel", "warning",
+        "--save", ""
+      ],
+      "fault_probe": ":7004"
+    },
+    {
+      "name": "redis-5",
+      "binary": "./bin/redis-server",
+      "args": [
+        "--port", "7005",
+        "--cluster-enabled", "yes",
+        "--cluster-config-file", "/tmp/redis-nodes-7005.conf",
+        "--cluster-node-timeout", "5000",
+        "--cluster-announce-ip", "127.0.0.1",
+        "--cluster-announce-port", "7005",
+        "--cluster-announce-bus-port", "17005",
+        "--appendonly", "no",
+        "--protected-mode", "no",
+        "--bind", "127.0.0.1",
+        "--loglevel", "warning",
+        "--save", ""
+      ],
+      "fault_probe": ":7005"
+    },
+    {
+      "name": "redis-6",
+      "binary": "./bin/redis-server",
+      "args": [
+        "--port", "7006",
+        "--cluster-enabled", "yes",
+        "--cluster-config-file", "/tmp/redis-nodes-7006.conf",
+        "--cluster-node-timeout", "5000",
+        "--cluster-announce-ip", "127.0.0.1",
+        "--cluster-announce-port", "7006",
+        "--cluster-announce-bus-port", "17006",
+        "--appendonly", "no",
+        "--protected-mode", "no",
+        "--bind", "127.0.0.1",
+        "--loglevel", "warning",
+        "--save", ""
+      ],
+      "fault_probe": ":7006"
+    },
+    {
+      "name": "redis-driver",
+      "binary": "./redis-driver",
+      "args": ["loop"],
+      "env": {
+        "REDIS_NODES": "127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003,127.0.0.1:7004,127.0.0.1:7005,127.0.0.1:7006"
+      },
+      "daemon": false
+    }
+  ],
+  "test_dir": "./tests",
+  "kernel_path": "/var/lib/openthesis/kernel/vmlinux",
+  "exploration": {
+    "strategy": "coverage",
+    "max_states": 5000,
+    "max_depth": 50,
+    "branch_factor": 8,
+    "seed": 42,
+    "burst_min_ns": 50000000,
+    "burst_max_ns": 200000000,
+    "burst_timeout_secs": 12,
+    "use_wall_clock_bursts": true,
+    "wall_clock_burst_min_ms": 1500,
+    "wall_clock_burst_max_ms": 4000
+  },
+  "faults": {
+    "enabled": true,
+    "swarm_testing": true,
+    "adaptive_faults": true,
+    "network": {
+      "drop_rate": 0.08,
+      "delay_min": "5ms",
+      "delay_max": "200ms",
+      "crash_rate": 0.0,
+      "partition_rate": 0.05,
+      "directed_partition_ratio": 0.3,
+      "throttle_rate": 0.05,
+      "throttle_min_kbps": 256,
+      "throttle_max_kbps": 4096,
+      "reorder_rate": 0.05,
+      "reorder_correlation": 25,
+      "nway_partition_rate": 0.03,
+      "nway_partition_max_groups": 3
+    },
+    "node": {
+      "hang_rate": 0.02,
+      "hang_min": "500ms",
+      "hang_max": "5s",
+      "terminate_rate": 0.01,
+      "clock_jitter_max": "50ms",
+      "pause_rate": 0.03,
+      "pause_min": "200ms",
+      "pause_max": "2s",
+      "cpu_throttle_rate": 0.04,
+      "cpu_throttle_min_pct": 10,
+      "cpu_throttle_max_pct": 40,
+      "mem_pressure_rate": 0.03,
+      "mem_pressure_min_mb": 64,
+      "mem_pressure_max_mb": 256
+    }
+  },
+  "duration": "5m"
+}

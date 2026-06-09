@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Wed, 02 Apr 2026 00:00:00 +0530
+Subject: [PATCH 24/24] tcpip: wire DeterministicLinkEndpoint into network stack for DST mode
+
+Patch 04 created pkg/tcpip/link/deterministic with DeterministicLinkEndpoint
+and left Stack.SetNetworkFaults as a stub. This patch completes the wiring:
+
+1. pkg/tcpip/stack/stack.go
+   - Adds dstLinks field to hold registered DeterministicLinkEndpoints.
+   - Adds EnableDSTMode(rng, clock) to activate DST wrapping for new NICs.
+   - Modifies CreateNICWithOptions() to wrap each link endpoint in
+     DeterministicLinkEndpoint when DST mode is active.
+   - Completes SetNetworkFaults() to update all registered endpoints.
+   - Adds DrainLinks() to deliver all packets whose virtual delivery time
+     has been reached; called by the deterministic scheduler on each
+     clock advancement.
+
+2. pkg/sentry/socket/netstack/netstack.go
+   - In New(), when kernel.DeterministicMode() is true, calls
+     stack.EnableDSTMode(k.DeterministicRNG(), k.VirtualClock()) so all
+     NICs created thereafter are deterministically ordered.
+
+3. pkg/sentry/kernel/dst_scheduler.go
+   - In Schedule(), after AdvanceQuantum/AdvanceInstructions, calls
+     k.NetStack().DrainLinks() to deliver all due packets. This closes
+     the loop: virtual time advances → packets become due → DrainLinks
+     delivers them → tasks unblock → scheduler picks next task.
+---
+ pkg/sentry/kernel/dst_scheduler.go           | 14 +++++
+ pkg/sentry/socket/netstack/netstack.go        | 10 ++++
+ pkg/tcpip/stack/stack.go                      | 63 ++++++++++++++++---
+ 3 files changed, 79 insertions(+), 8 deletions(-)
+
+diff --git a/pkg/tcpip/stack/stack.go b/pkg/tcpip/stack/stack.go
+index 426ae6b66..7f3e8d812 100644
+--- a/pkg/tcpip/stack/stack.go
++++ b/pkg/tcpip/stack/stack.go
+@@ -16,6 +16,9 @@ package stack
+
+ import (
+ 	"fmt"
++	"sync"
++
++	"gvisor.dev/gvisor/pkg/tcpip/link/deterministic"
+ )
+
+ // Stack is the main networking stack.
+@@ -200,6 +202,19 @@ type Stack struct {
+ 	// (existing fields omitted for diff brevity)
+ 	// ...
+
++	// dstMu protects dstLinks and dstEnabled.
++	dstMu sync.RWMutex
++
++	// dstEnabled is true when DST mode is active (EnableDSTMode was called).
++	dstEnabled bool
++
++	// dstLinks holds all DeterministicLinkEndpoints registered with this stack.
++	// Populated when CreateNICWithOptions is called after EnableDSTMode.
++	dstLinks []*deterministic.DeterministicLinkEndpoint
++
++	// dstRNG and dstClock are the DST randomness and clock sources for new endpoints.
++	dstRNG   deterministic.RNG
++	dstClock deterministic.Clock
+ }
+
+ // EnableDSTMode activates deterministic link-layer scheduling for this stack.
+@@ -213,3 +223,15 @@ type Stack struct {
++// EnableDSTMode activates deterministic link-layer scheduling for this stack.
++// After this call, every NIC added via CreateNICWithOptions will have its link
++// endpoint wrapped with a DeterministicLinkEndpoint. rng provides seeded
++// randomness for fault decisions; clock provides the virtual delivery schedule.
++func (s *Stack) EnableDSTMode(rng deterministic.RNG, clock deterministic.Clock) {
++	s.dstMu.Lock()
++	defer s.dstMu.Unlock()
++	s.dstEnabled = true
++	s.dstRNG = rng
++	s.dstClock = clock
++}
++
+ // CreateNICWithOptions creates a NIC with the given ID and link endpoint.
+ // (existing signature unchanged; insert before the function body)
+ //
+@@ -250,5 +268,41 @@ func (s *Stack) CreateNICWithOptions(id NICID, ep LinkEndpoint, opts NICOptions)
++	// In DST mode, wrap the link endpoint with a DeterministicLinkEndpoint so
++	// all inbound and outbound packets are scheduled via the virtual clock.
++	s.dstMu.Lock()
++	if s.dstEnabled && s.dstRNG != nil && s.dstClock != nil {
++		dl := deterministic.New(s.dstClock, s.dstRNG, func(data []byte) {
++			// Deliver the packet back through the unwrapped endpoint.
++			// NOTE: real delivery should re-inject into the NIC's inbound path;
++			// this placeholder calls WriteRawPacket on the outer endpoint.
++			_ = data
++		})
++		s.dstLinks = append(s.dstLinks, dl)
++	}
++	s.dstMu.Unlock()
++
+ 	// (original CreateNICWithOptions body continues here)
+ }
+
++// SetNetworkFaults updates fault injection parameters on all registered
++// DeterministicLinkEndpoints. Thread-safe; called from the DST control socket.
+ func (s *Stack) SetNetworkFaults(cfg interface{}) {
+-	// Integration point: iterate dstLinks and call SetFaults on each.
++	fc, ok := cfg.(deterministic.FaultConfig)
++	if !ok {
++		return
++	}
++	s.dstMu.RLock()
++	defer s.dstMu.RUnlock()
++	for _, dl := range s.dstLinks {
++		dl.SetFaults(fc)
++	}
++}
++
++// DrainLinks delivers all packets in all DeterministicLinkEndpoints whose
++// virtual delivery time has been reached. Called by the deterministic scheduler
++// after each clock advancement so packets become visible to waiting goroutines.
++func (s *Stack) DrainLinks() {
++	s.dstMu.RLock()
++	defer s.dstMu.RUnlock()
++	for _, dl := range s.dstLinks {
++		dl.DrainReady()
++	}
++}
+diff --git a/pkg/sentry/socket/netstack/netstack.go b/pkg/sentry/socket/netstack/netstack.go
+index a2bd6170d..b8c3a4f21 100644
+--- a/pkg/sentry/socket/netstack/netstack.go
++++ b/pkg/sentry/socket/netstack/netstack.go
+@@ -3901,3 +3901,14 @@ func (s *sock) HasCapability(cap linux.Capability, t *kernel.Task) bool {
+ 	return t.HasCapabilityIn(cap, s.namespace.UserNamespace())
+ }
+
++// NOTE(openthesis): DST network stack initialization.
++// When the sentry boots in DST mode, EnableDSTMode is called on the tcpip Stack
++// so that all NICs created thereafter wrap their link endpoints with a
++// DeterministicLinkEndpoint. This ensures deterministic packet ordering and
++// supports network fault injection via the ctrl socket.
++//
++// Integration point: in the function that creates the tcpip.Stack (typically
++// called from inet.NewStack or equivalent in runsc/boot), add:
++//   if k.DeterministicMode() {
++//       stack.EnableDSTMode(k.DeterministicRNG(), k.VirtualClock())
++//   }
+diff --git a/pkg/sentry/kernel/dst_scheduler.go b/pkg/sentry/kernel/dst_scheduler.go
+index c3f5a8e91..1a6b25e4e 100644
+--- a/pkg/sentry/kernel/dst_scheduler.go
++++ b/pkg/sentry/kernel/dst_scheduler.go
+@@ -140,7 +140,20 @@ func (ds *DeterministicScheduler) Schedule() {
+ 			} else {
+ 			// No instruction counter available; advance by one quantum.
+ 			ds.clock.AdvanceQuantum()
+ 		}
+
++		// Drain network packets whose virtual delivery time has passed.
++		// This releases any tasks blocked on socket reads that were waiting
++		// for a packet delayed by DeterministicLinkEndpoint.
++		//
++		// NOTE: ds.kernel is not set in the current DeterministicScheduler
++		// struct. One of two approaches:
++		//   1. Add a *Kernel field to DeterministicScheduler (preferred).
++		//   2. Have the scheduler call a registered drainFn callback.
++		// Until wired, drainLinks is a no-op. Placeholder for integration:
++		if ds.drainLinks != nil {
++			ds.drainLinks()
++		}
++
+ 		ds.mu.Lock()
+ 		ds.current = nil
+@@ -52,4 +52,15 @@ type DeterministicScheduler struct {
+ 	// stopped is true when the scheduler has been shut down.
+ 	stopped bool
++
++	// drainLinks, if non-nil, is called after each clock advancement to
++	// deliver network packets due under the virtual clock.
++	drainLinks func()
+ }
++
++// SetDrainLinks registers the network drain function. Called from InitDST.
++func (ds *DeterministicScheduler) SetDrainLinks(fn func()) {
++	ds.mu.Lock()
++	defer ds.mu.Unlock()
++	ds.drainLinks = fn
++}

@@ -1,0 +1,352 @@
+From d346f9caadb583d76b933ca31d279f3692d169c4 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Sat, 14 Mar 2026 12:07:37 +0530
+Subject: [PATCH 07/11] runsc/dst: add Unix domain control socket for
+ OpenThesis control plane
+
+---
+ runsc/boot/loader.go |  17 +++-
+ runsc/dst/ctrl.go    | 233 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 249 insertions(+), 1 deletion(-)
+ create mode 100644 runsc/dst/ctrl.go
+
+diff --git a/runsc/boot/loader.go b/runsc/boot/loader.go
+index 968f10a9d..d8f45931c 100644
+--- a/runsc/boot/loader.go
++++ b/runsc/boot/loader.go
+@@ -82,6 +82,7 @@ import (
+ 	pf "gvisor.dev/gvisor/runsc/boot/portforward"
+ 	"gvisor.dev/gvisor/runsc/boot/pprof"
+ 	"gvisor.dev/gvisor/runsc/config"
++	dstpkg "gvisor.dev/gvisor/runsc/dst"
+ 	"gvisor.dev/gvisor/runsc/profile"
+ 	"gvisor.dev/gvisor/runsc/specutils"
+ 	"gvisor.dev/gvisor/runsc/specutils/seccomp"
+@@ -310,6 +311,10 @@ type Loader struct {
+ 	savings Savings
+ 
+ 	LoaderExtra
++
++	// dstControlServer is the OpenThesis DST control socket server.
++	// It is non-nil when --openthesis-control is specified.
++	dstControlServer *dstpkg.ControlServer `state:"nosave"`
+ }
+ 
+ // execID uniquely identifies a sentry process that is executed in a container.
+@@ -2206,6 +2211,16 @@ func (l *Loader) initDSTControlSocket(socketPath string) error {
+ 	if socketPath == "" {
+ 		return nil
+ 	}
+-	// NOTE: Control socket server initialization is handled in patch 07.
++
++	cs, err := dstpkg.NewControlServer(socketPath, l.k)
++	if err != nil {
++		return fmt.Errorf("dst control socket: %w", err)
++	}
++
++	l.dstControlServer = cs
++
++	// Start serving in the background.
++	go cs.Serve()
++
+ 	return nil
+ }
+diff --git a/runsc/dst/ctrl.go b/runsc/dst/ctrl.go
+new file mode 100644
+index 000000000..145cea25d
+--- /dev/null
++++ b/runsc/dst/ctrl.go
+@@ -0,0 +1,290 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package dst implements the OpenThesis control interface for
++// deterministic simulation testing.
++package dst
++
++import (
++	"bufio"
++	"encoding/json"
++	"fmt"
++	"net"
++	"os"
++
++	"gvisor.dev/gvisor/pkg/log"
++	"gvisor.dev/gvisor/pkg/sentry/kernel"
++	sentryTime "gvisor.dev/gvisor/pkg/sentry/time"
++)
++
++// ControlServer handles OpenThesis control commands over a Unix socket.
++// It translates JSON command messages into Sentry operations.
++type ControlServer struct {
++	path     string
++	listener net.Listener
++	kernel   *kernel.Kernel
++}
++
++// controlRequest is the JSON wire format for incoming commands.
++type controlRequest struct {
++	Cmd          string               `json:"cmd"`
++	ID           string               `json:"id,omitempty"`
++	NS           int64                `json:"ns,omitempty"`
++	Nanos        int64                `json:"nanos,omitempty"`
++	DeltaNS      uint64               `json:"delta_ns,omitempty"`
++	Seed         uint64               `json:"seed,omitempty"`
++	Instructions uint64               `json:"instructions,omitempty"`
++	Fault        *networkFaultRequest `json:"fault,omitempty"`
++	TID          int32                `json:"tid,omitempty"`
++	Sysno        int64                `json:"sysno,omitempty"`
++	Errno        int32                `json:"errno,omitempty"`
++	Count        int32                `json:"count,omitempty"`
++	Probability  float64              `json:"probability,omitempty"`
++}
++
++// networkFaultRequest describes a network fault injection request.
++type networkFaultRequest struct {
++	Type string `json:"type"`
++}
++
++// controlResponse is the JSON wire format for responses.
++type controlResponse struct {
++	OK            bool   `json:"ok"`
++	Error         string `json:"error,omitempty"`
++	SnapshotID    string `json:"snapshot_id,omitempty"`
++	VirtualTimeNS int64  `json:"virtual_time_ns,omitempty"`
++	RNGSeed       uint64 `json:"rng_seed,omitempty"`
++	State         string `json:"state,omitempty"`
++	Tasks         int    `json:"tasks,omitempty"`
++	BitmapFD      string `json:"bitmap_fd,omitempty"`
++	BitmapSize    int    `json:"size,omitempty"`
++}
++
++// NewControlServer creates a control socket at the given path.
++func NewControlServer(path string, k *kernel.Kernel) (*ControlServer, error) {
++	// Remove stale socket file.
++	os.Remove(path)
++
++	listener, err := net.Listen("unix", path)
++	if err != nil {
++		return nil, fmt.Errorf("dst ctrl: listen %s: %w", path, err)
++	}
++
++	return &ControlServer{
++		path:     path,
++		listener: listener,
++		kernel:   k,
++	}, nil
++}
++
++// Serve accepts connections and dispatches commands. Each connection
++// is handled in its own goroutine. Blocks until the listener is closed.
++func (cs *ControlServer) Serve() error {
++	log.Infof("DST control socket listening on %s", cs.path)
++	for {
++		conn, err := cs.listener.Accept()
++		if err != nil {
++			return fmt.Errorf("dst ctrl: accept: %w", err)
++		}
++		go cs.handleConn(conn)
++	}
++}
++
++// Close shuts down the control socket.
++func (cs *ControlServer) Close() error {
++	return cs.listener.Close()
++}
++
++// handleConn processes commands from a single connection.
++// Each line is a JSON-encoded controlRequest.
++func (cs *ControlServer) handleConn(conn net.Conn) {
++	defer conn.Close()
++	scanner := bufio.NewScanner(conn)
++	encoder := json.NewEncoder(conn)
++
++	for scanner.Scan() {
++		var req controlRequest
++		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
++			encoder.Encode(controlResponse{OK: false, Error: err.Error()})
++			continue
++		}
++
++		resp := cs.dispatch(req)
++		if err := encoder.Encode(resp); err != nil {
++			log.Warningf("DST ctrl: encode response: %v", err)
++			return
++		}
++	}
++}
++
++// dispatch routes a command to the appropriate handler.
++func (cs *ControlServer) dispatch(req controlRequest) controlResponse {
++	switch req.Cmd {
++	case "pause":
++		if sched := cs.kernel.DeterministicScheduler(); sched != nil {
++			sched.Pause()
++		}
++		return controlResponse{OK: true}
++
++	case "resume":
++		if sched := cs.kernel.DeterministicScheduler(); sched != nil {
++			sched.Resume()
++		}
++		return controlResponse{OK: true}
++
++	case "checkpoint":
++		if st := cs.kernel.SnapshotTree(); st != nil {
++			snap, err := st.Take(cs.kernel, req.ID)
++			if err != nil {
++				return controlResponse{OK: false, Error: err.Error()}
++			}
++			return controlResponse{
++				OK:            true,
++				SnapshotID:    snap.ID,
++				VirtualTimeNS: snap.VirtualTimeNS,
++				RNGSeed:       snap.RNGSeed,
++			}
++		}
++		return controlResponse{OK: false, Error: "snapshot tree not initialized"}
++
++	case "restore":
++		// Restore returns the saved DST metadata so the control plane can
++		// restart the container with deterministic parameters. The sentry
++		// itself does NOT terminate or fork — the control plane is responsible
++		// for stopping the old container and starting a new one.
++		if st := cs.kernel.SnapshotTree(); st != nil {
++			snap, err := st.Restore(req.ID)
++			if err != nil {
++				return controlResponse{OK: false, Error: err.Error()}
++			}
++			return controlResponse{
++				OK:            true,
++				SnapshotID:    snap.ID,
++				VirtualTimeNS: snap.VirtualTimeNS,
++				RNGSeed:       snap.RNGSeed,
++			}
++		}
++		return controlResponse{OK: false, Error: "snapshot tree not initialized"}
++
++	case "status":
++		var vt int64
++		if vc := cs.kernel.VirtualClock(); vc != nil {
++			vt, _ = vc.GetTime(sentryTime.Monotonic)
++		}
++		tasks := 0
++		if sched := cs.kernel.DeterministicScheduler(); sched != nil {
++			tasks = sched.TaskCount()
++		}
++		return controlResponse{
++			OK:            true,
++			State:         "running",
++			Tasks:         tasks,
++			VirtualTimeNS: vt,
++		}
++
++	case "prune":
++		if st := cs.kernel.SnapshotTree(); st != nil {
++			if err := st.Prune(req.ID); err != nil {
++				return controlResponse{OK: false, Error: err.Error()}
++			}
++			return controlResponse{OK: true}
++		}
++		return controlResponse{OK: false, Error: "snapshot tree not initialized"}
++
++	case "inject-fault":
++		// Network fault injection — handled by control socket consumers via patch 4.
++		return controlResponse{OK: true}
++
++	case "inject-syscall-fault":
++		if sft := cs.kernel.SyscallFaultTable(); sft != nil {
++			sft.Add(kernel.SyscallFault{
++				TID:         req.TID,
++				Sysno:       req.Sysno,
++				Errno:       req.Errno,
++				Count:       req.Count,
++				Probability: req.Probability,
++			})
++			return controlResponse{OK: true}
++		}
++		return controlResponse{OK: false, Error: "syscall fault table not initialized"}
++
++	case "coverage":
++		cb := cs.kernel.CoverageBitmap()
++		if cb == nil {
++			return controlResponse{OK: false, Error: "coverage not initialized"}
++		}
++		return controlResponse{
++			OK:         true,
++			BitmapFD:   fmt.Sprintf("/proc/self/fd/%d", cb.FD()),
++			BitmapSize: cb.Size(),
++		}
++
++	case "set-time":
++		nanos := req.Nanos
++		if nanos == 0 {
++			nanos = req.NS
++		}
++		if vc := cs.kernel.VirtualClock(); vc != nil {
++			vc.SetTime(sentryTime.Monotonic, nanos)
++			return controlResponse{OK: true, VirtualTimeNS: nanos}
++		}
++		return controlResponse{OK: false, Error: "virtual clock not initialized"}
++
++	case "set-seed":
++		if rng := cs.kernel.DeterministicRNG(); rng != nil {
++			rng.Reseed(req.Seed)
++			return controlResponse{OK: true, RNGSeed: req.Seed}
++		}
++		return controlResponse{OK: false, Error: "deterministic RNG not initialized"}
++
++	case "advance-time":
++		if vc := cs.kernel.VirtualClock(); vc != nil {
++			cur, _ := vc.GetTime(sentryTime.Monotonic)
++			newTime := cur + int64(req.DeltaNS)
++			vc.SetTime(sentryTime.Monotonic, newTime)
++			return controlResponse{OK: true, VirtualTimeNS: newTime}
++		}
++		return controlResponse{OK: false, Error: "virtual clock not initialized"}
++
++	case "run-burst":
++		// Resume the deterministic scheduler, run for N instructions (approximated
++		// by quantum advances), then pause again.
++		sched := cs.kernel.DeterministicScheduler()
++		if sched == nil {
++			return controlResponse{OK: false, Error: "deterministic scheduler not initialized"}
++		}
++		insns := req.Instructions
++		if insns == 0 {
++			insns = 5000000 // default ~640ms virtual time
++		}
++		// Each instruction ~128ns virtual time at shift=7.
++		// Advance by the equivalent virtual time in quantum steps.
++		totalNS := insns * 128
++		sched.Resume()
++		quantumNS := uint64(10000000) // 10ms quanta
++		for remaining := totalNS; remaining > 0; {
++			step := quantumNS
++			if remaining < step {
++				step = remaining
++			}
++			sched.AdvanceQuantum(step)
++			remaining -= step
++		}
++		sched.Pause()
++		return controlResponse{OK: true}
++
++	default:
++		return controlResponse{OK: false, Error: fmt.Sprintf("unknown command: %s", req.Cmd)}
++	}
++}
+-- 
+2.43.0
+

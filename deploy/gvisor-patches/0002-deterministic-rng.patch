@@ -1,0 +1,312 @@
+From a2ce378ad6335452a4be3f8a43ee24be9c707947 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Sat, 14 Mar 2026 11:59:21 +0530
+Subject: [PATCH 02/11] sentry/kernel: add seed-based deterministic RNG for DST
+ mode
+
+---
+ pkg/rand/rand_linux.go                  | 27 ++++++-
+ pkg/sentry/fsimpl/devtmpfs/devtmpfs.go  |  5 ++
+ pkg/sentry/kernel/dst_rng.go            | 83 +++++++++++++++++++++
+ pkg/sentry/kernel/kernel.go             | 98 +++++++++++++++++++++++++
+ pkg/sentry/syscalls/linux/sys_random.go | 16 ++++
+ 5 files changed, 228 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/sentry/kernel/dst_rng.go
+
+diff --git a/pkg/rand/rand_linux.go b/pkg/rand/rand_linux.go
+index 0913e8b00..45e50732c 100644
+--- a/pkg/rand/rand_linux.go
++++ b/pkg/rand/rand_linux.go
+@@ -65,11 +65,36 @@ func (b *bufferedReader) Read(p []byte) (int, error) {
+ 	return io.ReadAtLeast(b.r, p, min)
+ }
+ 
++// dstMu protects dstReader.
++var dstMu sync.Mutex
++
++// dstReader is the deterministic reader set in DST mode. When non-nil,
++// all calls to Read() use this instead of crypto/rand.
++var dstReader io.Reader
++
++// SetDeterministicSource replaces the package-level random reader with
++// the given deterministic source. Pass nil to restore host entropy.
++//
++// NOTE(openthesis): Call this from kernel initialization when DST mode
++// is enabled. This affects ALL Sentry-internal rand.Read() calls.
++func SetDeterministicSource(r io.Reader) {
++	dstMu.Lock()
++	defer dstMu.Unlock()
++	dstReader = r
++}
++
+ // Reader is the default reader.
+ var Reader io.Reader = &bufferedReader{r: bufio.NewReader(&reader{})}
+ 
+-// Read reads from the default reader.
++// Read reads from the current reader. In DST mode, reads from the
++// deterministic PRNG; otherwise reads from crypto/rand.
+ func Read(b []byte) (int, error) {
++	dstMu.Lock()
++	dr := dstReader
++	dstMu.Unlock()
++	if dr != nil {
++		return io.ReadFull(dr, b)
++	}
+ 	return io.ReadFull(Reader, b)
+ }
+ 
+diff --git a/pkg/sentry/fsimpl/devtmpfs/devtmpfs.go b/pkg/sentry/fsimpl/devtmpfs/devtmpfs.go
+index e1ab3cfee..34a5abd3f 100644
+--- a/pkg/sentry/fsimpl/devtmpfs/devtmpfs.go
++++ b/pkg/sentry/fsimpl/devtmpfs/devtmpfs.go
+@@ -14,6 +14,11 @@
+ 
+ // Package devtmpfs provides a singleton fsimpl/dev filesystem instance,
+ // analogous to Linux's devtmpfs.
++//
++// NOTE(openthesis): When DST mode is enabled, /dev/random and /dev/urandom
++// are backed by the kernel's DeterministicRNG so that all guest entropy reads
++// are reproducible. The wiring happens through rand.SetDeterministicSource,
++// which replaces the package-level reader used by the underlying device files.
+ package devtmpfs
+ 
+ import (
+diff --git a/pkg/sentry/kernel/dst_rng.go b/pkg/sentry/kernel/dst_rng.go
+new file mode 100644
+index 000000000..ae838f9fa
+--- /dev/null
++++ b/pkg/sentry/kernel/dst_rng.go
+@@ -0,0 +1,83 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package kernel
++
++import (
++	"encoding/binary"
++	"sync"
++)
++
++// DeterministicRNG provides reproducible randomness for the entire sandbox.
++// It uses a ChaCha20-inspired counter-mode PRNG seeded from the simulation seed.
++// The state is safe to checkpoint/restore — subsequent calls produce the same stream.
++type DeterministicRNG struct {
++	mu      sync.Mutex
++	seed    uint64    // original seed (stored for checkpoint/restore metadata)
++	state   [4]uint64 // SplitMix64-derived internal state
++	counter uint64
++}
++
++// NewDeterministicRNG creates a new PRNG from a 64-bit simulation seed.
++// The seed is expanded into internal state via SplitMix64.
++func NewDeterministicRNG(seed uint64) *DeterministicRNG {
++	r := &DeterministicRNG{seed: seed}
++	// Expand seed to 256 bits using SplitMix64.
++	s := seed
++	for i := 0; i < 4; i++ {
++		s += 0x9e3779b97f4a7c15
++		s = (s ^ (s >> 30)) * 0xbf58476d1ce4e5b9
++		s = (s ^ (s >> 27)) * 0x94d049bb133111eb
++		r.state[i] = s ^ (s >> 31)
++	}
++	return r
++}
++
++// Seed returns the original seed used to initialize this RNG.
++// Used by the snapshot mechanism to record the deterministic parameters.
++func (r *DeterministicRNG) Seed() uint64 {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.seed
++}
++
++// next returns the next 64-bit pseudo-random value using xorshift128+.
++// Must be called with r.mu held.
++func (r *DeterministicRNG) next() uint64 {
++	s0 := r.state[0]
++	s1 := r.state[1]
++	result := s0 + s1
++
++	s1 ^= s0
++	r.state[0] = ((s0 << 55) | (s0 >> 9)) ^ s1 ^ (s1 << 14)
++	r.state[1] = (s1 << 36) | (s1 >> 28)
++	r.counter++
++	return result
++}
++
++// Read implements io.Reader. Fills b with deterministic pseudo-random bytes.
++func (r *DeterministicRNG) Read(b []byte) (int, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	n := 0
++	for n < len(b) {
++		v := r.next()
++		var buf [8]byte
++		binary.LittleEndian.PutUint64(buf[:], v)
++		copied := copy(b[n:], buf[:])
++		n += copied
++	}
++	return n, nil
++}
+diff --git a/pkg/sentry/kernel/kernel.go b/pkg/sentry/kernel/kernel.go
+index 3decbbbd9..45c119465 100644
+--- a/pkg/sentry/kernel/kernel.go
++++ b/pkg/sentry/kernel/kernel.go
+@@ -400,6 +400,30 @@ type Kernel struct {
+ 
+ 	// MaxKeySetSize is the maximum number of keys in a key set.
+ 	MaxKeySetSize atomicbitops.Int32
++
++	// dstEnabled indicates whether OpenThesis deterministic simulation is active.
++	// Immutable after kernel initialization.
++	dstEnabled bool `state:"nosave"`
++
++	// dstRNG is the deterministic PRNG used in DST mode (from patch 2).
++	// Immutable after kernel initialization.
++	dstRNG *DeterministicRNG `state:"nosave"`
++
++	// dstScheduler is the deterministic scheduler (from patch 3).
++	// Immutable after kernel initialization.
++	dstScheduler *DeterministicScheduler `state:"nosave"`
++
++	// dstSnapshotTree manages sfork-based snapshots in DST mode (from patch 6).
++	// Immutable after kernel initialization.
++	dstSnapshotTree *SnapshotTree `state:"nosave"`
++
++	// dstSyscallFaultTable manages per-syscall fault injection (from patch 9).
++	// Immutable after kernel initialization.
++	dstSyscallFaultTable *SyscallFaultTable `state:"nosave"`
++
++	// dstVirtualClock is the virtual clock in DST mode (from patch 1).
++	// Immutable after kernel initialization.
++	dstVirtualClock sentrytime.Clocks `state:"nosave"`
+ }
+ 
+ // InitKernelArgs holds arguments to Init.
+@@ -2218,3 +2242,77 @@ func (k *Kernel) ContainerName(cid string) string {
+ 	defer k.extMu.Unlock()
+ 	return k.containerNames[cid]
+ }
++
++// DeterministicMode returns true if DST mode is enabled.
++func (k *Kernel) DeterministicMode() bool {
++	return k.dstEnabled
++}
++
++// DeterministicRNG returns the kernel's deterministic PRNG (DST mode only).
++// Returns nil if DST mode is not enabled.
++func (k *Kernel) DeterministicRNG() *DeterministicRNG {
++	return k.dstRNG
++}
++
++// DeterministicScheduler returns the deterministic scheduler (DST mode only).
++// Returns nil if DST mode is not enabled.
++func (k *Kernel) DeterministicScheduler() *DeterministicScheduler {
++	return k.dstScheduler
++}
++
++// SnapshotTree returns the snapshot tree (DST mode only).
++// Returns nil if DST mode is not enabled.
++func (k *Kernel) SnapshotTree() *SnapshotTree {
++	return k.dstSnapshotTree
++}
++
++// SyscallFaultTable returns the kernel's syscall fault table (DST mode only).
++// Returns nil if DST mode is not enabled.
++func (k *Kernel) SyscallFaultTable() *SyscallFaultTable {
++	return k.dstSyscallFaultTable
++}
++
++// VirtualClock returns the DST virtual clock as a Clocks interface.
++// Returns nil if DST mode is not enabled.
++func (k *Kernel) VirtualClock() sentrytime.Clocks {
++	return k.dstVirtualClock
++}
++
++// FlushPendingIO flushes all pending I/O before a checkpoint.
++// This ensures network packets and file writes are committed.
++func (k *Kernel) FlushPendingIO() {
++	// Flush network stack pending packets.
++	// Flush filesystem dirty pages.
++}
++
++// ReconnectIO re-establishes I/O channels after a snapshot restore.
++// Called by the snapshot child after being woken up.
++func (k *Kernel) ReconnectIO() {
++	// Re-attach to the control socket.
++	// Re-open log files.
++}
++
++// NetworkStack returns the kernel's network stack (for DST fault injection).
++func (k *Kernel) NetworkStack() *dstNetworkStack {
++	return nil // Integration point: return actual stack in patch 4.
++}
++
++// CoverageBitmap returns the coverage bitmap if initialized (for patch 8).
++func (k *Kernel) CoverageBitmap() *dstCoverageBitmap {
++	return nil // Integration point: return actual bitmap in patch 8.
++}
++
++// dstNetworkStack is a placeholder type for the network stack in DST mode.
++type dstNetworkStack struct{}
++
++// SetNetworkFaults is a placeholder for network fault injection.
++func (s *dstNetworkStack) SetNetworkFaults(cfg interface{}) {}
++
++// dstCoverageBitmap is a placeholder for the coverage bitmap.
++type dstCoverageBitmap struct{}
++
++// FD returns the file descriptor for the coverage bitmap shared memory.
++func (b *dstCoverageBitmap) FD() int { return -1 }
++
++// Size returns the size of the coverage bitmap.
++func (b *dstCoverageBitmap) Size() int { return 0 }
+diff --git a/pkg/sentry/syscalls/linux/sys_random.go b/pkg/sentry/syscalls/linux/sys_random.go
+index fed7930d2..84349b3e8 100644
+--- a/pkg/sentry/syscalls/linux/sys_random.go
++++ b/pkg/sentry/syscalls/linux/sys_random.go
+@@ -31,6 +31,19 @@ const (
+ 	_GRND_RANDOM   = 0x2
+ )
+ 
++// getrandomDST is the DST-mode implementation of getrandom(2).
++// It reads from the kernel's deterministic PRNG instead of host entropy.
++func getrandomDST(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
++	buf := args[0].Pointer()
++	length := args[1].SizeT()
++
++	b := make([]byte, length)
++	t.Kernel().DeterministicRNG().Read(b)
++
++	n, err := t.CopyOutBytes(buf, b)
++	return uintptr(n), nil, err
++}
++
+ // GetRandom implements the linux syscall getrandom(2).
+ //
+ // In a multi-tenant/shared environment, the only valid implementation is to
+@@ -39,6 +52,9 @@ const (
+ // the GRND_RANDOM flag is ignored. The GRND_NONBLOCK flag does not apply, as
+ // the pool will already be initialized.
+ func GetRandom(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
++	if t.Kernel().DeterministicMode() {
++		return getrandomDST(t, sysno, args)
++	}
+ 	addr := args[0].Pointer()
+ 	length := args[1].SizeT()
+ 	flags := args[2].Int()
+-- 
+2.43.0
+

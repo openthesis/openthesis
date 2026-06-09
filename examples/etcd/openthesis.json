@@ -1,0 +1,131 @@
+{
+  "name": "etcd-cluster",
+  "description": "3-node etcd cluster - tests Raft consensus under fault injection",
+  "memory_mb": 2048,
+  "nodes": [
+    {
+      "name": "etcd1",
+      "binary": "./bin/etcd",
+      "cover_dir": "/tmp/gocover/etcd1",
+      "args": [
+        "--name=etcd1",
+        "--data-dir=/tmp/etcd1",
+        "--listen-peer-urls=http://127.0.0.1:12380",
+        "--listen-client-urls=http://127.0.0.1:12379",
+        "--advertise-client-urls=http://127.0.0.1:12379",
+        "--initial-advertise-peer-urls=http://127.0.0.1:12380",
+        "--initial-cluster=etcd1=http://127.0.0.1:12380,etcd2=http://127.0.0.1:22380,etcd3=http://127.0.0.1:32380",
+        "--initial-cluster-state=new",
+        "--initial-cluster-token=openthesis-etcd",
+        "--heartbeat-interval=20",
+        "--election-timeout=200",
+        "--log-level=warn"
+      ],
+      "ready_probe": ":12379/health",
+      "fault_probe": ":12380"
+    },
+    {
+      "name": "etcd2",
+      "binary": "./bin/etcd",
+      "cover_dir": "/tmp/gocover/etcd2",
+      "args": [
+        "--name=etcd2",
+        "--data-dir=/tmp/etcd2",
+        "--listen-peer-urls=http://127.0.0.1:22380",
+        "--listen-client-urls=http://127.0.0.1:22379",
+        "--advertise-client-urls=http://127.0.0.1:22379",
+        "--initial-advertise-peer-urls=http://127.0.0.1:22380",
+        "--initial-cluster=etcd1=http://127.0.0.1:12380,etcd2=http://127.0.0.1:22380,etcd3=http://127.0.0.1:32380",
+        "--initial-cluster-state=new",
+        "--initial-cluster-token=openthesis-etcd",
+        "--heartbeat-interval=20",
+        "--election-timeout=200",
+        "--log-level=warn"
+      ],
+      "ready_probe": ":22379/health",
+      "fault_probe": ":22380"
+    },
+    {
+      "name": "etcd3",
+      "binary": "./bin/etcd",
+      "cover_dir": "/tmp/gocover/etcd3",
+      "args": [
+        "--name=etcd3",
+        "--data-dir=/tmp/etcd3",
+        "--listen-peer-urls=http://127.0.0.1:32380",
+        "--listen-client-urls=http://127.0.0.1:32379",
+        "--advertise-client-urls=http://127.0.0.1:32379",
+        "--initial-advertise-peer-urls=http://127.0.0.1:32380",
+        "--initial-cluster=etcd1=http://127.0.0.1:12380,etcd2=http://127.0.0.1:22380,etcd3=http://127.0.0.1:32380",
+        "--initial-cluster-state=new",
+        "--initial-cluster-token=openthesis-etcd",
+        "--heartbeat-interval=20",
+        "--election-timeout=200",
+        "--log-level=warn"
+      ],
+      "ready_probe": ":32379/health",
+      "fault_probe": ":32380"
+    },
+    {
+      "name": "etcd-driver",
+      "binary": "./etcd-driver",
+      "args": ["loop"],
+      "env": {
+        "ETCD_NODES": "127.0.0.1:12379,127.0.0.1:22379,127.0.0.1:32379"
+      },
+      "daemon": false
+    }
+  ],
+  "test_dir": "./tests",
+  "exploration": {
+    "strategy": "coverage",
+    "max_states": 5000,
+    "max_depth": 50,
+    "branch_factor": 8,
+    "seed": 42,
+    "burst_min_ns": 50000000,
+    "burst_max_ns": 200000000,
+    "burst_timeout_secs": 12,
+    "use_wall_clock_bursts": true,
+    "wall_clock_burst_min_ms": 1500,
+    "wall_clock_burst_max_ms": 4000,
+    "no_host_patches": true
+  },
+  "faults": {
+    "enabled": true,
+    "swarm_testing": true,
+    "adaptive_faults": true,
+    "network": {
+      "drop_rate": 0.15,
+      "delay_min": "10ms",
+      "delay_max": "500ms",
+      "crash_rate": 0.0,
+      "partition_rate": 0.12,
+      "directed_partition_ratio": 0.6,
+      "throttle_rate": 0.04,
+      "throttle_min_kbps": 128,
+      "throttle_max_kbps": 1024,
+      "reorder_rate": 0.06,
+      "reorder_correlation": 25,
+      "nway_partition_rate": 0.06,
+      "nway_partition_max_groups": 3
+    },
+    "node": {
+      "hang_rate": 0.03,
+      "hang_min": "200ms",
+      "hang_max": "3s",
+      "terminate_rate": 0.02,
+      "clock_jitter_max": "100ms",
+      "pause_rate": 0.04,
+      "pause_min": "100ms",
+      "pause_max": "2s",
+      "cpu_throttle_rate": 0.03,
+      "cpu_throttle_min_pct": 10,
+      "cpu_throttle_max_pct": 50,
+      "mem_pressure_rate": 0.02,
+      "mem_pressure_min_mb": 128,
+      "mem_pressure_max_mb": 256
+    }
+  },
+  "duration": "5m"
+}

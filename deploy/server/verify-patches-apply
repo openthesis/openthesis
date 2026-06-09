@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# verify-patches-apply COMPONENT
+#
+# Clones the upstream repo at the version in COMPONENT-patches/VERSION and
+# applies the patch series via git am. Reports success or failure with context.
+#
+# COMPONENT must be one of: firecracker, qemu, gvisor, linux, host-kernel,
+#                            cloud-hypervisor
+#
+# This is expensive (full clone + compile setup). Run it before bumping VERSION
+# or after upstream releases a new version you want to adopt.
+#
+# Env: WORK_DIR   scratch directory for clones (default: /tmp/openthesis-patch-verify)
+#      KEEP=1     do not clean up after verification (useful for debugging)
+set -o errexit
+set -o nounset
+set -o pipefail
+[[ "${TRACE-0}" == "1" ]] && set -o xtrace
+
+readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+err() { echo "error: $*" >&2; exit 1; }
+log() { echo "--> $*" >&2; }
+ok()  { echo "  ✓ $*" >&2; }
+
+[[ $# -ge 1 ]] || err "usage: verify-patches-apply COMPONENT [NEW_VERSION]"
+
+readonly COMPONENT="$1"
+readonly NEW_VERSION="${2:-}"    # if given, verify against a new version instead of VERSION file
+readonly WORK_DIR="${WORK_DIR:-/tmp/openthesis-patch-verify}"
+readonly KEEP="${KEEP:-0}"
+
+readonly PATCHES_DIR="${REPO_ROOT}/deploy/${COMPONENT}-patches"
+[[ -d "$PATCHES_DIR" ]] || err "patch directory not found: ${PATCHES_DIR}"
+
+readonly VERSION_FILE="${PATCHES_DIR}/VERSION"
+[[ -f "$VERSION_FILE" ]] || err "missing VERSION file: ${VERSION_FILE}"
+
+if [[ -n "$NEW_VERSION" ]]; then
+    readonly UPSTREAM_VERSION="$NEW_VERSION"
+    log "verifying against NEW version: ${UPSTREAM_VERSION} (current: $(cat "$VERSION_FILE"))"
+else
+    readonly UPSTREAM_VERSION="$(cat "$VERSION_FILE")"
+    log "verifying against pinned version: ${UPSTREAM_VERSION}"
+fi
+
+# Component-specific upstream config.
+case "$COMPONENT" in
+    firecracker)
+        UPSTREAM_REPO="https://github.com/firecracker-microvm/firecracker"
+        SERIES_FILE="${PATCHES_DIR}/series"
+        ;;
+    qemu)
+        UPSTREAM_REPO="https://gitlab.com/qemu-project/qemu"
+        SERIES_FILE="${PATCHES_DIR}/series"
+        ;;
+    gvisor)
+        UPSTREAM_REPO="https://github.com/google/gvisor"
+        SERIES_FILE="${PATCHES_DIR}/series"
+        ;;
+    linux)
+        UPSTREAM_REPO="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
+        SERIES_FILE="${PATCHES_DIR}/series"
+        ;;
+    host-kernel)
+        err "host-kernel patches apply to the running Ubuntu kernel source (linux-source-6.8.0).\nClone-and-verify is not supported for host-kernel; apply manually on the target server."
+        ;;
+    cloud-hypervisor)
+        UPSTREAM_REPO="https://github.com/cloud-hypervisor/cloud-hypervisor"
+        SERIES_FILE="${PATCHES_DIR}/series"
+        ;;
+    *)
+        err "unknown component: ${COMPONENT}\nSupported: firecracker qemu gvisor linux cloud-hypervisor"
+        ;;
+esac
+
+[[ -f "$SERIES_FILE" ]] || err "series file not found: ${SERIES_FILE}"
+
+readonly CLONE_DIR="${WORK_DIR}/${COMPONENT}-${UPSTREAM_VERSION//\//-}"
+
+cleanup() {
+    if [[ "$KEEP" != "1" && -d "$WORK_DIR" ]]; then
+        rm -rf "$CLONE_DIR"
+    fi
+}
+trap cleanup EXIT
+
+mkdir -p "$WORK_DIR"
+
+# Clone at the pinned version (shallow where possible).
+if [[ -d "$CLONE_DIR/.git" ]]; then
+    log "reusing existing clone at ${CLONE_DIR}"
+else
+    log "cloning ${UPSTREAM_REPO} at ${UPSTREAM_VERSION}..."
+    # Commit hashes need a full (or at least deeper) clone; tags can be shallow.
+    if [[ "$UPSTREAM_VERSION" =~ ^[0-9a-f]{7,40}$ ]]; then
+        git clone "$UPSTREAM_REPO" "$CLONE_DIR"
+        git -C "$CLONE_DIR" checkout "$UPSTREAM_VERSION"
+    else
+        git clone --depth 1 --branch "$UPSTREAM_VERSION" "$UPSTREAM_REPO" "$CLONE_DIR"
+    fi
+fi
+ok "cloned at $(git -C "$CLONE_DIR" rev-parse --short HEAD)"
+
+# Apply each patch in the series.
+log "applying patch series from ${SERIES_FILE}..."
+_applied=0
+_failed=0
+while IFS= read -r patch || [[ -n "$patch" ]]; do
+    [[ -z "$patch" || "$patch" == \#* ]] && continue
+    pf="${PATCHES_DIR}/${patch}"
+    [[ -f "$pf" ]] || { echo "  ✗ missing: ${patch}" >&2; (( _failed++ )) || true; continue; }
+    if git -C "$CLONE_DIR" am "$pf" 2>&1; then
+        ok "applied: ${patch}"
+        (( _applied++ )) || true
+    else
+        echo "  ✗ failed: ${patch}" >&2
+        git -C "$CLONE_DIR" am --abort 2>/dev/null || true
+        (( _failed++ )) || true
+        break
+    fi
+done < "$SERIES_FILE"
+
+echo ""
+if [[ "$_failed" -gt 0 ]]; then
+    echo "FAILED: ${_failed} patch(es) did not apply against ${UPSTREAM_VERSION}" >&2
+    if [[ -n "$NEW_VERSION" ]]; then
+        echo "" >&2
+        echo "To rebase:" >&2
+        echo "  1. Clone the fork or working tree at the new version" >&2
+        echo "  2. Cherry-pick or rebase your changes" >&2
+        echo "  3. Regenerate patches: git format-patch BASE_COMMIT..HEAD -o deploy/${COMPONENT}-patches/" >&2
+        echo "  4. Update deploy/${COMPONENT}-patches/VERSION to ${NEW_VERSION}" >&2
+    fi
+    exit 1
+fi
+
+ok "all ${_applied} patch(es) applied cleanly against ${UPSTREAM_VERSION}"
+if [[ "$KEEP" == "1" ]]; then
+    log "patched source left at: ${CLONE_DIR}"
+fi

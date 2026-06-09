@@ -1,0 +1,104 @@
+From 9893367c19eaa87f34bf2eb0b12a7cb54f983aa6 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Sat, 14 Mar 2026 13:00:00 +0530
+Subject: [PATCH 11/11] runsc/boot: wire DST components into loader and kernel
+
+All previous patches defined DST types, constructors, and getters but
+never wired them together. Two things were missing:
+
+  1. pkg/sentry/kernel/dst_init.go - adds Kernel.InitDST which sets all
+     unexported dst* fields (only settable from within the kernel package)
+     and starts the deterministic scheduler goroutine.
+
+  2. runsc/boot/loader.go - in Loader.New, after the timekeeper is set
+     up, calls newDSTClocks() so virtual time is used when DST is enabled,
+     then constructs and installs all DST subsystems (RNG, scheduler,
+     snapshot tree, syscall-fault table) via Kernel.InitDST, and finally
+     calls initDSTControlSocket so the control server is listening before
+     any container tasks are created.
+---
+ pkg/sentry/kernel/dst_init.go | 44 +++++++++++++++++++++++++++++++++++
+ runsc/boot/loader.go          | 16 ++++++++++++-
+ 2 files changed, 59 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/sentry/kernel/dst_init.go
+
+diff --git a/pkg/sentry/kernel/dst_init.go b/pkg/sentry/kernel/dst_init.go
+new file mode 100644
+index 000000000..6e4f3daa2
+--- /dev/null
++++ b/pkg/sentry/kernel/dst_init.go
+@@ -0,0 +1,44 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package kernel
++
++import (
++	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
++)
++
++// InitDST wires all deterministic simulation testing components into the
++// kernel. Must be called from the boot loader after kernel.Init() completes
++// and before the first container task is created. All parameters must be
++// non-nil. InitDST starts the deterministic scheduler goroutine.
++func (k *Kernel) InitDST(
++	vc *sentrytime.VirtualClock,
++	rng *DeterministicRNG,
++	sched *DeterministicScheduler,
++	st *SnapshotTree,
++	sft *SyscallFaultTable,
++) {
++	k.dstEnabled = true
++	// *VirtualClock implements sentrytime.Clocks; store via the interface so
++	// callers outside the kernel package do not need the concrete type.
++	k.dstVirtualClock = vc
++	k.dstRNG = rng
++	k.dstScheduler = sched
++	k.dstSnapshotTree = st
++	k.dstSyscallFaultTable = sft
++
++	// Start the scheduler loop in the background. It blocks until tasks become
++	// runnable, so starting it before container creation is harmless.
++	go sched.Schedule()
++}
+diff --git a/runsc/boot/loader.go b/runsc/boot/loader.go
+index d8f45931c..dec663b07 100644
+--- a/runsc/boot/loader.go
++++ b/runsc/boot/loader.go
+@@ -615,7 +615,21 @@ func New(args Args) (*Loader, error) {
+ 	// Create timekeeper.
+ 	tk := kernel.NewTimekeeper()
+ 	params := kernel.NewVDSOParamPage(l.k.MemoryFile(), vdso.ParamPage.FileRange())
+-	tk.SetClocks(sentryTime.NewCalibratedClocks(), params)
++	dstClocks, dstVC := newDSTClocks(args.Conf)
++	tk.SetClocks(dstClocks, params)
++
++	// When DST mode is requested, wire all deterministic components into the
++	// kernel and start the OpenThesis control socket before any tasks run.
++	if dstVC != nil {
++		rng := kernel.NewDeterministicRNG(0)
++		sched := kernel.NewDeterministicScheduler(dstVC, uint64(args.Conf.DSTQuantumNS))
++		st := kernel.NewSnapshotTree()
++		sft := kernel.NewSyscallFaultTable(rng)
++		l.k.InitDST(dstVC, rng, sched, st, sft)
++		if err := l.initDSTControlSocket(args.Conf.DSTControlPath); err != nil {
++			return nil, fmt.Errorf("dst control socket: %w", err)
++		}
++	}
+ 
+ 	if err := enableStrace(args.Conf); err != nil {
+ 		return nil, fmt.Errorf("enabling strace: %w", err)
+-- 
+2.43.0
+

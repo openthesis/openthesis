@@ -1,0 +1,72 @@
+diff --git a/pkg/sentry/syscalls/linux/sys_signal.go b/pkg/sentry/syscalls/linux/sys_signal.go
+index b2ca06f94..69efabe4b 100644
+--- a/pkg/sentry/syscalls/linux/sys_signal.go
++++ b/pkg/sentry/syscalls/linux/sys_signal.go
+@@ -214,6 +214,14 @@ func Tkill(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
+ 	if !mayKill(t, target, sig) {
+ 		return 0, nil, linuxerr.EPERM
+ 	}
++	// DST: Suppress SIGURG and SIGPROF in deterministic mode. Guest Go
++	// runtimes send SIGURG (tgkill) for async goroutine preemption and
++	// SIGPROF for profiling timers — both are non-deterministic in ptrace
++	// mode. The DST scheduler provides deterministic cooperative preemption
++	// at syscall boundaries, so these signals are unnecessary.
++	if t.Kernel().DeterministicMode() && (sig == linux.SIGURG || sig == linux.SIGPROF || sig == linux.SIGVTALRM) {
++		return 0, nil, nil
++	}
+ 	return 0, nil, target.SendSignal(tkillSigInfo(t, target, sig))
+ }
+ 
+@@ -238,6 +246,10 @@ func Tgkill(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
+ 	if !mayKill(t, target, sig) {
+ 		return 0, nil, linuxerr.EPERM
+ 	}
++	// DST: Suppress SIGURG and SIGPROF in deterministic mode (see Tkill above).
++	if t.Kernel().DeterministicMode() && (sig == linux.SIGURG || sig == linux.SIGPROF || sig == linux.SIGVTALRM) {
++		return 0, nil, nil
++	}
+ 	return 0, nil, target.SendSignal(tkillSigInfo(t, target, sig))
+ }
+ 
+diff --git a/pkg/sentry/syscalls/linux/sys_time.go b/pkg/sentry/syscalls/linux/sys_time.go
+index 385e09bc2..2e414ddab 100644
+--- a/pkg/sentry/syscalls/linux/sys_time.go
++++ b/pkg/sentry/syscalls/linux/sys_time.go
+@@ -134,8 +134,17 @@ func getClock(t *kernel.Task, clockID int32) (ktime.Clock, error) {
+ 		//		the closest to suspend time.
+ 		return t.Kernel().MonotonicClock(), nil
+ 	case linux.CLOCK_PROCESS_CPUTIME_ID:
++		// In DST mode, CPU time clocks return virtual monotonic time
++		// so that applications using CLOCK_PROCESS_CPUTIME_ID for timing
++		// decisions get deterministic values.
++		if t.Kernel().DeterministicMode() {
++			return t.Kernel().MonotonicClock(), nil
++		}
+ 		return t.ThreadGroup().CPUClock(), nil
+ 	case linux.CLOCK_THREAD_CPUTIME_ID:
++		if t.Kernel().DeterministicMode() {
++			return t.Kernel().MonotonicClock(), nil
++		}
+ 		return t.CPUClock(), nil
+ 	default:
+ 		return nil, linuxerr.EINVAL
+@@ -304,11 +313,17 @@ func Gettimeofday(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (ui
+ 	}
+ 
+ 	if tz != hostarch.Addr(0) {
+-		// Ask the time package for the timezone.
+-		_, offset := time.Now().Zone()
++		// In DST mode, return UTC (offset=0) for determinism — timezone data
++		// from the host wall clock is a non-deterministic syscall output.
++		// Outside DST mode, return the host timezone for compatibility.
++		var tzMinutesWest int32
++		if !t.Kernel().DeterministicMode() {
++			_, offset := time.Now().Zone()
++			tzMinutesWest = -int32(offset) / 60
++		}
+ 		// This int32 array mimics linux's struct timezone.
+-		timezone := []int32{-int32(offset) / 60, 0}
++		timezone := []int32{tzMinutesWest, 0}
+ 		_, err := primitive.CopyInt32SliceOut(t, tz, timezone)
+ 		return 0, nil, err
+ 	}

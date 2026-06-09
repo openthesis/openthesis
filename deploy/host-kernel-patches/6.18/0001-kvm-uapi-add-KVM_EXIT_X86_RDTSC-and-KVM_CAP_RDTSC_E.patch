@@ -1,0 +1,26 @@
+--- /tmp/kvm.h.orig
++++ /usr/src/linux-6.18.7/include/uapi/linux/kvm.h
+@@ -178,6 +178,7 @@
+ #define KVM_EXIT_NOTIFY           37
+ #define KVM_EXIT_LOONGARCH_IOCSR  38
+ #define KVM_EXIT_MEMORY_FAULT     39
+ #define KVM_EXIT_TDX              40
++#define KVM_EXIT_X86_RDTSC        41
+ 
+ /* For KVM_EXIT_INTERNAL_ERROR */
+@@ -475,4 +476,8 @@
+ 		} tdx;
++		/* KVM_EXIT_X86_RDTSC */
++		struct {
++			__u64 tsc_value;
++		} rdtsc;
+ 		/* Fix the size of the union. */
+ 		char padding[256];
+ 	};
+@@ -969,4 +974,6 @@
+ #define KVM_CAP_ARM_CACHEABLE_PFNMAP_SUPPORTED 243
+ #define KVM_CAP_GUEST_MEMFD_FLAGS 244
+ 
++#define KVM_CAP_RDTSC_EXITING			245
++
+ struct kvm_irq_routing_irqchip {

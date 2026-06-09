@@ -1,0 +1,275 @@
+From 1a040552ab120b41c2402e1a83c31ccfcf78c977 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Sat, 14 Mar 2026 12:01:48 +0530
+Subject: [PATCH 03/11] sentry/kernel: add TID-ordered deterministic task
+ scheduler
+
+---
+ pkg/sentry/kernel/dst_scheduler.go | 185 +++++++++++++++++++++++++++++
+ pkg/sentry/kernel/task.go          |   8 ++
+ pkg/sentry/kernel/task_run.go      |  23 ++++
+ pkg/sentry/kernel/task_syscall.go  |   6 +
+ 4 files changed, 222 insertions(+)
+ create mode 100644 pkg/sentry/kernel/dst_scheduler.go
+
+diff --git a/pkg/sentry/kernel/dst_scheduler.go b/pkg/sentry/kernel/dst_scheduler.go
+new file mode 100644
+index 000000000..3a1bb7d66
+--- /dev/null
++++ b/pkg/sentry/kernel/dst_scheduler.go
+@@ -0,0 +1,185 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package kernel
++
++import (
++	"container/heap"
++	"sync"
++
++	sentryTime "gvisor.dev/gvisor/pkg/sentry/time"
++)
++
++// DeterministicScheduler enforces TID-ordered cooperative scheduling
++// for deterministic simulation testing. It replaces the default
++// goroutine-pool scheduler when DST mode is enabled.
++//
++// All runnable tasks are held in a min-heap ordered by ThreadID.
++// The scheduler picks the lowest-TID task, lets it run until it
++// yields (syscall boundary, block, or instruction quantum exhaustion),
++// then advances the virtual clock and picks the next task.
++type DeterministicScheduler struct {
++	mu sync.Mutex
++
++	// runnable is a min-heap of tasks ordered by TID.
++	runnable taskHeap
++
++	// current is the currently executing task (nil if idle).
++	current *Task
++
++	// clock is the virtual clock to advance on each quantum.
++	clock *sentryTime.VirtualClock
++
++	// instrQuanta is the max instructions per scheduling slice.
++	// When the instruction counter (patch 10) is active, a task is
++	// preempted after this many retired instructions.
++	instrQuanta uint64
++
++	// wakeup signals the scheduler loop that a new task is runnable.
++	wakeup chan struct{}
++
++	// paused is true when the scheduler is frozen (for checkpoint).
++	paused bool
++
++	// stopped is true when the scheduler has been shut down.
++	stopped bool
++}
++
++// NewDeterministicScheduler creates a scheduler bound to the given
++// virtual clock. instrQuanta sets the maximum instructions per slice
++// (0 means unlimited, yield only on syscall/block).
++func NewDeterministicScheduler(clock *sentryTime.VirtualClock, instrQuanta uint64) *DeterministicScheduler {
++	return &DeterministicScheduler{
++		clock:       clock,
++		instrQuanta: instrQuanta,
++		wakeup:      make(chan struct{}, 1),
++	}
++}
++
++// taskHeap implements heap.Interface for TID-ordered scheduling.
++type taskHeap []*Task
++
++func (h taskHeap) Len() int            { return len(h) }
++func (h taskHeap) Less(i, j int) bool  { return h[i].ThreadID() < h[j].ThreadID() }
++func (h taskHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
++func (h *taskHeap) Push(x interface{}) { *h = append(*h, x.(*Task)) }
++func (h *taskHeap) Pop() interface{} {
++	old := *h
++	n := len(old)
++	t := old[n-1]
++	old[n-1] = nil // avoid memory leak
++	*h = old[:n-1]
++	return t
++}
++
++// Schedule runs the main scheduling loop. It blocks forever and should
++// be called in its own goroutine. The loop exits when Stop() is called.
++func (ds *DeterministicScheduler) Schedule() {
++	for {
++		ds.mu.Lock()
++		for (ds.runnable.Len() == 0 || ds.paused) && !ds.stopped {
++			ds.mu.Unlock()
++			<-ds.wakeup
++			ds.mu.Lock()
++		}
++
++		if ds.stopped {
++			ds.mu.Unlock()
++			return
++		}
++
++		// Pick the lowest-TID runnable task.
++		t := heap.Pop(&ds.runnable).(*Task)
++		ds.current = t
++		ds.mu.Unlock()
++
++		// Advance the virtual clock by one quantum.
++		ds.clock.AdvanceQuantum()
++
++		// Let the task run until it yields (syscall completion, block, or
++		// instruction quantum exhausted). The task calls back into
++		// taskYielded() when it is done.
++		t.deterministicRun(ds.instrQuanta)
++
++		ds.mu.Lock()
++		ds.current = nil
++
++		// If the task still has a running resume channel, re-queue it.
++		if t.deterministicResume != nil {
++			heap.Push(&ds.runnable, t)
++		}
++		ds.mu.Unlock()
++	}
++}
++
++// MakeRunnable adds a task to the run queue. Safe to call from any
++// goroutine (e.g., when a task is woken from a futex wait).
++func (ds *DeterministicScheduler) MakeRunnable(t *Task) {
++	ds.mu.Lock()
++	defer ds.mu.Unlock()
++	heap.Push(&ds.runnable, t)
++	ds.notify()
++}
++
++// Pause freezes the scheduler. All tasks stop at their next yield
++// point. The virtual clock is also frozen. Used before checkpointing.
++func (ds *DeterministicScheduler) Pause() {
++	ds.mu.Lock()
++	defer ds.mu.Unlock()
++	ds.paused = true
++	ds.clock.Freeze()
++}
++
++// Resume unfreezes the scheduler and virtual clock.
++func (ds *DeterministicScheduler) Resume() {
++	ds.mu.Lock()
++	ds.paused = false
++	ds.clock.Thaw()
++	ds.mu.Unlock()
++	ds.notify()
++}
++
++// Stop terminates the scheduling loop.
++func (ds *DeterministicScheduler) Stop() {
++	ds.mu.Lock()
++	ds.stopped = true
++	ds.mu.Unlock()
++	ds.notify()
++}
++
++// TaskCount returns the number of runnable tasks.
++func (ds *DeterministicScheduler) TaskCount() int {
++	ds.mu.Lock()
++	defer ds.mu.Unlock()
++	n := ds.runnable.Len()
++	if ds.current != nil {
++		n++
++	}
++	return n
++}
++
++// taskYielded is called by Task.yield() to notify the scheduler that
++// the task has reached a yield point and is returning control.
++func (ds *DeterministicScheduler) taskYielded(t *Task) {
++	// Signal the scheduler that this task has yielded.
++	t.deterministicYield <- struct{}{}
++}
++
++// notify sends a non-blocking signal to the wakeup channel.
++func (ds *DeterministicScheduler) notify() {
++	select {
++	case ds.wakeup <- struct{}{}:
++	default:
++	}
++}
+diff --git a/pkg/sentry/kernel/task.go b/pkg/sentry/kernel/task.go
+index c178c428f..06553c510 100644
+--- a/pkg/sentry/kernel/task.go
++++ b/pkg/sentry/kernel/task.go
+@@ -648,6 +648,14 @@ type Task struct {
+ 	// another task that wants to pass on the execveCredsMutex lock may write to this field with
+ 	// tg.signalHandlers.mu held.
+ 	execveCredsMutexOwner *ThreadGroup
++
++	// deterministicResume is signaled by the deterministic scheduler to let
++	// this task proceed with its next syscall. Only set in DST mode.
++	deterministicResume chan struct{} `state:"nosave"`
++
++	// deterministicYield is signaled by the task when it yields back to the
++	// deterministic scheduler (after a syscall or block). Only set in DST mode.
++	deterministicYield chan struct{} `state:"nosave"`
+ }
+ 
+ // Task related metrics
+diff --git a/pkg/sentry/kernel/task_run.go b/pkg/sentry/kernel/task_run.go
+index eb266fc67..00be3b14a 100644
+--- a/pkg/sentry/kernel/task_run.go
++++ b/pkg/sentry/kernel/task_run.go
+@@ -401,3 +401,26 @@ func (t *Task) Yield() {
+ 	t.tg.yieldCount.Add(1)
+ 	runtime.Gosched()
+ }
++
++// dstYield returns control to the deterministic scheduler. The task's
++// goroutine blocks on deterministicResume until the scheduler picks
++// it again based on TID ordering.
++func (t *Task) dstYield() {
++	if t.k.DeterministicScheduler() != nil {
++		t.k.DeterministicScheduler().taskYielded(t)
++		<-t.deterministicResume
++	}
++}
++
++// deterministicRun is called by the scheduler to execute the task
++// for up to instrQuanta instructions. The task runs on its own
++// goroutine and calls dstYield() when it reaches a yield point.
++func (t *Task) deterministicRun(instrQuanta uint64) {
++	if t.deterministicResume == nil {
++		return
++	}
++	// Signal the task's goroutine to proceed.
++	t.deterministicResume <- struct{}{}
++	// Wait for the task to yield back.
++	<-t.deterministicYield
++}
+diff --git a/pkg/sentry/kernel/task_syscall.go b/pkg/sentry/kernel/task_syscall.go
+index d95dad635..4cd84ea9d 100644
+--- a/pkg/sentry/kernel/task_syscall.go
++++ b/pkg/sentry/kernel/task_syscall.go
+@@ -336,6 +336,12 @@ func (t *Task) doSyscallInvoke(sysno uintptr, args arch.SyscallArguments) taskRu
+ 		t.Arch().SetReturn(rval)
+ 	}
+ 
++	// NOTE(openthesis): In DST mode, yield to the deterministic scheduler
++	// after each syscall so it can pick the next TID-ordered task.
++	if t.k.DeterministicMode() {
++		t.dstYield()
++	}
++
+ 	return (*runSyscallExit)(nil).execute(t)
+ }
+ 
+-- 
+2.43.0
+

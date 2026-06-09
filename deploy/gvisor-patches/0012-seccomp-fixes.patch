@@ -1,0 +1,465 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Fri, 20 Mar 2026 17:00:00 +0000
+Subject: [PATCH 12/12] runsc: fix seccomp filters, scheduler idle advance, add dst/BUILD
+
+Three runtime fixes discovered during gVisor backend testing:
+
+1. Sentry seccomp filter: add SYS_ACCEPT4 (MatchAll) and SYS_GETSOCKNAME
+   (MatchAll) to the base allowedSyscalls. Go 1.22+ uses accept4 instead
+   of accept in the net package. Previously accept4 was only allowed via
+   controlServerFilters(fd) with a specific fd. getsockname is needed by
+   the urpc/control server path after accepting connections.
+
+2. Gofer seccomp filter: add SYS_ACCEPT4 (MatchAll) to the base
+   allowedSyscalls. Previously accept4 was only in udsCreateSyscalls
+   which requires UDSCreateEnabled=true (not the default).
+
+3. DST scheduler idle advance: when all goroutines are sleeping (waiting
+   on timers), the idle loop previously blocked on <-ds.wakeup indefinitely.
+   The virtual clock never advanced, timers never fired, and the system
+   deadlocked. Fix: add time.After(10ms) branch that calls AdvanceQuantum()
+   to advance the virtual clock and wake sleeping goroutines.
+
+Also includes nil-guard fixes in taskYielded() and dstYield() for tasks
+that are not registered with the DST scheduler, plus minor code cleanup
+and import fixes (syscall instead of linuxerr, local clock constants).
+---
+diff --git a/pkg/sentry/kernel/BUILD b/pkg/sentry/kernel/BUILD
+index 008e7eb3c..6e29c5dae 100644
+--- a/pkg/sentry/kernel/BUILD
++++ b/pkg/sentry/kernel/BUILD
+@@ -239,6 +239,12 @@ proto_library(
+ go_library(
+     name = "kernel",
+     srcs = [
++        "dst_snapshot.go",
++        "dst_scheduler.go",
++        "dst_rng.go",
++        "dst_init.go",
++        "dst_fault.go",
++        "dst_coverage.go",
+         "aio.go",
+         "atomicptr_bucket_slice_unsafe.go",
+         "atomicptr_bucket_unsafe.go",
+@@ -417,6 +423,12 @@ go_test(
+     name = "kernel_test",
+     size = "small",
+     srcs = [
++        "dst_snapshot.go",
++        "dst_scheduler.go",
++        "dst_rng.go",
++        "dst_init.go",
++        "dst_fault.go",
++        "dst_coverage.go",
+         "fd_table_test.go",
+         "table_test.go",
+         "task_test.go",
+diff --git a/pkg/sentry/kernel/dst_coverage.go b/pkg/sentry/kernel/dst_coverage.go
+index d2fbd2bc0..437201fe6 100644
+--- a/pkg/sentry/kernel/dst_coverage.go
++++ b/pkg/sentry/kernel/dst_coverage.go
+@@ -27,33 +27,16 @@ const (
+ // CoverageBitmap provides shared-memory code coverage collection using
+ // an AFL-style edge coverage bitmap. The bitmap is backed by a memfd
+ // so the host process can read it directly via mmap without any IPC.
+-//
+-// Edge coverage tracks transitions between basic blocks (PC pairs),
+-// not just which blocks were visited. This provides better sensitivity
+-// for the explorer's coverage-guided state space search.
+ type CoverageBitmap struct {
+ 	mu sync.Mutex
+-
+-	// fd is the memfd file descriptor.
+ 	fd int
+-
+-	// bitmap is the mmap'd coverage bitmap.
+ 	bitmap []byte
+-
+-	// size is the bitmap size in bytes.
+ 	size int
+-
+-	// prevPC tracks the previous PC for edge coverage.
+-	// Edge hash = current_PC XOR (prevPC >> 1).
+ 	prevPC uint64
+-
+-	// totalEdges is the number of unique edges recorded since last reset.
+ 	totalEdges int
+ }
+ 
+ // NewCoverageBitmap creates a new coverage bitmap backed by a memfd.
+-// The memfd is created with MFD_CLOEXEC cleared so it can be passed
+-// to the host via /proc/self/fd/N.
+ func NewCoverageBitmap(size int) (*CoverageBitmap, error) {
+ 	if size <= 0 {
+ 		size = DefaultCoverageBitmapSize
+@@ -69,10 +52,7 @@ func NewCoverageBitmap(size int) (*CoverageBitmap, error) {
+ 		return nil, fmt.Errorf("ftruncate coverage memfd to %d: %w", size, err)
+ 	}
+ 
+-	bitmap, err := unix.Mmap(fd, 0, size,
+-		unix.PROT_READ|unix.PROT_WRITE,
+-		unix.MAP_SHARED,
+-	)
++	bitmap, err := unix.Mmap(fd, 0, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+ 	if err != nil {
+ 		unix.Close(fd)
+ 		return nil, fmt.Errorf("mmap coverage memfd: %w", err)
+@@ -85,14 +65,10 @@ func NewCoverageBitmap(size int) (*CoverageBitmap, error) {
+ 	}, nil
+ }
+ 
+-// RecordEdge records a control flow edge from the previous PC to the
+-// current PC. Uses AFL-style hashing: hash = (pc ^ (prevPC >> 1)).
+-//
+-// This is called from the syscall dispatch path (task_syscall.go) after
+-// each syscall handler returns. The PC is typically obtained from
+-// runtime.Callers or from the task's register state.
++// RecordEdge records a control flow edge from the previous PC to pc.
+ func (cb *CoverageBitmap) RecordEdge(pc uint64) {
+ 	cb.mu.Lock()
++	defer cb.mu.Unlock()
+ 
+ 	hash := (pc ^ (cb.prevPC >> 1)) % uint64(cb.size*8)
+ 	byteIdx := hash / 8
+@@ -105,12 +81,9 @@ func (cb *CoverageBitmap) RecordEdge(pc uint64) {
+ 	}
+ 
+ 	cb.prevPC = pc
+-
+-	cb.mu.Unlock()
+ }
+ 
+ // FD returns the memfd file descriptor for sharing with the host.
+-// The host can mmap this fd to read coverage data directly.
+ func (cb *CoverageBitmap) FD() int {
+ 	return cb.fd
+ }
+@@ -120,8 +93,7 @@ func (cb *CoverageBitmap) Size() int {
+ 	return cb.size
+ }
+ 
+-// Count returns the number of unique edges seen since last reset.
+-// This scans the bitmap, which is O(size) but accurate.
++// Count returns the number of set bits in the bitmap.
+ func (cb *CoverageBitmap) Count() int {
+ 	cb.mu.Lock()
+ 	defer cb.mu.Unlock()
+@@ -133,8 +105,7 @@ func (cb *CoverageBitmap) Count() int {
+ 	return count
+ }
+ 
+-// Reset clears the bitmap and resets the edge counter.
+-// Called between exploration episodes.
++// Reset clears bitmap state for a new exploration episode.
+ func (cb *CoverageBitmap) Reset() {
+ 	cb.mu.Lock()
+ 	defer cb.mu.Unlock()
+@@ -146,5 +117,18 @@ func (cb *CoverageBitmap) Reset() {
+ 	cb.totalEdges = 0
+ }
+ 
+-// Close unmaps the bitmap and closes the memfd.
++// Close unmaps and closes the backing memfd.
+ func (cb *CoverageBitmap) Close() error {
++	cb.mu.Lock()
++	defer cb.mu.Unlock()
++
++	if cb.bitmap != nil {
++		unix.Munmap(cb.bitmap)
++		cb.bitmap = nil
++	}
++	if cb.fd >= 0 {
++		unix.Close(cb.fd)
++		cb.fd = -1
++	}
++	return nil
++}
+diff --git a/pkg/sentry/kernel/dst_scheduler.go b/pkg/sentry/kernel/dst_scheduler.go
+index 3a1bb7d66..77ff92304 100644
+--- a/pkg/sentry/kernel/dst_scheduler.go
++++ b/pkg/sentry/kernel/dst_scheduler.go
+@@ -17,6 +17,7 @@ package kernel
+ import (
+ 	"container/heap"
+ 	"sync"
++	"time"
+ 
+ 	sentryTime "gvisor.dev/gvisor/pkg/sentry/time"
+ )
+@@ -90,7 +91,16 @@ func (ds *DeterministicScheduler) Schedule() {
+ 		ds.mu.Lock()
+ 		for (ds.runnable.Len() == 0 || ds.paused) && !ds.stopped {
+ 			ds.mu.Unlock()
+-			<-ds.wakeup
++			// When idle, advance the virtual clock periodically so that
++			// sleeping tasks can wake up via timer callbacks. AdvanceQuantum
++			// is a no-op when the clock is frozen (during checkpoint).
++			select {
++			case <-ds.wakeup:
++				// A task became runnable or state changed.
++			case <-time.After(10 * time.Millisecond):
++				// Advance virtual clock to fire pending sleep timers.
++				ds.clock.AdvanceQuantum()
++			}
+ 			ds.mu.Lock()
+ 		}
+ 
+@@ -172,8 +182,10 @@ func (ds *DeterministicScheduler) TaskCount() int {
+ // taskYielded is called by Task.yield() to notify the scheduler that
+ // the task has reached a yield point and is returning control.
+ func (ds *DeterministicScheduler) taskYielded(t *Task) {
+-	// Signal the scheduler that this task has yielded.
+-	t.deterministicYield <- struct{}{}
++	// Guard: skip if channel not initialized (task not DST-registered).
++	if t.deterministicYield != nil {
++		t.deterministicYield <- struct{}{}
++	}
+ }
+ 
+ // notify sends a non-blocking signal to the wakeup channel.
+diff --git a/pkg/sentry/kernel/task_run.go b/pkg/sentry/kernel/task_run.go
+index 00be3b14a..1fe12a4a5 100644
+--- a/pkg/sentry/kernel/task_run.go
++++ b/pkg/sentry/kernel/task_run.go
+@@ -406,7 +406,9 @@ func (t *Task) Yield() {
+ // goroutine blocks on deterministicResume until the scheduler picks
+ // it again based on TID ordering.
+ func (t *Task) dstYield() {
+-	if t.k.DeterministicScheduler() != nil {
++	if t.k.DeterministicScheduler() != nil &&
++		t.deterministicResume != nil &&
++		t.deterministicYield != nil {
+ 		t.k.DeterministicScheduler().taskYielded(t)
+ 		<-t.deterministicResume
+ 	}
+diff --git a/pkg/sentry/platform/BUILD b/pkg/sentry/platform/BUILD
+index 7871a2ade..3da3d0d59 100644
+--- a/pkg/sentry/platform/BUILD
++++ b/pkg/sentry/platform/BUILD
+@@ -8,6 +8,7 @@ package(
+ go_library(
+     name = "platform",
+     srcs = [
++        "dst_counter.go",
+         "context.go",
+         "cpuid_amd64.go",
+         "cpuid_arm64.go",
+diff --git a/pkg/sentry/time/BUILD b/pkg/sentry/time/BUILD
+index 4b147b829..e2db3b694 100644
+--- a/pkg/sentry/time/BUILD
++++ b/pkg/sentry/time/BUILD
+@@ -20,6 +20,7 @@ go_template_instance(
+ go_library(
+     name = "time",
+     srcs = [
++        "virtual_clock.go",
+         "arith_arm64.go",
+         "calibrated_clock.go",
+         "clock_id.go",
+@@ -52,6 +53,7 @@ go_library(
+ go_test(
+     name = "time_test",
+     srcs = [
++        "virtual_clock.go",
+         "calibrated_clock_test.go",
+         "parameters_test.go",
+         "sampler_test.go",
+diff --git a/pkg/sentry/time/virtual_clock.go b/pkg/sentry/time/virtual_clock.go
+index facc98a83..386dab529 100644
+--- a/pkg/sentry/time/virtual_clock.go
++++ b/pkg/sentry/time/virtual_clock.go
+@@ -16,10 +16,16 @@ package time
+ 
+ import (
+ 	"sync"
++	"syscall"
+ 	"time"
++)
+ 
+-	"gvisor.dev/gvisor/pkg/abi/linux"
+-	"gvisor.dev/gvisor/pkg/errors/linuxerr"
++const (
++	clockRealtime       int32 = 0
++	clockMonotonic      int32 = 1
++	clockMonotonicRaw   int32 = 4
++	clockMonotonicCoarse int32 = 6
++	clockBoottime       int32 = 7
+ )
+ 
+ // VirtualClock provides deterministic time for the Sentry in DST mode.
+@@ -81,7 +87,7 @@ func (vc *VirtualClock) GetTime(id ClockID) (int64, error) {
+ 	case Monotonic:
+ 		return vc.monotonicNS, nil
+ 	default:
+-		return 0, linuxerr.EINVAL
++		return 0, syscall.EINVAL
+ 	}
+ }
+ 
+@@ -91,13 +97,12 @@ func (vc *VirtualClock) GetTimeByLinuxID(clockID int32) (int64, error) {
+ 	defer vc.mu.Unlock()
+ 
+ 	switch clockID {
+-	case linux.CLOCK_REALTIME:
++	case clockRealtime:
+ 		return vc.epoch.UnixNano() + vc.monotonicNS, nil
+-	case linux.CLOCK_MONOTONIC, linux.CLOCK_MONOTONIC_RAW,
+-		linux.CLOCK_MONOTONIC_COARSE, linux.CLOCK_BOOTTIME:
++	case clockMonotonic, clockMonotonicRaw, clockMonotonicCoarse, clockBoottime:
+ 		return vc.monotonicNS, nil
+ 	default:
+-		return 0, linuxerr.EINVAL
++		return 0, syscall.EINVAL
+ 	}
+ }
+ 
+diff --git a/runsc/boot/BUILD b/runsc/boot/BUILD
+index 0e36cf7c6..03f806d98 100644
+--- a/runsc/boot/BUILD
++++ b/runsc/boot/BUILD
+@@ -8,6 +8,7 @@ package(
+ go_library(
+     name = "boot",
+     srcs = [
++        "dst_api.go",
+         "autosave.go",
+         "compat.go",
+         "compat_amd64.go",
+@@ -33,6 +34,7 @@ go_library(
+         "//test:__subpackages__",
+     ],
+     deps = [
++        "//runsc/dst",
+         "//pkg/abi",
+         "//pkg/abi/linux",
+         "//pkg/abi/nvgpu",
+@@ -152,6 +154,7 @@ go_test(
+     name = "boot_test",
+     size = "small",
+     srcs = [
++        "dst_api.go",
+         "compat_test.go",
+         "gofer_conf_test.go",
+         "loader_test.go",
+@@ -160,6 +163,7 @@ go_test(
+     ],
+     library = ":boot",
+     deps = [
++        "//runsc/dst",
+         "//pkg/abi/linux",
+         "//pkg/control/server",
+         "//pkg/cpuid",
+diff --git a/runsc/boot/filter/config/config_main.go b/runsc/boot/filter/config/config_main.go
+index aa9a04aed..c2f28e76a 100644
+--- a/runsc/boot/filter/config/config_main.go
++++ b/runsc/boot/filter/config/config_main.go
+@@ -23,6 +23,8 @@ import (
+ 
+ // allowedSyscalls is the set of syscalls executed by the Sentry to the host OS.
+ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
++	unix.SYS_ACCEPT4:        seccomp.MatchAll{},
++	unix.SYS_GETSOCKNAME:    seccomp.MatchAll{},
+ 	unix.SYS_CLOCK_GETTIME: seccomp.MatchAll{},
+ 	unix.SYS_CLOSE:         seccomp.MatchAll{},
+ 	unix.SYS_DUP:           seccomp.MatchAll{},
+diff --git a/runsc/cmd/run.go b/runsc/cmd/run.go
+index 42069d68e..5fe54d025 100644
+--- a/runsc/cmd/run.go
++++ b/runsc/cmd/run.go
+@@ -47,6 +47,9 @@ type Run struct {
+ 
+ 	// spec is the cached OCI spec from FetchSpec().
+ 	spec *specs.Spec
++
++	// openthesisControl is an OpenThesis control socket path override.
++	openthesisControl string
+ }
+ 
+ // Name implements subcommands.Command.Name.
+@@ -69,6 +72,7 @@ func (r *Run) SetFlags(f *flag.FlagSet) {
+ 	f.BoolVar(&r.detach, "detach", false, "detach from the container's process")
+ 	f.Var(&r.passFDs, "pass-fd", "file descriptor passed to the container in M:N format, where M is the host and N is the guest descriptor (can be supplied multiple times)")
+ 	f.IntVar(&r.execFD, "exec-fd", -1, "host file descriptor used for program execution")
++	f.StringVar(&r.openthesisControl, "openthesis-control", "", "OpenThesis control socket path override")
+ 	r.Create.SetFlags(f)
+ }
+ 
+@@ -104,6 +108,9 @@ func (r *Run) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomman
+ 	}
+ 
+ 	conf := args[0].(*config.Config)
++	if r.openthesisControl != "" {
++		conf.DSTControlPath = r.openthesisControl
++	}
+ 	waitStatus := args[1].(*unix.WaitStatus)
+ 
+ 	if conf.Rootless {
+diff --git a/runsc/config/flags.go b/runsc/config/flags.go
+index 3dfedc3cd..c939a70c4 100644
+--- a/runsc/config/flags.go
++++ b/runsc/config/flags.go
+@@ -113,6 +113,10 @@ func RegisterFlags(flagSet *flag.FlagSet) {
+ 	flagSet.Bool("allow-suid", false, "allows ID elevation when executing binaries with the SUID/SGID bits set. The OCI --no-new-privileges flag continues to prevent ID elevation even when this flag is true.")
+ 	flagSet.Bool("kvm-use-cpu-nums", false, "on KVM use vCPU numbers as CPU numbers in the sentry. This is necessary to support features like rseq.")
+ 	flagSet.Bool("allow-rootfs-tar-annotation", false, "allows the rootfs tar annotation to be set.")
++	flagSet.Bool("openthesis-dst", false, "enable OpenThesis deterministic simulation mode.")
++	flagSet.Int64("openthesis-dst-epoch", 0, "OpenThesis virtual clock epoch in nanoseconds since Unix epoch.")
++	flagSet.Int64("openthesis-dst-quantum-ns", 0, "OpenThesis virtual scheduler quantum in nanoseconds.")
++	flagSet.String("openthesis-control", "", "Unix socket path for OpenThesis control API.")
+ 
+ 	// Flags that control sandbox runtime behavior: MM related.
+ 	flagSet.Bool("app-huge-pages", true, "enable use of huge pages for application memory; requires /sys/kernel/mm/transparent_hugepage/shmem_enabled = advise")
+diff --git a/runsc/dst/ctrl.go b/runsc/dst/ctrl.go
+index 145cea25d..815a8a391 100644
+--- a/runsc/dst/ctrl.go
++++ b/runsc/dst/ctrl.go
+@@ -22,6 +22,7 @@ import (
+ 	"fmt"
+ 	"net"
+ 	"os"
++	"path/filepath"
+ 
+ 	"gvisor.dev/gvisor/pkg/log"
+ 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+@@ -73,6 +74,10 @@ func NewControlServer(path string, k *kernel.Kernel) (*ControlServer, error) {
+ 	// Remove stale socket file.
+ 	os.Remove(path)
+ 
++	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
++		return nil, fmt.Errorf("dst ctrl: mkdir %s: %w", filepath.Dir(path), err)
++	}
++
+ 	listener, err := net.Listen("unix", path)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("dst ctrl: listen %s: %w", path, err)
+diff --git a/runsc/fsgofer/filter/config.go b/runsc/fsgofer/filter/config.go
+index 98d64e3fa..8c56557eb 100644
+--- a/runsc/fsgofer/filter/config.go
++++ b/runsc/fsgofer/filter/config.go
+@@ -25,6 +25,7 @@ import (
+ // allowedSyscalls is the set of syscalls executed by the gofer.
+ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+ 	unix.SYS_ACCEPT:        seccomp.MatchAll{},
++	unix.SYS_ACCEPT4:        seccomp.MatchAll{},
+ 	unix.SYS_CLOCK_GETTIME: seccomp.MatchAll{},
+ 	unix.SYS_CLOSE:         seccomp.MatchAll{},
+ 	unix.SYS_DUP:           seccomp.MatchAll{},
+diff --git a/runsc/dst/BUILD b/runsc/dst/BUILD
+new file mode 100644
+index 000000000..a1b2c3d4e
+--- /dev/null
++++ b/runsc/dst/BUILD
+@@ -0,1 +1,13 @@
++load("//tools:defs.bzl", "go_library")
++
++go_library(
++    name = "dst",
++    srcs = ["ctrl.go"],
++    visibility = ["//runsc:__subpackages__"],
++    deps = [
++        "//pkg/log",
++        "//pkg/sentry/kernel",
++        "//pkg/sentry/time",
++    ],
++)

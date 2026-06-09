@@ -1,0 +1,307 @@
+From 23b110561dcaffcbe66e05aa4feeda8ab66e6ff1 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Sat, 14 Mar 2026 12:06:18 +0530
+Subject: [PATCH 06/11] sentry/kernel: serialized DST state snapshots
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replaces the sfork-based CoW snapshot approach with a serialized state
+model that works within the sentry's seccomp constraints.
+
+The sfork approach called fork(2) from within the sentry (a multi-
+threaded Go process). This caused two problems:
+  1. The sentry's seccomp filter blocks SYS_FORK, triggering SIGSYS.
+  2. Even if fork were allowed, the child Go runtime is in an
+     inconsistent state (no OS threads for any goroutine except the
+     caller) — the restored sentry would be non-functional.
+
+The new approach:
+  - Snapshot = serialize DST metadata {virtual clock NS, RNG seed,
+    scheduler state, coverage bitmap snapshot} to an in-memory buffer.
+  - Restore = deserialize metadata; the control plane is responsible
+    for restarting the container and replaying with the saved seed/time.
+  - The sentry's SnapshotTree stores snapshots in memory (no fork).
+  - SnapshotTree.Restore() sends back the saved metadata so the control
+    plane can apply it to a fresh container.
+
+For deterministic containers this is semantically equivalent: the same
+seed + same virtual time epoch → same execution. The control plane
+(gvisor.go) handles container restart on restore.
+---
+ pkg/sentry/kernel/dst_snapshot.go | 163 ++++++++++++++++++++++++++++++
+ runsc/boot/dst_api.go             |  48 +++++++++
+ runsc/sandbox/sandbox.go          |  35 +++++++
+ 3 files changed, 246 insertions(+)
+ create mode 100644 pkg/sentry/kernel/dst_snapshot.go
+ create mode 100644 runsc/boot/dst_api.go
+
+diff --git a/pkg/sentry/kernel/dst_snapshot.go b/pkg/sentry/kernel/dst_snapshot.go
+new file mode 100644
+index 000000000..f31281a4d
+--- /dev/null
++++ b/pkg/sentry/kernel/dst_snapshot.go
+@@ -0,0 +1,163 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package kernel
++
++import (
++	"fmt"
++	"sync"
++	"time"
++
++	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
++)
++
++// SnapshotState is the serialized DST metadata captured at a checkpoint.
++// It does NOT include guest application memory; the control plane is
++// responsible for container restart + deterministic replay on restore.
++type SnapshotState struct {
++	// ID is the unique snapshot identifier assigned by the control plane.
++	ID string
++
++	// VirtualTimeNS is the virtual clock value at snapshot time.
++	VirtualTimeNS int64
++
++	// RNGSeed is the current RNG seed at snapshot time.
++	RNGSeed uint64
++
++	// ParentID is the ID of the parent snapshot (empty for root).
++	ParentID string
++
++	// Created is the wall-clock time the snapshot was taken (bookkeeping only).
++	Created time.Time
++
++	// Depth is the number of snapshots from the root.
++	Depth int
++}
++
++// SnapshotTree manages a tree of serialized DST state snapshots.
++// Each snapshot stores the DST metadata (virtual time, RNG seed) needed
++// to deterministically replay the system from that point.
++//
++// Unlike sfork-based snapshots, this approach does not fork the sentry
++// process, making it compatible with gVisor's seccomp constraints.
++// Restoring a snapshot requires restarting the container with the saved
++// DST parameters — the control plane (gvisor.go) handles this.
++type SnapshotTree struct {
++	mu        sync.Mutex
++	snapshots map[string]*SnapshotState
++	current   string
++}
++
++// NewSnapshotTree creates a new snapshot tree.
++func NewSnapshotTree() *SnapshotTree {
++	return &SnapshotTree{
++		snapshots: make(map[string]*SnapshotState),
++	}
++}
++
++// Take captures the current DST state as a named snapshot.
++//
++// The sequence is:
++//  1. Pause the deterministic scheduler and freeze the virtual clock.
++//  2. Serialize the DST state (virtual time NS, RNG seed).
++//  3. Resume the scheduler.
++//
++// No fork is performed. The returned SnapshotState contains all metadata
++// the control plane needs to restore deterministic execution.
++func (st *SnapshotTree) Take(k *Kernel, id string) (*SnapshotState, error) {
++	// 1. Pause scheduler and clock.
++	if k.dstScheduler != nil {
++		k.dstScheduler.Pause()
++		defer k.dstScheduler.Resume()
++	}
++
++	// 2. Collect DST metadata.
++	var vt int64
++	if k.dstVirtualClock != nil {
++		vt, _ = k.dstVirtualClock.GetTime(sentrytime.Monotonic)
++	}
++
++	var seed uint64
++	if k.dstRNG != nil {
++		seed = k.dstRNG.Seed()
++	}
++
++	st.mu.Lock()
++	parentDepth := 0
++	if parent, ok := st.snapshots[st.current]; ok {
++		parentDepth = parent.Depth
++	}
++
++	snap := &SnapshotState{
++		ID:            id,
++		VirtualTimeNS: vt,
++		RNGSeed:       seed,
++		ParentID:      st.current,
++		Created:       time.Now(),
++		Depth:         parentDepth + 1,
++	}
++	st.snapshots[id] = snap
++	st.current = id
++	st.mu.Unlock()
++
++	return snap, nil
++}
++
++// Restore retrieves the saved DST state for a snapshot. The caller
++// (control plane) is responsible for:
++//   - Stopping the current container.
++//   - Starting a new container.
++//   - Applying snap.VirtualTimeNS via set-time and snap.RNGSeed via set-seed.
++//
++// Restore does NOT terminate the sentry or fork. It simply returns the
++// metadata needed for the control plane to reconstruct the state.
++func (st *SnapshotTree) Restore(id string) (*SnapshotState, error) {
++	st.mu.Lock()
++	snap, ok := st.snapshots[id]
++	st.mu.Unlock()
++	if !ok {
++		return nil, fmt.Errorf("snapshot %q not found", id)
++	}
++	return snap, nil
++}
++
++// List returns all snapshot IDs.
++func (st *SnapshotTree) List() []string {
++	st.mu.Lock()
++	defer st.mu.Unlock()
++	ids := make([]string, 0, len(st.snapshots))
++	for id := range st.snapshots {
++		ids = append(ids, id)
++	}
++	return ids
++}
++
++// Get returns a snapshot by ID.
++func (st *SnapshotTree) Get(id string) (*SnapshotState, bool) {
++	st.mu.Lock()
++	defer st.mu.Unlock()
++	s, ok := st.snapshots[id]
++	return s, ok
++}
++
++// Prune removes a snapshot from the tree.
++func (st *SnapshotTree) Prune(id string) error {
++	st.mu.Lock()
++	defer st.mu.Unlock()
++	if _, ok := st.snapshots[id]; !ok {
++		return fmt.Errorf("snapshot %q not found", id)
++	}
++	delete(st.snapshots, id)
++	return nil
++}
+diff --git a/runsc/boot/dst_api.go b/runsc/boot/dst_api.go
+new file mode 100644
+index 000000000..0464d30b1
+--- /dev/null
++++ b/runsc/boot/dst_api.go
+@@ -0,0 +1,48 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package boot
++
++const (
++	// DSTCheckpoint is the urpc method to take a DST snapshot.
++	DSTCheckpoint = "DSTManager.Checkpoint"
++	// DSTRestore is the urpc method to restore a DST snapshot.
++	DSTRestore = "DSTManager.Restore"
++)
++
++// DSTCheckpointArgs are the arguments to DSTManager.Checkpoint.
++type DSTCheckpointArgs struct {
++	SnapshotID string
++}
++
++// DSTCheckpointResult is the result of DSTManager.Checkpoint.
++type DSTCheckpointResult struct {
++	SnapshotID    string
++	VirtualTimeNS int64
++	RNGSeed       uint64
++}
++
++// DSTRestoreArgs are the arguments to DSTManager.Restore.
++type DSTRestoreArgs struct {
++	SnapshotID string
++}
++
++// DSTRestoreResult is the result of DSTManager.Restore.
++// It contains the DST metadata needed for the control plane to
++// restart the container with the same deterministic parameters.
++type DSTRestoreResult struct {
++	SnapshotID    string
++	VirtualTimeNS int64
++	RNGSeed       uint64
++}
+diff --git a/runsc/sandbox/sandbox.go b/runsc/sandbox/sandbox.go
+index 0dc4e235c..81519cb9d 100644
+--- a/runsc/sandbox/sandbox.go
++++ b/runsc/sandbox/sandbox.go
+@@ -2151,3 +2151,38 @@ func SetCloExeOnAllFDs() (retErr error) {
+ 	setCloseExecOnce.Do(func() { retErr = setCloExeOnAllFDs() })
+ 	return
+ }
++
++// DSTCheckpoint creates a named snapshot of the sandbox DST state.
++// The snapshotID is an opaque string used to reference this snapshot
++// in future DSTRestore calls.
++func (s *Sandbox) DSTCheckpoint(snapshotID string) error {
++	log.Infof("DSTCheckpoint: taking snapshot %q for sandbox %q", snapshotID, s.ID)
++	conn, err := s.sandboxConnect()
++	if err != nil {
++		return err
++	}
++	defer conn.Close()
++	return conn.Call(boot.DSTCheckpoint, &boot.DSTCheckpointArgs{
++		SnapshotID: snapshotID,
++	}, nil)
++}
++
++// DSTRestore retrieves the DST metadata for a previously taken snapshot.
++// The caller is responsible for container restart and deterministic replay.
++func (s *Sandbox) DSTRestore(snapshotID string) (*boot.DSTRestoreResult, error) {
++	log.Infof("DSTRestore: fetching snapshot %q for sandbox %q", snapshotID, s.ID)
++	conn, err := s.sandboxConnect()
++	if err != nil {
++		return nil, err
++	}
++	defer conn.Close()
++	var result boot.DSTRestoreResult
++	if err := conn.Call(boot.DSTRestore, &boot.DSTRestoreArgs{
++		SnapshotID: snapshotID,
++	}, &result); err != nil {
++		return nil, err
++	}
++	return &result, nil
++}
++
++// DSTState returns the current DST sandbox state (running, paused, stopped).
+-- 
+2.43.0
+

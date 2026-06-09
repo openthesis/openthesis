@@ -1,0 +1,30 @@
+--- /tmp/kvm.h.orig	2026-04-25 13:56:33.454152655 +0000
++++ /usr/src/linux-source-6.8.0/include/uapi/linux/kvm.h	2026-04-25 13:56:33.481152788 +0000
+@@ -210,6 +210,7 @@
+ #define KVM_EXIT_NOTIFY           37
+ #define KVM_EXIT_LOONGARCH_IOCSR  38
+ #define KVM_EXIT_MEMORY_FAULT     39
++#define KVM_EXIT_X86_RDTSC        40
+ 
+ /* For KVM_EXIT_INTERNAL_ERROR */
+ /* Emulate instruction failed. */
+@@ -470,6 +471,10 @@
+ 			__u64 gpa;
+ 			__u64 size;
+ 		} memory_fault;
++		/* KVM_EXIT_X86_RDTSC */
++		struct {
++			__u64 tsc_value;
++		} rdtsc;
+ 		/* Fix the size of the union. */
+ 		char padding[256];
+ 	};
+@@ -1156,6 +1161,8 @@
+ #define KVM_CAP_GUEST_MEMFD 234
+ #define KVM_CAP_VM_TYPES 235
+ 
++#define KVM_CAP_RDTSC_EXITING			236
++
+ #ifdef KVM_CAP_IRQ_ROUTING
+ 
+ struct kvm_irq_routing_irqchip {

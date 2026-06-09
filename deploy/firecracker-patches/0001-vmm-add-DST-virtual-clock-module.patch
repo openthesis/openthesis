@@ -1,0 +1,142 @@
+From 2501faaf696a458b8f18fb05d3d01ad17591e5ef Mon Sep 17 00:00:00 2001
+From: OpenThesis Build <openthesis@localhost>
+Date: Sun, 5 Apr 2026 03:08:49 +0000
+Subject: [PATCH 1/6]  vmm: add DST virtual clock module
+
+Patch 0001: dst-virtual-clock
+- Add dst/ module with VirtualClock (lock-free monotonic counter)
+- VirtualClock provides advance(), freeze/unfreeze, HLT counter
+- Add dst_clock and dst_seed fields to Vmm struct
+- Virtual epoch: 2024-01-01T00:00:00Z
+---
+ src/vmm/src/builder.rs   |  4 +++
+ src/vmm/src/dst/clock.rs | 58 ++++++++++++++++++++++++++++++++++++++++
+ src/vmm/src/dst/mod.rs   |  6 +++++
+ src/vmm/src/lib.rs       |  4 +++
+ 4 files changed, 72 insertions(+)
+ create mode 100644 src/vmm/src/dst/clock.rs
+ create mode 100644 src/vmm/src/dst/mod.rs
+
+diff --git a/src/vmm/src/builder.rs b/src/vmm/src/builder.rs
+index bb46bf79..603d1b5c 100644
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -320,6 +320,8 @@ pub fn build_microvm_for_boot(
+         vcpus_handles: Vec::new(),
+         vcpus_exit_evt,
+         device_manager,
++        dst_clock: None,
++        dst_seed: None,
+     };
+     let vmm = Arc::new(Mutex::new(vmm));
+ 
+@@ -522,6 +524,8 @@ pub fn build_microvm_from_snapshot(
+         vcpus_handles: Vec::new(),
+         vcpus_exit_evt,
+         device_manager,
++        dst_clock: None,
++        dst_seed: None,
+     };
+ 
+     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
+diff --git a/src/vmm/src/dst/clock.rs b/src/vmm/src/dst/clock.rs
+new file mode 100644
+index 00000000..245c8cee
+--- /dev/null
++++ b/src/vmm/src/dst/clock.rs
+@@ -0,0 +1,58 @@
++use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
++
++pub const VIRTUAL_EPOCH_NS: i64 = 1_704_067_200_000_000_000;
++
++#[derive(Debug)]
++pub struct VirtualClock {
++    monotonic_ns: AtomicI64,
++    wall_offset_ns: AtomicI64,
++    frozen: AtomicBool,
++    consecutive_hlt: AtomicU64,
++}
++
++impl VirtualClock {
++    pub fn new() -> Arc<Self> {
++        Arc::new(Self {
++            monotonic_ns: AtomicI64::new(0),
++            wall_offset_ns: AtomicI64::new(VIRTUAL_EPOCH_NS),
++            frozen: AtomicBool::new(false),
++            consecutive_hlt: AtomicU64::new(0),
++        })
++    }
++
++    #[inline]
++    pub fn advance(&self, instructions: u64) {
++        if self.frozen.load(Ordering::Relaxed) { return; }
++        let delta = instructions.min(i64::MAX as u64) as i64;
++        self.monotonic_ns.fetch_add(delta, Ordering::Relaxed);
++    }
++
++    #[inline]
++    pub fn record_hlt(&self) -> u64 {
++        self.consecutive_hlt.fetch_add(1, Ordering::Relaxed) + 1
++    }
++
++    #[inline]
++    pub fn reset_hlt(&self) {
++        self.consecutive_hlt.store(0, Ordering::Relaxed);
++    }
++
++    #[inline]
++    pub fn hlt_count(&self) -> u64 {
++        self.consecutive_hlt.load(Ordering::Relaxed)
++    }
++
++    pub fn advance_quantum(&self, quantum_ns: i64) {
++        if !self.frozen.load(Ordering::Relaxed) && quantum_ns > 0 {
++            self.monotonic_ns.fetch_add(quantum_ns, Ordering::Relaxed);
++        }
++    }
++
++    pub fn monotonic_ns(&self) -> i64 { self.monotonic_ns.load(Ordering::Relaxed) }
++    pub fn wall_ns(&self) -> i64 { self.wall_offset_ns.load(Ordering::Relaxed) + self.monotonic_ns() }
++
++    pub fn set_monotonic(&self, ns: i64) { self.monotonic_ns.store(ns, Ordering::Relaxed); }
++    pub fn freeze(&self) { self.frozen.store(true, Ordering::Relaxed); }
++    pub fn unfreeze(&self) { self.frozen.store(false, Ordering::Relaxed); }
++}
+diff --git a/src/vmm/src/dst/mod.rs b/src/vmm/src/dst/mod.rs
+new file mode 100644
+index 00000000..1cff85a0
+--- /dev/null
++++ b/src/vmm/src/dst/mod.rs
+@@ -0,0 +1,6 @@
++pub mod clock;
++pub mod pmc;
++pub mod prng;
++pub mod net;
++pub mod ctrl;
++pub mod rdtsc;
+diff --git a/src/vmm/src/lib.rs b/src/vmm/src/lib.rs
+index 2e389606..fc9499e0 100644
+--- a/src/vmm/src/lib.rs
++++ b/src/vmm/src/lib.rs
+@@ -108,6 +108,8 @@ pub mod snapshot;
+ pub mod test_utils;
+ /// Utility functions and struct
+ pub mod utils;
++
++pub mod dst;
+ /// Wrappers over structures used to configure the VMM.
+ pub mod vmm_config;
+ /// Module with virtual state structs.
+@@ -329,6 +331,8 @@ pub struct Vmm {
+     vcpus_exit_evt: EventFd,
+     // Device manager
+     device_manager: DeviceManager,
++    pub dst_clock: Option<Arc<crate::dst::clock::VirtualClock>>,
++    pub dst_seed: Option<u64>,
+ }
+ 
+ impl Vmm {
+-- 
+2.43.0
+

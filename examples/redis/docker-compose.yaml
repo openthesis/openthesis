@@ -1,0 +1,55 @@
+services:
+  redis1:
+    container_name: redis1
+    hostname: redis1
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+
+  redis2:
+    container_name: redis2
+    hostname: redis2
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+
+  redis3:
+    container_name: redis3
+    hostname: redis3
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+
+  redis4:
+    container_name: redis4
+    hostname: redis4
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+
+  redis5:
+    container_name: redis5
+    hostname: redis5
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+
+  redis6:
+    container_name: redis6
+    hostname: redis6
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+
+  tests:
+    container_name: tests
+    hostname: tests
+    image: openthesis-redis-tests:latest
+    environment:
+      OPENTHESIS_OUTPUT_DIR: /tmp/openthesis-output
+      OPENTHESIS_SDK_LOCAL_OUTPUT: /tmp/openthesis-output/sdk.jsonl
+      REDIS_NODES: redis1:6379,redis2:6379,redis3:6379,redis4:6379,redis5:6379,redis6:6379
+    depends_on:
+      - redis1
+      - redis2
+      - redis3
+      - redis4
+      - redis5
+      - redis6
+    volumes:
+      - ./tests:/opt/openthesis/test
+    command: sleep infinity

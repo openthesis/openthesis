@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Wed, 02 Apr 2026 00:00:00 +0530
+Subject: [PATCH 31/31] kvm: advance virtual time by 1ns on each RDTSC emulation
+
+Problem:
+Patch 0027 (CR4.TSD) intercepts every RDTSC/RDTSCP from ring 3 via #GP
+and returns virtual TSC = dstGetTimeNS() * tscFreqKHz / 1_000_000.
+
+However, dstGetTimeNS() returns the SAME value throughout a scheduling
+quantum — AdvanceQuantum() is only called at quantum boundaries (in the
+DeterministicScheduler loop), not on every instruction or every RDTSC.
+
+This means tight RDTSC spin-wait loops like:
+
+  uint64_t start = rdtsc();
+  while (rdtsc() - start < timeout_ticks) { /* spin */ }
+
+... run forever: every rdtsc() call returns the same virtual TSC value,
+so (rdtsc() - start) is always 0, and the loop never terminates.
+
+Real examples in Go applications:
+  - runtime.nanotime() on some platforms uses RDTSC (though gVisor apps
+    typically use clock_gettime; this covers edge cases)
+  - Some C extensions or CGo code with TSC-based timeouts
+  - etcd's raft uses time.After which is virtual-clock based (safe), but
+    third-party dependencies may use TSC directly
+
+Fix:
+Advance virtual time by 1 nanosecond on each RDTSC emulation in DST mode.
+
+Why 1ns:
+  - Small enough to be invisible for normal code: a function that reads
+    RDTSC once to timestamp an event sees a 1ns bump — negligible.
+  - Large enough to terminate spin-waits in finite virtual time: a 1ms
+    timeout requires 1,000,000 RDTSC calls to expire, which is bounded
+    by the number of instructions the #GP handler can execute per quantum.
+  - The virtual time advancement from RDTSC calls is deterministic given
+    the same seed and same code path: same number of RDTSC calls per run
+    → same total virtual time advance → same observable behavior.
+
+Implementation:
+Add dstAdvanceNS func(ns int64) to machine struct alongside dstGetTimeNS.
+In handleRDTSCFault(), call c.machine.dstAdvanceNS(1) after computing TSC.
+Wire dstAdvanceNS via an extended DSTClocker interface in loader.go.
+
+DSTClocker interface (pkg/sentry/platform/platform.go) gains:
+  SetDSTAdvanceNS(fn func(int64))
+
+KVM.SetDSTAdvanceNS wires machine.dstAdvanceNS.
+loader.go calls dc.SetDSTAdvanceNS(dstVC.AdvanceNS) after InitDST().
+---
+ pkg/sentry/platform/kvm/machine.go              |  5 +++
+ pkg/sentry/platform/kvm/machine_amd64_unsafe.go | 10 ++++-
+ pkg/sentry/platform/kvm/kvm.go                  |  8 ++++
+ pkg/sentry/platform/platform.go                 |  5 +++
+ runsc/boot/loader.go                            |  5 +++
+ 5 files changed, 33 insertions(+)
+
+diff --git a/pkg/sentry/platform/kvm/machine.go b/pkg/sentry/platform/kvm/machine.go
+index 0000000..0000001 100644
+--- a/pkg/sentry/platform/kvm/machine.go
++++ b/pkg/sentry/platform/kvm/machine.go
+@@ -142,7 +142,13 @@ type machine struct {
+ 	// dstGetTimeNS, if non-nil, returns the current virtual time in nanoseconds.
+ 	dstGetTimeNS func() int64
+
++	// dstAdvanceNS, if non-nil, advances the virtual clock by the given
++	// number of nanoseconds. Called once per RDTSC emulation in DST mode
++	// to prevent spin-wait loops on RDTSC from running forever (since the
++	// virtual clock otherwise only advances at quantum boundaries).
++	dstAdvanceNS func(ns int64)
++
+ 	// tscFreqKHz is the vCPU TSC frequency in kHz, cached during initArchState.
+ 	tscFreqKHz uint64
+ }
+
+diff --git a/pkg/sentry/platform/kvm/kvm.go b/pkg/sentry/platform/kvm/kvm.go
+index 0000000..0000001 100644
+--- a/pkg/sentry/platform/kvm/kvm.go
++++ b/pkg/sentry/platform/kvm/kvm.go
+@@ -1,4 +1,11 @@
+ package kvm
+
++// SetDSTAdvanceNS registers the virtual clock advancement function for DST mode.
++// Called from loader.go after InitDST() to wire VirtualClock.AdvanceNS into
++// the KVM platform so RDTSC emulation can advance virtual time by 1ns per call.
++func (k *KVM) SetDSTAdvanceNS(fn func(int64)) {
++	k.machine.dstAdvanceNS = fn
++}
++
+ // (existing file contents unchanged)
+
+diff --git a/pkg/sentry/platform/platform.go b/pkg/sentry/platform/platform.go
+index 0000000..0000001 100644
+--- a/pkg/sentry/platform/platform.go
++++ b/pkg/sentry/platform/platform.go
+@@ -1,9 +1,14 @@
+ package platform
+
+ // DSTClocker is an optional interface implemented by platforms that support
+ // DST virtual-time injection. The KVM platform implements this; the ptrace
+ // platform does not (no RDTSC interception).
+ type DSTClocker interface {
+ 	SetDSTGetTimeNS(fn func() int64)
++
++	// SetDSTAdvanceNS registers a function to advance the virtual clock by
++	// a given number of nanoseconds. Used by the RDTSC emulation handler
++	// to prevent spin-wait loops from running forever within a quantum.
++	SetDSTAdvanceNS(fn func(int64))
+ }
+
+diff --git a/pkg/sentry/platform/kvm/machine_amd64_unsafe.go b/pkg/sentry/platform/kvm/machine_amd64_unsafe.go
+index 0000000..0000001 100644
+--- a/pkg/sentry/platform/kvm/machine_amd64_unsafe.go
++++ b/pkg/sentry/platform/kvm/machine_amd64_unsafe.go
+@@ -82,13 +82,21 @@ func (c *vCPU) handleRDTSCFault() bool {
+ 		regs.Rax = tscTicks & 0xFFFFFFFF
+ 		regs.Rdx = tscTicks >> 32
+ 		regs.Rip += 2
++		// Advance virtual clock by 1ns so repeated RDTSC calls in a spin-wait
++		// loop see monotonically increasing TSC values and eventually terminate.
++		if c.machine.dstAdvanceNS != nil {
++			c.machine.dstAdvanceNS(1)
++		}
+ 		return true
+
+ 	case buf[0] == 0x0F && buf[1] == 0x01 && buf[2] == 0xF9: // RDTSCP
+ 		regs.Rax = tscTicks & 0xFFFFFFFF
+ 		regs.Rdx = tscTicks >> 32
+ 		regs.Rcx = 0
+ 		regs.Rip += 3
++		if c.machine.dstAdvanceNS != nil {
++			c.machine.dstAdvanceNS(1)
++		}
+ 		return true
+ 	}
+
+diff --git a/runsc/boot/loader.go b/runsc/boot/loader.go
+index 0000000..0000001 100644
+--- a/runsc/boot/loader.go
++++ b/runsc/boot/loader.go
+@@ -634,4 +634,9 @@ func (l *Loader) New(args Args) error {
+ 	if dc, ok := p.(platform.DSTClocker); ok {
+ 		dc.SetDSTGetTimeNS(dstVC.MonotonicNS)
++		// Wire the clock advance function so RDTSC emulation can advance
++		// virtual time by 1ns per call, preventing infinite spin-wait loops.
++		dc.SetDSTAdvanceNS(func(ns int64) {
++			dstVC.AdvanceNS(ns)
++		})
+ 	}

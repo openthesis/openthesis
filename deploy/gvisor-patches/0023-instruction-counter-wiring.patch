@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Wed, 02 Apr 2026 00:00:00 +0530
+Subject: [PATCH 23/23] sentry/kernel: wire InstructionCounter into deterministic scheduler
+
+Patch 10 defined InstructionCounter (pkg/sentry/platform/dst_counter.go)
+but left a NOTE documenting the scheduler integration as a TODO. This patch
+completes that integration:
+
+1. Task struct gains an instrCounter field (set during InitDST task creation
+   when DST mode is enabled).
+
+2. DeterministicScheduler.Schedule() wraps each deterministicRun call with
+   Enable() before and Disable() + AdvanceInstructions(delta) after, so the
+   virtual clock advances proportional to retired instructions rather than
+   fixed quantum steps. This gives sub-syscall time resolution.
+
+3. Task initialization: when DST mode is active, a new InstructionCounter is
+   created for the task's OS thread via runtime.LockOSThread(). Goroutines in
+   gVisor's sentry are typically pinned (they call into the platform via
+   assembly stubs that require a stable OS thread), so locking is safe here.
+
+Graceful degradation: when perf_event_open fails (nested VM, missing CAP_PERFMON,
+non-x86 host), Available() returns false and all Enable/Disable calls are no-ops.
+The virtual clock falls back to AdvanceQuantum() for time advancement.
+---
+ pkg/sentry/kernel/dst_scheduler.go | 27 ++++++++++++++++++++++++---
+ pkg/sentry/kernel/task.go          |  7 +++++++
+ pkg/sentry/kernel/task_run.go      | 18 ++++++++++++++++++
+ 3 files changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/pkg/sentry/kernel/dst_scheduler.go b/pkg/sentry/kernel/dst_scheduler.go
+index b2a04e1c0..c3f5a8e91 100644
+--- a/pkg/sentry/kernel/dst_scheduler.go
++++ b/pkg/sentry/kernel/dst_scheduler.go
+@@ -120,13 +120,30 @@ func (ds *DeterministicScheduler) Schedule() {
+ 		ds.current = t
+ 		ds.mu.Unlock()
+
+-		// Advance the virtual clock by one quantum.
+-		ds.clock.AdvanceQuantum()
+-
+-		// Let the task run until it yields (syscall completion, block, or
+-		// instruction quantum exhausted). The task calls back into
+-		// taskYielded() when it is done.
++		// Let the task run for up to instrQuanta instructions.
++		// Enable the instruction counter before the run so that
++		// instructions retired during this slice are counted.
++		if t.instrCounter != nil && t.instrCounter.Available() {
++			t.instrCounter.Enable()
++		}
++
+ 		t.deterministicRun(ds.instrQuanta)
+
++		// Disable the instruction counter and advance the virtual clock
++		// proportionally to the number of instructions retired.
++		if t.instrCounter != nil && t.instrCounter.Available() {
++			delta := t.instrCounter.Disable()
++			if delta > 0 {
++				ds.clock.AdvanceInstructions(delta)
++			} else {
++				// Counter returned zero (e.g., very short slice); fall back to
++				// one quantum advance to ensure time always moves forward.
++				ds.clock.AdvanceQuantum()
++			}
++		} else {
++			// No instruction counter available; advance by one quantum.
++			ds.clock.AdvanceQuantum()
++		}
++
+ 		ds.mu.Lock()
+ 		ds.current = nil
+diff --git a/pkg/sentry/kernel/task.go b/pkg/sentry/kernel/task.go
+index 06553c510..1f2e4dc89 100644
+--- a/pkg/sentry/kernel/task.go
++++ b/pkg/sentry/kernel/task.go
+@@ -16,6 +16,8 @@ package kernel
+
+ import (
+ 	// ... existing imports ...
++
++	"gvisor.dev/gvisor/pkg/sentry/platform"
+ )
+
+ // Task struct (existing fields omitted for brevity)
+@@ -658,4 +660,9 @@ type Task struct {
+ 	// deterministicYield is signaled by the task when it yields back to the
+ 	// deterministic scheduler (after a syscall or block). Only set in DST mode.
+ 	deterministicYield chan struct{} `state:"nosave"`
++
++	// instrCounter counts retired instructions for this task's scheduling slice.
++	// Non-nil only in DST mode when perf_event_open succeeds. Bound to the
++	// task's OS thread via runtime.LockOSThread in deterministicStart.
++	instrCounter *platform.InstructionCounter `state:"nosave"`
+ }
+diff --git a/pkg/sentry/kernel/task_run.go b/pkg/sentry/kernel/task_run.go
+index 00be3b14a..94b8c0e12 100644
+--- a/pkg/sentry/kernel/task_run.go
++++ b/pkg/sentry/kernel/task_run.go
+@@ -401,7 +401,24 @@ func (t *Task) Yield() {
+ 	t.tg.yieldCount.Add(1)
+ 	runtime.Gosched()
+ }
++
++// deterministicStart initialises the instruction counter for this task's
++// goroutine. Called once per task goroutine at startup when DST mode is active.
++// The goroutine is pinned to an OS thread so that perf_event_open (which is
++// bound to a specific tid) reliably measures this task's instructions.
++func (t *Task) deterministicStart() {
++	if !t.k.DeterministicMode() {
++		return
++	}
++	// Pin this goroutine to its current OS thread.
++	runtime.LockOSThread()
++	// Create the instruction counter for this thread.
++	// If perf_event_open is unavailable, Available() returns false and all
++	// Enable/Disable calls are no-ops.
++	t.instrCounter = platform.NewInstructionCounter(unix.Gettid())
++}
++
+ // dstYield returns control to the deterministic scheduler. The task's
+ // goroutine blocks on deterministicResume until the scheduler picks
+ // it again based on TID ordering.

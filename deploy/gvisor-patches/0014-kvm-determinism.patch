@@ -1,0 +1,221 @@
+diff --git a/pkg/sentry/platform/kvm/filters.go b/pkg/sentry/platform/kvm/filters.go
+index f57b62465..e20d2207a 100644
+--- a/pkg/sentry/platform/kvm/filters.go
++++ b/pkg/sentry/platform/kvm/filters.go
+@@ -28,9 +28,31 @@ func (k *KVM) SeccompInfo() platform.SeccompInfo {
+ 		PlatformName: "kvm",
+ 		Filters: k.archSyscallFilters().Merge(seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+ 			unix.SYS_IOCTL: seccomp.Or{
++				// Core KVM device ioctls (on /dev/kvm fd)
+ 				seccomp.PerArg{
+ 					seccomp.NonNegativeFD{},
+-					seccomp.EqualTo(KVM_RUN),
++					seccomp.EqualTo(KVM_CREATE_VM),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_GET_VCPU_MMAP_SIZE),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_CHECK_EXTENSION),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_GET_SUPPORTED_CPUID),
++				},
++				// VM-level ioctls (on VM fd)
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_CREATE_VCPU),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_TSS_ADDR),
+ 				},
+ 				seccomp.PerArg{
+ 					seccomp.NonNegativeFD{},
+@@ -40,6 +62,19 @@ func (k *KVM) SeccompInfo() platform.SeccompInfo {
+ 					seccomp.NonNegativeFD{},
+ 					seccomp.EqualTo(KVM_IOEVENTFD),
+ 				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_DEVICE_ATTR),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_ENABLE_CAP),
++				},
++				// vCPU ioctls
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_RUN),
++				},
+ 				seccomp.PerArg{
+ 					seccomp.NonNegativeFD{},
+ 					seccomp.EqualTo(KVM_GET_REGS),
+@@ -48,6 +83,46 @@ func (k *KVM) SeccompInfo() platform.SeccompInfo {
+ 					seccomp.NonNegativeFD{},
+ 					seccomp.EqualTo(KVM_SET_REGS),
+ 				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_GET_SREGS),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_SREGS),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_GET_MSRS),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_MSRS),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_CPUID2),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_SIGNAL_MASK),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_GET_VCPU_EVENTS),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_VCPU_EVENTS),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_GET_TSC_KHZ),
++				},
++				seccomp.PerArg{
++					seccomp.NonNegativeFD{},
++					seccomp.EqualTo(KVM_SET_TSC_KHZ),
++				},
+ 			},
+ 			unix.SYS_MEMBARRIER: seccomp.PerArg{
+ 				seccomp.EqualTo(linux.MEMBARRIER_CMD_PRIVATE_EXPEDITED),
+diff --git a/pkg/sentry/platform/kvm/kvm.go b/pkg/sentry/platform/kvm/kvm.go
+index d9cce0cd6..0ac9f8a39 100644
+--- a/pkg/sentry/platform/kvm/kvm.go
++++ b/pkg/sentry/platform/kvm/kvm.go
+@@ -242,3 +242,9 @@ func (*constructor) Requirements() platform.Requirements {
+ func init() {
+ 	platform.Register("kvm", &constructor{})
+ }
++
++// SetDSTGetTimeNS implements platform.DSTClocker. fn is called before each
++// vCPU quantum to synchronise the guest TSC with the virtual clock.
++func (k *KVM) SetDSTGetTimeNS(fn func() int64) {
++	k.machine.dstGetTimeNS = fn
++}
+diff --git a/pkg/sentry/platform/kvm/kvm_amd64.go b/pkg/sentry/platform/kvm/kvm_amd64.go
+index af921c4da..f54ceefe1 100644
+--- a/pkg/sentry/platform/kvm/kvm_amd64.go
++++ b/pkg/sentry/platform/kvm/kvm_amd64.go
+@@ -245,6 +245,10 @@ func updateGlobalOnce(fd int) error {
+ 	// any virtualization APIs, there is no need to enable this feature.
+ 	cpuid.X86FeatureVMX.Unset(s)
+ 	cpuid.X86FeatureSVM.Unset(s)
++	// Disable RDRAND and RDSEED to force the guest through software entropy
++	// paths (which are routed through gVisor's DST-seeded pkg/rand).
++	cpuid.X86FeatureRDRAND.Unset(s)
++	cpuid.X86FeatureRDSEED.Unset(s)
+ 	ring0.Init(cpuid.FeatureSet{
+ 		Function: s,
+ 	})
+diff --git a/pkg/sentry/platform/kvm/machine.go b/pkg/sentry/platform/kvm/machine.go
+index 3f2d77095..9489b8d1d 100644
+--- a/pkg/sentry/platform/kvm/machine.go
++++ b/pkg/sentry/platform/kvm/machine.go
+@@ -86,6 +86,13 @@ type machine struct {
+ 	// tscControl checks whether cpu supports TSC scaling
+ 	tscControl bool
+ 
++	// dstGetTimeNS, if non-nil, returns the current virtual time in nanoseconds.
++	// Set by SetDSTGetTimeNS when DST mode is active with the KVM platform.
++	dstGetTimeNS func() int64
++
++	// tscFreqKHz is the vCPU TSC frequency in kHz, cached during initArchState.
++	tscFreqKHz uint64
++
+ 	// usedSlots is the set of used physical addresses (not sorted).
+ 	usedSlots []uintptr
+ 
+diff --git a/pkg/sentry/platform/kvm/machine_amd64.go b/pkg/sentry/platform/kvm/machine_amd64.go
+index 830a543a4..4e5fde936 100644
+--- a/pkg/sentry/platform/kvm/machine_amd64.go
++++ b/pkg/sentry/platform/kvm/machine_amd64.go
+@@ -156,6 +156,11 @@ func (c *vCPU) initArchState() error {
+ 		return err
+ 	}
+ 
++	// Cache TSC frequency for DST virtual-time injection.
++	if freq, err := c.getTSCFreq(); err == nil && freq > 0 {
++		c.machine.tscFreqKHz = uint64(freq)
++	}
++
+ 	// Try to enable CPUID faulting. This is required to handle app CPUID
+ 	// correctly, since we always pass the CPUID returned by
+ 	// KVM_GET_SUPPORTED_CPUID to KVM_SET_CPUID2. Note that while hardware
+@@ -377,6 +382,11 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo)
+ 	// See below.
+ 	var vector ring0.Vector
+ 
++	// DST: Synchronise guest TSC with virtual clock before entering VM.
++	if fn := c.machine.dstGetTimeNS; fn != nil {
++		c.setTSCToVirtual(fn())
++	}
++
+ 	// Past this point, stack growth can cause system calls (and a break
+ 	// from guest mode). So we need to ensure that between the bluepill
+ 	// call here and the switch call immediately below, no additional
+diff --git a/pkg/sentry/platform/kvm/machine_amd64_unsafe.go b/pkg/sentry/platform/kvm/machine_amd64_unsafe.go
+index 32a79939a..47a50e93e 100644
+--- a/pkg/sentry/platform/kvm/machine_amd64_unsafe.go
++++ b/pkg/sentry/platform/kvm/machine_amd64_unsafe.go
+@@ -171,6 +171,21 @@ func (c *vCPU) setTSC(value uint64) error {
+ 	return nil
+ }
+ 
++// setTSCToVirtual sets the vCPU TSC so that guest RDTSC returns virtual time.
++// virtualNS is the current virtual monotonic time in nanoseconds.
++//
++//go:nosplit
++func (c *vCPU) setTSCToVirtual(virtualNS int64) {
++	freq := c.machine.tscFreqKHz
++	if freq == 0 || virtualNS <= 0 {
++		return
++	}
++	// TSC ticks = virtualNS_ns * freqKHz / 1_000_000
++	// because freqKHz * 1000 Hz/kHz * 1ns/1e9s = freqKHz/1e6 ticks/ns
++	virtualTSC := uint64(virtualNS) * freq / 1_000_000
++	_ = c.setTSC(virtualTSC)
++}
++
+ func (c *vCPU) enableCPUIDFaulting() error {
+ 	const (
+ 		_MSR_MISC_FEATURES_ENABLE              = 0x140
+diff --git a/pkg/sentry/platform/platform.go b/pkg/sentry/platform/platform.go
+index db5d4a00a..a1d64f7a9 100644
+--- a/pkg/sentry/platform/platform.go
++++ b/pkg/sentry/platform/platform.go
+@@ -640,4 +640,12 @@ func Lookup(name string) (Constructor, error) {
+ 	}
+ 	return p, nil
+ }
++
++// DSTClocker is optionally implemented by platforms that support DST virtual
++// time injection. When implemented, SetDSTGetTimeNS registers a callback used
++// to synchronise the guest's time source (e.g. TSC offset in KVM) with the
++// sentry's virtual clock before each vCPU quantum.
++type DSTClocker interface {
++	SetDSTGetTimeNS(fn func() int64)
++}

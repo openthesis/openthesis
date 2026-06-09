@@ -1,0 +1,8 @@
+0001-kvm-uapi-add-KVM_EXIT_X86_RDTSC-and-KVM_CAP_RDTSC_E.patch
+0002-kvm-x86-add-rdtsc_exiting-flag-to-kvm_arch.patch
+0003-kvm-x86-wire-KVM_CAP_RDTSC_EXITING-capability.patch
+0004-kvm-vmx-add-RDTSC-RDTSCP-userspace-exit-handler.patch
+0005-kvm-svm-add-RDTSC-RDTSCP-userspace-exit-handler.patch
+0006-kvm-uapi-add-KVM_CAP_HLT_USER_EXIT.patch
+0007-kvm-x86-add-hlt_user_exit-flag-to-kvm_arch.patch
+0008-kvm-x86-wire-KVM_CAP_HLT_USER_EXIT.patch

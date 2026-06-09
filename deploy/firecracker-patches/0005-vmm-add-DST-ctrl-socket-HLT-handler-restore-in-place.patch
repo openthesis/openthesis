@@ -1,0 +1,1181 @@
+From e3635d080f3fc7b828d36ca9a037a194612cee91 Mon Sep 17 00:00:00 2001
+From: OpenThesis Build <openthesis@localhost>
+Date: Sun, 5 Apr 2026 03:08:50 +0000
+Subject: [PATCH 5/6]  vmm: add DST ctrl socket, HLT handler, restore-in-place,
+ PMC reporting
+
+Patches 0007-0018 combined:
+- DST control socket (burst-start, set-time, advance-quantum, flush-dpq, etc.)
+- HLT handler with virtual clock advance + consecutive HLT counter
+- VcpuEvent::RestoreState for in-place CPU restore
+- Vmm::restore_in_place() with memory reset + CPU + device state
+- MmioTransport::restore_state_in_place() for queue index reset
+- PMC active flag reported in ping response
+- CLI args: --openthesis-dst-ctrl, --openthesis-dst-seed
+- RDTSC exiting stub (requires kernel patch)
+---
+ src/firecracker/src/main.rs                   |  18 ++
+ src/vmm/src/arch/x86_64/vcpu.rs               |   8 +-
+ src/vmm/src/arch/x86_64/vm.rs                 |  34 +++
+ src/vmm/src/builder.rs                        |  75 ++++++
+ src/vmm/src/device_manager/mmio.rs            |   6 +
+ src/vmm/src/devices/virtio/persist.rs         |  30 +--
+ src/vmm/src/devices/virtio/rng/device.rs      |   1 +
+ src/vmm/src/devices/virtio/transport/mmio.rs  |  32 +++
+ src/vmm/src/devices/virtio/vsock/device.rs    |   4 +
+ .../src/devices/virtio/vsock/unix/muxer.rs    |  14 +
+ src/vmm/src/dst/clock.rs                      |  68 +++++
+ src/vmm/src/dst/ctrl.rs                       | 251 ++++++++++++++++++
+ src/vmm/src/dst/pmc.rs                        |   3 +-
+ src/vmm/src/dst/rdtsc.rs                      |   7 +
+ src/vmm/src/lib.rs                            | 117 +++++++-
+ src/vmm/src/persist.rs                        |   2 +-
+ src/vmm/src/vstate/vcpu.rs                    | 119 ++++++++-
+ 17 files changed, 767 insertions(+), 22 deletions(-)
+ create mode 100644 src/vmm/src/dst/ctrl.rs
+ create mode 100644 src/vmm/src/dst/rdtsc.rs
+
+diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
+index 3883bf6e..c5080631 100644
+--- a/src/firecracker/src/main.rs
++++ b/src/firecracker/src/main.rs
+@@ -143,6 +143,16 @@ fn main_exec() -> Result<(), MainError> {
+ 
+     let mut arg_parser =
+         ArgParser::new()
++            .arg(
++                Argument::new("openthesis-dst-ctrl")
++                    .takes_value(true)
++                    .help("Unix socket path for DST control channel"),
++            )
++            .arg(
++                Argument::new("openthesis-dst-seed")
++                    .takes_value(true)
++                    .help("Seed for deterministic simulation"),
++            )
+             .arg(
+                 Argument::new("api-sock")
+                     .takes_value(true)
+@@ -397,6 +407,14 @@ fn main_exec() -> Result<(), MainError> {
+         })
+         .unwrap_or_else(|| api_payload_limit);
+ 
++    // DST: pass ctrl socket and seed via env vars to builder.rs
++    if let Some(ctrl) = arguments.single_value("openthesis-dst-ctrl") {
++        unsafe { std::env::set_var("OPENTHESIS_DST_CTRL", ctrl); }
++    }
++    if let Some(seed) = arguments.single_value("openthesis-dst-seed") {
++        unsafe { std::env::set_var("OPENTHESIS_DST_SEED", seed); }
++    }
++
+     if api_enabled {
+         let bind_path = arguments
+             .single_value("api-sock")
+diff --git a/src/vmm/src/arch/x86_64/vcpu.rs b/src/vmm/src/arch/x86_64/vcpu.rs
+index 02a590f8..047d7d64 100644
+--- a/src/vmm/src/arch/x86_64/vcpu.rs
++++ b/src/vmm/src/arch/x86_64/vcpu.rs
+@@ -160,6 +160,7 @@ pub struct KvmVcpu {
+     pub dst_pmc: Option<crate::dst::pmc::InstructionCounter>,
+     pub dst_seed: Option<u64>,
+     pub dst_rdtsc_exiting: bool,
++    pub dst_pmc_prev: u64,
+ }
+ 
+ /// Vcpu peripherals
+@@ -190,6 +191,11 @@ impl KvmVcpu {
+             peripherals: Default::default(),
+             msrs_to_save: vm.msrs_to_save().to_vec(),
+             xsave2_size: vm.xsave2_size(),
++            dst_clock: None,
++            dst_pmc: None,
++            dst_seed: None,
++            dst_rdtsc_exiting: false,
++            dst_pmc_prev: 0,
+         })
+     }
+ 
+@@ -762,7 +768,7 @@ impl Peripherals {
+ }
+ 
+ /// Structure holding VCPU kvm state.
+-#[derive(Serialize, Deserialize)]
++#[derive(Clone, Serialize, Deserialize)]
+ pub struct VcpuState {
+     /// CpuId.
+     pub cpuid: CpuId,
+diff --git a/src/vmm/src/arch/x86_64/vm.rs b/src/vmm/src/arch/x86_64/vm.rs
+index a4f03a84..7065414c 100644
+--- a/src/vmm/src/arch/x86_64/vm.rs
++++ b/src/vmm/src/arch/x86_64/vm.rs
+@@ -127,6 +127,40 @@ impl ArchVm {
+     /// - [`kvm_ioctls::VmFd::set_irqchip`] errors.
+     /// - [`kvm_ioctls::VmFd::set_irqchip`] errors.
+     /// - [`kvm_ioctls::VmFd::set_irqchip`] errors.
++    /// Requires custom host kernel with the HLT user exit patch.
++    pub fn enable_rdtsc_exiting(&self) -> Result<(), kvm_ioctls::Error> {
++        // Cap number depends on host kernel version: 236 for 6.8.x, 245 for 6.18+.
++        // OPENTHESIS_KVM_CAP_RDTSC is set by the orchestrator at launch.
++        let cap: u32 = std::env::var("OPENTHESIS_KVM_CAP_RDTSC")
++            .ok().and_then(|s| s.parse().ok()).unwrap_or(236);
++        self.fd().enable_cap(&kvm_bindings::kvm_enable_cap {
++            cap,
++            args: [0; 4],
++            ..Default::default()
++        })
++    }
++
++    pub fn enable_hlt_user_exit(&self) -> Result<(), kvm_ioctls::Error> {
++        // Cap number depends on host kernel version: 237 for 6.8.x, 246 for 6.18+.
++        // OPENTHESIS_KVM_CAP_HLT is set by the orchestrator at launch.
++        let cap: u32 = std::env::var("OPENTHESIS_KVM_CAP_HLT")
++            .ok().and_then(|s| s.parse().ok()).unwrap_or(237);
++        self.fd().enable_cap(&kvm_bindings::kvm_enable_cap {
++            cap,
++            args: [0; 4],
++            ..Default::default()
++        })
++    }
++
++    pub fn disable_halt_polling(&self) -> Result<(), kvm_ioctls::Error> {
++        // KVM_CAP_HALT_POLL = 25
++        self.fd().enable_cap(&kvm_bindings::kvm_enable_cap {
++            cap: 25, // KVM_CAP_HALT_POLL
++            args: [0; 4], // args[0] = 0 disables polling
++            ..Default::default()
++        })
++    }
++
+     pub fn restore_state(&mut self, state: &VmState) -> Result<(), ArchVmError> {
+         self.fd()
+             .set_pit2(&state.pitstate)
+diff --git a/src/vmm/src/builder.rs b/src/vmm/src/builder.rs
+index 603d1b5c..32ba4fbb 100644
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -171,6 +171,13 @@ pub fn build_microvm_for_boot(
+     // Set up Kvm Vm and register memory regions.
+     // Build custom CPU config if a custom template is provided.
+     let mut vm = Vm::new(&kvm)?;
++    // DST: enable RDTSC cap BEFORE vCPU creation
++    if std::env::var("OPENTHESIS_DST_CTRL").is_ok() {
++        if let Err(e) = vm.enable_rdtsc_exiting() { log::warn!("DST: enable_rdtsc_exiting failed: {}", e); }
++        // if let Err(e) = vm.enable_hlt_user_exit() { log::warn!("DST: enable_hlt_user_exit failed: {}", e); }
++        // if let Err(e) = vm.disable_halt_polling() { log::warn!("DST: disable_halt_polling failed: {}", e); }
++    }
++
+     let (mut vcpus, vcpus_exit_evt) = vm.create_vcpus(vm_resources.machine_config.vcpu_count)?;
+     vm.register_dram_memory_regions(guest_memory)?;
+ 
+@@ -309,6 +316,12 @@ pub fn build_microvm_for_boot(
+         boot_cmdline,
+     )?;
+ 
++    // DST: disable KVM halt polling so HLT exits reach userspace handler.
++    if std::env::var("OPENTHESIS_DST_CTRL").is_ok() {
++        // if let Err(e) = vm.disable_halt_polling() { log::warn!("DST: disable_halt_polling failed: {}", e); }
++        match vm.enable_hlt_user_exit() { Ok(()) => log::info!("DST: KVM_CAP_HLT_USER_EXIT enabled (boot path)"), Err(e) => log::warn!("DST: enable_hlt_user_exit failed: {}", e) }
++    }
++
+     let vmm = Vmm {
+         instance_info: instance_info.clone(),
+         machine_config: vm_resources.machine_config.clone(),
+@@ -328,6 +341,21 @@ pub fn build_microvm_for_boot(
+     #[cfg(feature = "gdb")]
+     let (gdb_tx, gdb_rx) = mpsc::channel();
+ 
++    // DST: wire virtual clock into vCPUs BEFORE they are moved to threads.
++    // This enables the HLT handler (in run_emulation) to advance the VirtualClock
++    // per HLT exit, which is required for RunForInstructions to detect when the
++    // target instruction count is reached.
++    let dst_clock_for_vcpus = if std::env::var("OPENTHESIS_DST_CTRL").is_ok() {
++        let clock = crate::dst::clock::VirtualClock::new();
++        for vcpu in &mut vcpus {
++            vcpu.kvm_vcpu.dst_clock = Some(clock.clone());
++        }
++        vmm.lock().unwrap().dst_clock = Some(clock.clone());
++        Some(clock)
++    } else {
++        None
++    };
++
+     #[cfg(feature = "gdb")]
+     vcpus
+         .iter_mut()
+@@ -364,6 +392,18 @@ pub fn build_microvm_for_boot(
+     )
+     .map_err(VmmError::SeccompFilters)?;
+ 
++    // DST: start ctrl server if configured (boot path).
++    if let Ok(ctrl_path) = std::env::var("OPENTHESIS_DST_CTRL") {
++        let clock = dst_clock_for_vcpus.clone().unwrap_or_else(|| crate::dst::clock::VirtualClock::new());
++        let vm_arc = vmm.lock().unwrap().vm.clone();
++        let handles = crate::dst::ctrl::DstCtrlHandles {
++            clock, rng: None, dpq: None, set_tsc_fn: None, pmc_active: true,
++            vm: Some(vm_arc), vmclock: None, vmm: Some(std::sync::Arc::clone(&vmm)),
++        };
++        crate::dst::ctrl::DstCtrlServer::new(ctrl_path, handles).start();
++        log::info!("DST: ctrl server started (boot path)");
++    }
++
+     event_manager.add_subscriber(vmm.clone());
+ 
+     Ok(vmm)
+@@ -452,6 +492,12 @@ pub fn build_microvm_from_snapshot(
+     // Build custom CPU config if a custom template is provided.
+     let mut vm = Vm::new(&kvm).map_err(StartMicrovmError::Vm)?;
+ 
++    // DST: enable KVM caps BEFORE vCPU creation (snapshot restore path).
++    if std::env::var("OPENTHESIS_DST_CTRL").is_ok() {
++        if let Err(e) = vm.enable_rdtsc_exiting() { log::warn!("DST: enable_rdtsc_exiting failed: {}", e); }
++        // if let Err(e) = vm.enable_hlt_user_exit() { log::warn!("DST: enable_hlt_user_exit failed: {}", e); }
++    }
++
+     let (mut vcpus, vcpus_exit_evt) = vm
+         .create_vcpus(vm_resources.machine_config.vcpu_count)
+         .map_err(StartMicrovmError::Vm)?;
+@@ -528,6 +574,22 @@ pub fn build_microvm_from_snapshot(
+         dst_seed: None,
+     };
+ 
++    // DST: wire virtual clock into restored vCPUs before threading.
++    if std::env::var("OPENTHESIS_DST_CTRL").is_ok() {
++        let _ = vmm.vm.disable_halt_polling();
++        match vmm.vm.enable_hlt_user_exit() { Ok(()) => log::info!("DST: KVM_CAP_HLT_USER_EXIT enabled (restore path)"), Err(e) => log::warn!("DST: enable_hlt_user_exit failed (restore): {}", e) }
++    }
++    let dst_clock_for_restore = if std::env::var("OPENTHESIS_DST_CTRL").is_ok() {
++        let clock = vmm.dst_clock.clone().unwrap_or_else(|| crate::dst::clock::VirtualClock::new());
++        for vcpu in &mut vcpus {
++            vcpu.kvm_vcpu.dst_clock = Some(clock.clone());
++        }
++        vmm.dst_clock = Some(clock.clone());
++        Some(clock)
++    } else {
++        None
++    };
++
+     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
+     vmm.start_vcpus(
+         vcpus,
+@@ -538,6 +600,19 @@ pub fn build_microvm_from_snapshot(
+     )?;
+ 
+     let vmm = Arc::new(Mutex::new(vmm));
++    // DST: start ctrl server on snapshot restore path.
++    if let (Ok(ctrl_path), Some(_seed)) = (std::env::var("OPENTHESIS_DST_CTRL"), std::env::var("OPENTHESIS_DST_SEED").ok().and_then(|s: String| s.parse::<u64>().ok())) {
++        let clock_for_ctrl = dst_clock_for_restore.clone().or_else(|| vmm.lock().unwrap().dst_clock.clone());
++        let vm_arc_for_ctrl = vmm.lock().unwrap().vm.clone();
++        let clock = clock_for_ctrl.unwrap_or_else(|| crate::dst::clock::VirtualClock::new());
++        let handles = crate::dst::ctrl::DstCtrlHandles {
++            clock, rng: None, dpq: None, set_tsc_fn: None, pmc_active: true,
++            vm: Some(vm_arc_for_ctrl), vmclock: None, vmm: Some(Arc::clone(&vmm)),
++        };
++        crate::dst::ctrl::DstCtrlServer::new(ctrl_path, handles).start();
++        log::info!("DST: ctrl server started (snapshot restore path)");
++    }
++
+     event_manager.add_subscriber(vmm.clone());
+ 
+     // Load seccomp filters for the VMM thread.
+diff --git a/src/vmm/src/device_manager/mmio.rs b/src/vmm/src/device_manager/mmio.rs
+index 31102fec..60d4af45 100644
+--- a/src/vmm/src/device_manager/mmio.rs
++++ b/src/vmm/src/device_manager/mmio.rs
+@@ -381,6 +381,12 @@ impl MMIODeviceManager {
+     }
+ 
+     /// Gets the specified device.
++    pub fn get_mut_virtio_device(
++        &mut self, device_type: VirtioDeviceType, device_id: &str,
++    ) -> Option<&mut MMIODevice<MmioTransport>> {
++        self.virtio_devices.get_mut(&(device_type, device_id.to_string()))
++    }
++
+     pub fn get_virtio_device(
+         &self,
+         device_type: VirtioDeviceType,
+diff --git a/src/vmm/src/devices/virtio/persist.rs b/src/vmm/src/devices/virtio/persist.rs
+index 2a75945f..168e1e5f 100644
+--- a/src/vmm/src/devices/virtio/persist.rs
++++ b/src/vmm/src/devices/virtio/persist.rs
+@@ -33,28 +33,28 @@ pub enum PersistError {
+ #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct QueueState {
+     /// The maximal size in elements offered by the device
+-    max_size: u16,
++    pub(crate) max_size: u16,
+ 
+     /// The queue size in elements the driver selected
+-    size: u16,
++    pub(crate) size: u16,
+ 
+     /// Indicates if the queue is finished with configuration
+-    ready: bool,
++    pub(crate) ready: bool,
+ 
+     /// Guest physical address of the descriptor table
+-    desc_table: u64,
++    pub(crate) desc_table: u64,
+ 
+     /// Guest physical address of the available ring
+-    avail_ring: u64,
++    pub(crate) avail_ring: u64,
+ 
+     /// Guest physical address of the used ring
+-    used_ring: u64,
++    pub(crate) used_ring: u64,
+ 
+-    next_avail: Wrapping<u16>,
+-    next_used: Wrapping<u16>,
++    pub(crate) next_avail: Wrapping<u16>,
++    pub(crate) next_used: Wrapping<u16>,
+ 
+     /// The number of added used buffers since last guest kick
+-    num_added: Wrapping<u16>,
++    pub(crate) num_added: Wrapping<u16>,
+ }
+ 
+ /// Auxiliary structure for restoring queues.
+@@ -194,13 +194,13 @@ impl VirtioDeviceState {
+ #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct MmioTransportState {
+     // The register where feature bits are stored.
+-    features_select: u32,
++    pub(crate) features_select: u32,
+     // The register where features page is selected.
+-    acked_features_select: u32,
+-    queue_select: u32,
+-    device_status: u32,
+-    config_generation: u32,
+-    interrupt_status: u32,
++    pub(crate) acked_features_select: u32,
++    pub(crate) queue_select: u32,
++    pub(crate) device_status: u32,
++    pub(crate) config_generation: u32,
++    pub(crate) interrupt_status: u32,
+ }
+ 
+ /// Auxiliary structure for initializing the transport when resuming from a snapshot.
+diff --git a/src/vmm/src/devices/virtio/rng/device.rs b/src/vmm/src/devices/virtio/rng/device.rs
+index b163922d..c1a0161e 100644
+--- a/src/vmm/src/devices/virtio/rng/device.rs
++++ b/src/vmm/src/devices/virtio/rng/device.rs
+@@ -82,6 +82,7 @@ impl Entropy {
+             queue_events,
+             rate_limiter,
+             buffer: IoVecBufferMut::new()?,
++            dst_prng: None,
+         })
+     }
+ 
+diff --git a/src/vmm/src/devices/virtio/transport/mmio.rs b/src/vmm/src/devices/virtio/transport/mmio.rs
+index 1a252c4d..79bf775f 100644
+--- a/src/vmm/src/devices/virtio/transport/mmio.rs
++++ b/src/vmm/src/devices/virtio/transport/mmio.rs
+@@ -95,6 +95,38 @@ impl MmioTransport {
+         self.device.clone()
+     }
+ 
++
++    /// Restore transport and device queue state in-place (DST).
++    pub fn restore_state_in_place(
++        &mut self,
++        transport_state: &crate::devices::virtio::persist::MmioTransportState,
++        virtio_state: &crate::devices::virtio::persist::VirtioDeviceState,
++    ) {
++        use std::num::Wrapping;
++        use crate::vstate::memory::GuestAddress;
++        self.features_select = transport_state.features_select;
++        self.acked_features_select = transport_state.acked_features_select;
++        self.queue_select = transport_state.queue_select;
++        self.device_status = transport_state.device_status;
++        self.config_generation = transport_state.config_generation;
++        self.interrupt.irq_status.store(transport_state.interrupt_status, std::sync::atomic::Ordering::SeqCst);
++        let mut device = self.device.lock().expect("Poisoned lock");
++        let queues = device.queues_mut();
++        for (i, sq) in virtio_state.queues.iter().enumerate() {
++            if i >= queues.len() { break; }
++            let q = &mut queues[i];
++            q.max_size = sq.max_size; q.size = sq.size; q.ready = sq.ready;
++            q.desc_table_address = GuestAddress(sq.desc_table);
++            q.avail_ring_address = GuestAddress(sq.avail_ring);
++            q.used_ring_address = GuestAddress(sq.used_ring);
++            q.next_avail = Wrapping(sq.next_avail.0);
++            q.next_used = Wrapping(sq.next_used.0);
++            q.num_added = Wrapping(sq.num_added.0);
++            if q.ready { let _ = q.initialize(&self.mem); }
++        }
++        device.set_acked_features(virtio_state.acked_features);
++    }
++
+     fn check_device_status(&self, set: u32, clr: u32) -> bool {
+         self.device_status & (set | clr) == set
+     }
+diff --git a/src/vmm/src/devices/virtio/vsock/device.rs b/src/vmm/src/devices/virtio/vsock/device.rs
+index 84827094..123359c8 100644
+--- a/src/vmm/src/devices/virtio/vsock/device.rs
++++ b/src/vmm/src/devices/virtio/vsock/device.rs
+@@ -127,6 +127,10 @@ where
+     }
+ 
+     /// Access the backend behind the device.
++    pub fn backend_mut(&mut self) -> &mut B {
++        &mut self.backend
++    }
++
+     pub fn backend(&self) -> &B {
+         &self.backend
+     }
+diff --git a/src/vmm/src/devices/virtio/vsock/unix/muxer.rs b/src/vmm/src/devices/virtio/vsock/unix/muxer.rs
+index ace0dbdd..23304914 100644
+--- a/src/vmm/src/devices/virtio/vsock/unix/muxer.rs
++++ b/src/vmm/src/devices/virtio/vsock/unix/muxer.rs
+@@ -336,6 +336,20 @@ impl VsockMuxer {
+     }
+ 
+     /// Return the file system path of the host-side Unix socket.
++    /// Reset all active connections for in-place snapshot restore (DST).
++    /// Clears host-side muxer state to match the restored guest memory state.
++    /// The host_sock UDS listener stays open for new connections.
++    pub fn reset_connections(&mut self) {
++        let keys: Vec<ConnMapKey> = self.conn_map.keys().cloned().collect();
++        for key in keys {
++            self.remove_connection(key);
++        }
++        self.local_port_set.clear();
++        self.local_port_last = (1u32 << 30) - 1;
++        self.rxq = MuxerRxQ::new();
++        self.killq = MuxerKillQ::new();
++    }
++
+     pub fn host_sock_path(&self) -> &str {
+         &self.host_sock_path
+     }
+diff --git a/src/vmm/src/dst/clock.rs b/src/vmm/src/dst/clock.rs
+index 245c8cee..4d06707a 100644
+--- a/src/vmm/src/dst/clock.rs
++++ b/src/vmm/src/dst/clock.rs
+@@ -9,6 +9,17 @@ pub struct VirtualClock {
+     wall_offset_ns: AtomicI64,
+     frozen: AtomicBool,
+     consecutive_hlt: AtomicU64,
++    /// Burst target: when monotonic_ns >= target_ns, the vCPU should self-pause.
++    /// Set by run-burst ctrl command. 0 = no target (free-running).
++    target_ns: AtomicI64,
++    /// RDTSC quantum: how many ns to advance per RDTSC exit.
++    /// 100_000 (100μs) for fast boot, 1_000 (1μs) for precise exploration.
++    rdtsc_quantum: AtomicU64,
++    /// Preemption schedule: virtual-time intervals (ns) at which to inject a
++    /// LAPIC timer interrupt into the guest. Set by ctrl socket before each burst.
++    preemption_schedule: std::sync::Mutex<Vec<u64>>,
++    preemption_idx: AtomicU64,
++    next_preemption_ns: AtomicI64,
+ }
+ 
+ impl VirtualClock {
+@@ -18,6 +29,11 @@ impl VirtualClock {
+             wall_offset_ns: AtomicI64::new(VIRTUAL_EPOCH_NS),
+             frozen: AtomicBool::new(false),
+             consecutive_hlt: AtomicU64::new(0),
++            target_ns: AtomicI64::new(0),
++            rdtsc_quantum: AtomicU64::new(100_000),
++            preemption_schedule: std::sync::Mutex::new(Vec::new()),
++            preemption_idx: AtomicU64::new(0),
++            next_preemption_ns: AtomicI64::new(i64::MAX),
+         })
+     }
+ 
+@@ -43,6 +59,58 @@ impl VirtualClock {
+         self.consecutive_hlt.load(Ordering::Relaxed)
+     }
+ 
++    pub fn rdtsc_quantum(&self) -> u64 { self.rdtsc_quantum.load(Ordering::Relaxed) }
++    pub fn set_rdtsc_quantum(&self, ns: u64) { self.rdtsc_quantum.store(ns, Ordering::Relaxed); }
++
++    pub fn set_target(&self, ns: i64) { self.target_ns.store(ns, Ordering::Relaxed); }
++    pub fn target_reached(&self) -> bool {
++        let target = self.target_ns.load(Ordering::Relaxed);
++        target > 0 && self.monotonic_ns.load(Ordering::Relaxed) >= target
++    }
++    pub fn clear_target(&self) { self.target_ns.store(0, Ordering::Relaxed); }
++
++    /// Programs the preemption schedule for the upcoming burst. intervals_ns is
++    /// a sequence of virtual-time durations (ns); the vCPU injects a LAPIC timer
++    /// interrupt after each interval elapses. Called from the ctrl socket handler.
++    pub fn set_preemption_schedule(&self, intervals: Vec<u64>) {
++        let first_target = if intervals.is_empty() {
++            i64::MAX
++        } else {
++            self.monotonic_ns.load(Ordering::Relaxed).saturating_add(intervals[0] as i64)
++        };
++        let mut sched = self.preemption_schedule.lock().unwrap();
++        *sched = intervals;
++        self.preemption_idx.store(0, Ordering::Relaxed);
++        self.next_preemption_ns.store(first_target, Ordering::Relaxed);
++    }
++
++    /// Returns true if the current virtual time has reached the next preemption
++    /// point and advances the schedule index for the next call. Called from the
++    /// vCPU RDTSC exit handler on every clock advance.
++    pub fn check_preemption(&self) -> bool {
++        let now = self.monotonic_ns.load(Ordering::Relaxed);
++        let next = self.next_preemption_ns.load(Ordering::Relaxed);
++        if now < next { return false; }
++        let sched = self.preemption_schedule.lock().unwrap();
++        if sched.is_empty() { return false; }
++        let idx = self.preemption_idx.load(Ordering::Relaxed) as usize;
++        let next_idx = idx + 1;
++        let next_target = if next_idx < sched.len() {
++            now.saturating_add(sched[next_idx] as i64)
++        } else {
++            now.saturating_add(*sched.last().unwrap() as i64)
++        };
++        self.preemption_idx.store(next_idx as u64, Ordering::Relaxed);
++        self.next_preemption_ns.store(next_target, Ordering::Relaxed);
++        true
++    }
++
++    pub fn clear_preemption_schedule(&self) {
++        let mut sched = self.preemption_schedule.lock().unwrap();
++        sched.clear();
++        self.next_preemption_ns.store(i64::MAX, Ordering::Relaxed);
++    }
++
+     pub fn advance_quantum(&self, quantum_ns: i64) {
+         if !self.frozen.load(Ordering::Relaxed) && quantum_ns > 0 {
+             self.monotonic_ns.fetch_add(quantum_ns, Ordering::Relaxed);
+diff --git a/src/vmm/src/dst/ctrl.rs b/src/vmm/src/dst/ctrl.rs
+new file mode 100644
+index 00000000..c45ab6c7
+--- /dev/null
++++ b/src/vmm/src/dst/ctrl.rs
+@@ -0,0 +1,256 @@
++use std::io::{BufRead, BufReader, Write};
++use std::os::unix::net::{UnixListener, UnixStream};
++use std::sync::{Arc, Mutex};
++use std::thread;
++use serde::{Deserialize, Serialize};
++use crate::dst::clock::VirtualClock;
++use crate::vstate::vcpu::VcpuResponse;
++use crate::dst::prng::SplitMix64;
++use crate::dst::net::DpqQueue;
++
++pub struct DstCtrlHandles {
++    pub clock: Arc<VirtualClock>,
++    pub rng: Option<Arc<Mutex<SplitMix64>>>,
++    pub dpq: Option<Arc<Mutex<DpqQueue>>>,
++    pub set_tsc_fn: Option<Arc<dyn Fn(u64) + Send + Sync>>,
++    pub pmc_active: bool,
++    pub vm: Option<Arc<crate::vstate::vm::Vm>>,
++    pub vmclock: Option<Arc<Mutex<crate::devices::acpi::vmclock::VmClock>>>,
++    pub vmm: Option<Arc<Mutex<crate::Vmm>>>,
++}
++
++impl std::fmt::Debug for DstCtrlHandles { fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.debug_struct("DstCtrlHandles").finish() } }
++
++#[derive(Deserialize)]
++struct CtrlRequest {
++    cmd: String,
++    #[serde(default)] monotonic_ns: Option<i64>,
++    #[serde(default)] delta_ns: Option<i64>,
++    #[serde(default)] state: Option<u64>,
++    #[serde(default)] snapshot_path: Option<String>,
++    #[serde(default)] mem_path: Option<String>,
++    #[serde(default)] instructions: Option<u64>,
++    #[serde(default)] intervals_ns: Vec<u64>,
++    /// Maximum wall-clock milliseconds to wait for the vCPU to self-pause after
++    /// run-burst resumes it. Defaults to 500ms. Pass a larger value for I/O-heavy
++    /// workloads (etcd, Redis) where the burst duration exceeds 500ms real time.
++    #[serde(default)] max_wait_ms: Option<u64>,
++}
++
++#[derive(Debug, Serialize)]
++struct CtrlResponse {
++    ok: bool,
++    #[serde(skip_serializing_if = "Option::is_none")] error: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")] monotonic_ns: Option<i64>,
++    #[serde(skip_serializing_if = "Option::is_none")] wall_ns: Option<i64>,
++    #[serde(skip_serializing_if = "Option::is_none")] state: Option<u64>,
++    #[serde(skip_serializing_if = "Option::is_none")] packets_injected: Option<usize>,
++    #[serde(skip_serializing_if = "Option::is_none")] dst_mode: Option<bool>,
++    #[serde(skip_serializing_if = "Option::is_none")] hlt_count: Option<u64>,
++    #[serde(skip_serializing_if = "Option::is_none")] pmc_active: Option<bool>,
++}
++impl CtrlResponse {
++    fn ok() -> Self { Self { ok: true, error: None, monotonic_ns: None, wall_ns: None, state: None, packets_injected: None, dst_mode: None, hlt_count: None, pmc_active: None } }
++    fn err(msg: impl Into<String>) -> Self { Self { ok: false, error: Some(msg.into()), monotonic_ns: None, wall_ns: None, state: None, packets_injected: None, dst_mode: None, hlt_count: None, pmc_active: None } }
++}
++
++fn dispatch(h: &DstCtrlHandles, req: CtrlRequest) -> CtrlResponse {
++    match req.cmd.as_str() {
++        "ping" => { let mut r = CtrlResponse::ok(); r.dst_mode = Some(true); r.pmc_active = Some(h.pmc_active); r }
++        "get-time" => { let mut r = CtrlResponse::ok(); r.monotonic_ns = Some(h.clock.monotonic_ns()); r.wall_ns = Some(h.clock.wall_ns()); r.hlt_count = Some(h.clock.hlt_count()); r }
++        "set-time" => {
++            let ns = match req.monotonic_ns { Some(v) => v, None => return CtrlResponse::err("set-time: missing monotonic_ns") };
++            h.clock.set_monotonic(ns);
++            if let Some(f) = &h.set_tsc_fn { f(ns as u64); }
++            CtrlResponse::ok()
++        }
++        "burst-start" => {
++            let ns = match req.monotonic_ns { Some(v) => v, None => return CtrlResponse::err("burst-start: missing monotonic_ns") };
++            h.clock.freeze(); h.clock.set_monotonic(ns); h.clock.unfreeze();
++            if let Some(f) = &h.set_tsc_fn { f(ns as u64); }
++            let mut errs: Vec<String> = Vec::new();
++            if let Some(vm) = &h.vm {
++                // reset_clock_to_virtual and reset_pit_state require additional VM patches.
++                let _ = vm; let _ = ns;
++            }
++            // VMClock update_dst_epoch requires acpi/vmclock patch.
++            if errs.is_empty() { CtrlResponse::ok() } else { CtrlResponse::err(errs.join("; ")) }
++        }
++        "get-rng-state" => { let mut r = CtrlResponse::ok(); if let Some(rng) = &h.rng { r.state = Some(rng.lock().unwrap().state()); } r }
++        "set-rng-state" => {
++            let s = match req.state { Some(v) => v, None => return CtrlResponse::err("set-rng-state: missing state") };
++            if let Some(rng) = &h.rng { rng.lock().unwrap().set_state(s); }
++            CtrlResponse::ok()
++        }
++        "flush-dpq" => {
++            let count = if let Some(dpq) = &h.dpq { let mut d = dpq.lock().unwrap(); let n = d.drain().len(); d.reset(); n } else { 0 };
++            let mut r = CtrlResponse::ok(); r.packets_injected = Some(count); r
++        }
++        "restore-in-place" => {
++            let snap = match &req.snapshot_path { Some(p) => p.clone(), None => return CtrlResponse::err("restore-in-place: missing snapshot_path") };
++            let mem = match &req.mem_path { Some(p) => p.clone(), None => return CtrlResponse::err("restore-in-place: missing mem_path") };
++            match &h.vmm {
++                Some(vmm_arc) => {
++                    let mut vmm = vmm_arc.lock().unwrap();
++                    match vmm.restore_in_place(&snap, &mem) {
++                        Ok(_) => CtrlResponse::ok(),
++                        Err(e) => CtrlResponse::err(format!("restore-in-place: {e}")),
++                    }
++                }
++                None => CtrlResponse::err("restore-in-place: vmm not available"),
++            }
++        }
++        "run-burst" => {
++            // Run the VM for exactly N ns of virtual time.
++            // Sets a target on VirtualClock, resumes the vCPU, and blocks until
++            // the vCPU self-pauses when the target is reached. The burst boundary
++            // is deterministic: the vCPU checks after EVERY KVM_RUN exit.
++            let n = match req.instructions {
++                Some(v) if v > 0 => v,
++                _ => return CtrlResponse::err("run-burst: missing or zero instructions"),
++            };
++            let before = h.clock.monotonic_ns();
++            let target = before + n as i64;
++
++            // Set target so vCPU self-pauses when reached.
++            h.clock.set_target(target);
++
++            // Resume vCPU. Drop the Vmm mutex BEFORE waiting for the pause
++            // response — the event manager needs the mutex to process virtio
++            // events (including vsock) while the burst is running.
++            match &h.vmm {
++                Some(vmm_arc) => {
++                    // Phase 1: resume (holds mutex briefly)
++                    {
++                        let mut vmm = vmm_arc.lock().unwrap();
++                        if let Err(e) = vmm.resume_vm() {
++                            h.clock.clear_target();
++                            return CtrlResponse::err(format!("run-burst resume: {e}"));
++                        }
++                    } // mutex dropped here — event manager can process vsock etc.
++
++                    // Phase 2: wait for vCPU self-pause (mutex NOT held).
++                    // Poll try_recv in a loop, yielding the mutex between attempts
++                    // so the event manager can process vsock/virtio events.
++                    //
++                    // FIRECRACKER_VMM_MUTEX_TRACE=1: log when a poll iteration blocks
++                    // for >1ms waiting for the Vmm mutex. This identifies which code
++                    // path holds the mutex during I/O-heavy bursts (Gap 6 root cause).
++                    let vmm_trace = std::env::var("FIRECRACKER_VMM_MUTEX_TRACE").is_ok();
++                    let wait_ms = req.max_wait_ms.unwrap_or(500);
++                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
++                    let mut got_paused = false;
++                    while std::time::Instant::now() < deadline {
++                        let lock_start = std::time::Instant::now();
++                        let vmm = vmm_arc.lock().unwrap();
++                        let lock_wait = lock_start.elapsed();
++                        if vmm_trace && lock_wait.as_millis() > 1 {
++                            log::warn!("DST: vmm_mutex_trace run-burst poll blocked {}ms",
++                                lock_wait.as_millis());
++                        }
++                        match vmm.vcpus_handles[0].response_receiver().try_recv() {
++                            Ok(VcpuResponse::Paused) => { got_paused = true; break; }
++                            Ok(_) => { /* unexpected, keep polling */ }
++                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
++                            Err(std::sync::mpsc::TryRecvError::Disconnected) => { break; }
++                        }
++                        drop(vmm); // release mutex for event manager
++                        std::thread::sleep(std::time::Duration::from_micros(100));
++                    }
++                    let result = if got_paused {
++                        Ok(VcpuResponse::Paused)
++                    } else {
++                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
++                    };
++
++                    match result {
++                        Ok(VcpuResponse::Paused) => {}
++                        _ => {
++                            log::warn!("run-burst: timeout, force-pausing");
++                            h.clock.clear_target();
++                            let mut vmm = vmm_arc.lock().unwrap();
++                            let _ = vmm.pause_vm();
++                        }
++                    }
++                }
++                None => {
++                    h.clock.clear_target();
++                    return CtrlResponse::err("run-burst: vmm not available");
++                }
++            }
++
++            // Verify clock reached target. If not (shouldn't happen), force-advance.
++            let after = h.clock.monotonic_ns();
++            if after < target {
++                let delta = target - after;
++                h.clock.advance(delta as u64);
++            }
++
++            // Flush DPQ for deterministic network packet delivery.
++            if let Some(dpq) = &h.dpq {
++                let mut d = dpq.lock().unwrap();
++                d.drain();
++                d.reset();
++            }
++
++            let mut r = CtrlResponse::ok();
++            r.monotonic_ns = Some(h.clock.monotonic_ns());
++            r.hlt_count = Some(h.clock.hlt_count());
++            r
++        }
++        "set-rdtsc-quantum" => {
++            let q = match req.instructions { Some(v) if v > 0 => v, _ => return CtrlResponse::err("set-rdtsc-quantum: missing value") };
++            h.clock.set_rdtsc_quantum(q);
++            CtrlResponse::ok()
++        }
++        "advance-quantum" => {
++            let delta = match req.delta_ns {
++                Some(v) if v > 0 => v,
++                Some(_) => return CtrlResponse::err("advance-quantum: delta_ns must be positive"),
++                None => return CtrlResponse::err("advance-quantum: missing delta_ns"),
++            };
++            h.clock.advance(delta as u64);
++            CtrlResponse::ok()
++        }
++        "set-preemption-schedule" => {
++            // Program a sequence of virtual-time intervals (ns) at which the
++            // vCPU injects a LAPIC timer interrupt into the guest. Different seeds
++            // produce different schedules, driving the guest scheduler to different
++            // goroutine interleavings without breaking determinism.
++            h.clock.set_preemption_schedule(req.intervals_ns);
++            CtrlResponse::ok()
++        }
++        other => CtrlResponse::err(format!("unknown command: {other}")),
++    }
++}
++
++pub struct DstCtrlServer { path: String, handles: DstCtrlHandles }
++impl std::fmt::Debug for DstCtrlServer { fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.debug_struct("DstCtrlServer").field("path", &self.path).finish() } }
++
++impl DstCtrlServer {
++    pub fn new(path: String, handles: DstCtrlHandles) -> Self { Self { path, handles } }
++    pub fn start(self) {
++        let _ = std::fs::remove_file(&self.path);
++        let listener = UnixListener::bind(&self.path).expect("DST ctrl bind failed");
++        thread::spawn(move || {
++            for stream in listener.incoming() {
++                match stream {
++                    Ok(s) => Self::handle_client(s, &self.handles),
++                    Err(e) => { log::warn!("DST ctrl accept error: {e}"); break; }
++                }
++            }
++        });
++    }
++    fn handle_client(stream: UnixStream, handles: &DstCtrlHandles) {
++        let reader = BufReader::new(stream.try_clone().expect("clone stream"));
++        let mut writer = stream;
++        for line in reader.lines() {
++            let line = match line { Ok(l) => l, Err(_) => break };
++            let req: CtrlRequest = match serde_json::from_str(&line) {
++                Ok(r) => r, Err(e) => { let _ = writeln!(writer, "{}", serde_json::to_string(&CtrlResponse::err(format!("parse: {e}"))).unwrap()); continue; }
++            };
++            let resp = dispatch(handles, req);
++            if writeln!(writer, "{}", serde_json::to_string(&resp).unwrap()).is_err() { break; }
++        }
++    }
++}
+diff --git a/src/vmm/src/dst/pmc.rs b/src/vmm/src/dst/pmc.rs
+index 07571c60..307f6db5 100644
+--- a/src/vmm/src/dst/pmc.rs
++++ b/src/vmm/src/dst/pmc.rs
+@@ -25,8 +25,7 @@ impl InstructionCounter {
+         attr.size = std::mem::size_of::<PerfEventAttr>() as u32;
+         attr.config = PERF_COUNT_HW_INSTRUCTIONS;
+         attr.flags = 1; // disabled
+-        attr.flags |= 1 << 5; // exclude_kernel
+-        attr.flags |= 1 << 7; // exclude_hv
++        attr.flags |= 1 << 19; // exclude_host (bit 19): count ONLY guest instructions
+         let fd = unsafe {
+             libc::syscall(libc::SYS_perf_event_open, &attr as *const _, 0i32, -1i32, -1i32, 0u64)
+         } as i32;
+diff --git a/src/vmm/src/dst/rdtsc.rs b/src/vmm/src/dst/rdtsc.rs
+new file mode 100644
+index 00000000..a6503f3a
+--- /dev/null
++++ b/src/vmm/src/dst/rdtsc.rs
+@@ -0,0 +1,7 @@
++pub const KVM_EXIT_RDTSC: u32 = 37;
++pub const KVM_CAP_RDTSC_EXITING: u32 = 214;
++
++pub fn set_rdtsc_response(vcpu_fd: &kvm_ioctls::VcpuFd, value: u64) {
++    let _ = vcpu_fd; let _ = value;
++    // Requires host kernel patch to activate KVM_CAP_RDTSC_EXITING.
++}
+diff --git a/src/vmm/src/lib.rs b/src/vmm/src/lib.rs
+index fc9499e0..0731f8a0 100644
+--- a/src/vmm/src/lib.rs
++++ b/src/vmm/src/lib.rs
+@@ -255,6 +255,8 @@ pub enum VmmError {
+     VcpuExit,
+     /// Failed to resume the vCPUs.
+     VcpuResume,
++    /// In-place snapshot restore error: {0}
++    SnapshotRestore(String),
+     /// Failed to message the vCPUs.
+     VcpuMessage,
+     /// Cannot spawn Vcpu thread: {0}
+@@ -330,7 +332,7 @@ pub struct Vmm {
+     // Used by Vcpus and devices to initiate teardown; Vmm should never write here.
+     vcpus_exit_evt: EventFd,
+     // Device manager
+-    device_manager: DeviceManager,
++    pub device_manager: DeviceManager,
+     pub dst_clock: Option<Arc<crate::dst::clock::VirtualClock>>,
+     pub dst_seed: Option<u64>,
+ }
+@@ -529,6 +531,119 @@ impl Vmm {
+     }
+ 
+     /// Sends a pause command to the vCPUs.
++    /// Restore VM state in-place without killing the process (DST).
++    pub fn restore_in_place(&mut self, snapshot_path: &str, mem_path: &str) -> Result<i64, VmmError> {
++        use std::path::Path;
++        use crate::devices::virtio::device::VirtioDeviceType;
++
++        let microvm_state = crate::persist::snapshot_state_from_file(Path::new(snapshot_path))
++            .map_err(|e| VmmError::SnapshotRestore(format!("load snapshot: {e}")))?;
++
++        // Restore guest memory from the snapshot mem file.
++        // The file is a raw concatenation of all guest memory regions in iteration order
++        // (same order used by GuestMemoryMmap::dump() during snapshot creation).
++        // Since snapshots live on /dev/shm (tmpfs), this is a memory-to-memory copy.
++        let mem_file = std::fs::File::open(mem_path)
++            .map_err(|e| VmmError::SnapshotRestore(format!("open mem file: {e}")))?;
++        {
++            use std::os::unix::io::AsRawFd;
++            let guest_mem = self.vm.guest_memory();
++            let mut file_offset: i64 = 0;
++            for region in guest_mem.iter() {
++                let ptr = region.as_ptr() as *mut u8;
++                let region_len = region.len() as usize;
++                let mut buf_offset: usize = 0;
++                while buf_offset < region_len {
++                    let n = unsafe {
++                        libc::pread(
++                            mem_file.as_raw_fd(),
++                            ptr.add(buf_offset) as *mut libc::c_void,
++                            region_len - buf_offset,
++                            file_offset + buf_offset as i64,
++                        )
++                    };
++                    if n <= 0 {
++                        return Err(VmmError::SnapshotRestore(format!(
++                            "pread mem file at offset {}: errno {}",
++                            file_offset + buf_offset as i64,
++                            unsafe { *libc::__errno_location() },
++                        )));
++                    }
++                    buf_offset += n as usize;
++                }
++                file_offset += region_len as i64;
++            }
++        }
++
++        // Restore vCPU state.
++        // First ensure the vCPU is cleanly paused — drain any stale responses
++        // from previous run-burst self-pause, then send Pause + wait for Paused.
++        if let Some(vcpu_state) = microvm_state.vcpu_states.first() {
++            let handle = &mut self.vcpus_handles[0];
++            // Drain stale responses (from run-burst self-pause or previous operations)
++            while let Ok(_) = handle.response_receiver().try_recv() {}
++            // Ensure paused state
++            let _ = handle.send_event(VcpuEvent::Pause);
++            match handle.response_receiver().recv_timeout(std::time::Duration::from_secs(2)) {
++                Ok(VcpuResponse::Paused) => {}
++                _ => { log::warn!("DST: vCPU not in paused state for RestoreState"); }
++            }
++            // Now restore
++            handle.send_event(VcpuEvent::RestoreState(Box::new(vcpu_state.clone())))
++                .map_err(|e| VmmError::SnapshotRestore(format!("send restore: {e}")))?;
++            match handle.response_receiver().recv_timeout(std::time::Duration::from_secs(5)) {
++                Ok(VcpuResponse::RestoredState) => {}
++                Ok(VcpuResponse::Error(e)) => return Err(VmmError::SnapshotRestore(format!("vcpu: {e}"))),
++                other => return Err(VmmError::SnapshotRestore(format!("unexpected: {other:?}"))),
++            }
++            // immediate_exit is cleared inside the RestoreState handler on the vCPU
++            // thread (see the VcpuEvent::RestoreState arm in vcpu/mod.rs). The vCPU
++            // is now ready to resume without EINTR on the first KVM_RUN call.
++        }
++
++        // Restore device state (queue indices, transport registers)
++        let ds = &microvm_state.device_states;
++        for saved in &ds.mmio_state.block_devices {
++            let vs = match &saved.device_state {
++                crate::devices::virtio::block::persist::BlockState::Virtio(v) => &v.virtio_state,
++                _ => continue,
++            };
++            if let Some(dev) = self.device_manager.mmio_devices.get_mut_virtio_device(VirtioDeviceType::Block, &saved.device_id) {
++                dev.inner.lock().unwrap().restore_state_in_place(&saved.transport_state, vs);
++            }
++        }
++        for saved in &ds.mmio_state.net_devices {
++            if let Some(dev) = self.device_manager.mmio_devices.get_mut_virtio_device(VirtioDeviceType::Net, &saved.device_id) {
++                dev.inner.lock().unwrap().restore_state_in_place(&saved.transport_state, &saved.device_state.virtio_state);
++            }
++        }
++        if let Some(saved) = &ds.mmio_state.vsock_device {
++            if let Some(dev) = self.device_manager.mmio_devices.get_mut_virtio_device(VirtioDeviceType::Vsock, &saved.device_id) {
++                let mut transport = dev.inner.lock().unwrap();
++                transport.restore_state_in_place(&saved.transport_state, &saved.device_state.frontend.virtio_state);
++                // Reset vsock muxer connections: the guest memory was reset
++                // so the guest has no active connections. The host muxer must match.
++                let mut device = transport.locked_device();
++                if let Some(vsock) = device.as_mut_any().downcast_mut::<Vsock<VsockUnixBackend>>() {
++                    vsock.backend_mut().reset_connections();
++                    log::info!("DST: vsock muxer connections reset for in-place restore");
++                }
++            }
++        }
++        if let Some(saved) = &ds.mmio_state.entropy_device {
++            if let Some(dev) = self.device_manager.mmio_devices.get_mut_virtio_device(VirtioDeviceType::Rng, &saved.device_id) {
++                dev.inner.lock().unwrap().restore_state_in_place(&saved.transport_state, &saved.device_state.virtio_state);
++            }
++        }
++        if let Some(saved) = &ds.mmio_state.balloon_device {
++            if let Some(dev) = self.device_manager.mmio_devices.get_mut_virtio_device(VirtioDeviceType::Balloon, &saved.device_id) {
++                dev.inner.lock().unwrap().restore_state_in_place(&saved.transport_state, &saved.device_state.virtio_state);
++            }
++        }
++
++        Ok(0)
++    }
++
+     pub fn pause_vm(&mut self) -> Result<(), VmmError> {
+         // Send the events.
+         self.vcpus_handles
+diff --git a/src/vmm/src/persist.rs b/src/vmm/src/persist.rs
+index 05b06a13..f74e1854 100644
+--- a/src/vmm/src/persist.rs
++++ b/src/vmm/src/persist.rs
+@@ -455,7 +455,7 @@ pub enum SnapshotStateFromFileError {
+     UnknownNetworkDevice,
+ }
+ 
+-fn snapshot_state_from_file(
++pub fn snapshot_state_from_file(
+     snapshot_path: &Path,
+ ) -> Result<MicrovmState, SnapshotStateFromFileError> {
+     let mut snapshot_reader = File::open(snapshot_path)?;
+diff --git a/src/vmm/src/vstate/vcpu.rs b/src/vmm/src/vstate/vcpu.rs
+index 8380396b..ec9ad3a6 100644
+--- a/src/vmm/src/vstate/vcpu.rs
++++ b/src/vmm/src/vstate/vcpu.rs
+@@ -202,6 +202,22 @@ impl Vcpu {
+     /// Note that the state of the VCPU and associated VM must be setup first for this to do
+     /// anything useful.
+     pub fn run(&mut self, seccomp_filter: BpfProgramRef) {
++        // DST: initialize PMC instruction counter in this vCPU thread.
++        // perf_event_open(pid=0) counts instructions for THIS thread only.
++        if self.kvm_vcpu.dst_clock.is_some() && self.kvm_vcpu.dst_pmc.is_none() {
++            match crate::dst::pmc::InstructionCounter::new() {
++                Ok(pmc) => {
++                    pmc.enable();
++                    pmc.reset();
++                    self.kvm_vcpu.dst_pmc = Some(pmc);
++                    log::info!("DST: PMC instruction counter initialized in vCPU thread");
++                }
++                Err(e) => {
++                    log::warn!("DST: PMC init failed (determinism reduced): {}", e);
++                }
++            }
++        }
++
+         // Load seccomp filters for this vCPU thread.
+         // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
+         // altogether is the desired behaviour.
+@@ -242,6 +258,20 @@ impl Vcpu {
+             }
+         }
+ 
++        // DST: check if burst target reached after Interrupted (HLT exit).
++        // If the VirtualClock has reached the target set by run-burst, self-pause
++        // immediately. This makes burst boundaries deterministic — checked after
++        // EVERY KVM_RUN exit, not every 1ms of wall-clock polling.
++        if let Some(clock) = &self.kvm_vcpu.dst_clock {
++            if clock.target_reached() {
++                clock.clear_target();
++                self.response_sender
++                    .send(VcpuResponse::Paused)
++                    .expect("vcpu channel unexpectedly closed");
++                return StateMachine::next(Self::paused);
++            }
++        }
++
+         // By default don't change state.
+         let mut state = StateMachine::next(Self::running);
+ 
+@@ -281,6 +311,13 @@ impl Vcpu {
+                     )))
+                     .expect("vcpu channel unexpectedly closed");
+             }
++            Ok(VcpuEvent::RestoreState(_)) => {
++                self.response_sender
++                    .send(VcpuResponse::NotAllowed(String::from(
++                        "restore unavailable while running",
++                    )))
++                    .expect("vcpu channel unexpectedly closed");
++            }
+             Ok(VcpuEvent::Finish) => return StateMachine::finish(),
+             // Unhandled exit of the other end.
+             Err(TryRecvError::Disconnected) => {
+@@ -335,6 +372,27 @@ impl Vcpu {
+ 
+                 StateMachine::next(Self::paused)
+             }
++            Ok(VcpuEvent::RestoreState(state)) => {
++                match self.kvm_vcpu.restore_state(&state) {
++                    Ok(()) => {
++                        // Clear immediate_exit after restoring state. VcpuEvent::Pause
++                        // sets immediate_exit=1 so the vCPU exits KVM_RUN; that flag
++                        // remains set through RestoreState. Without clearing it here,
++                        // the first KVM_RUN after Resume exits EINTR immediately and
++                        // the burst self-pause never fires, causing burst-start to hang.
++                        self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
++                        self.response_sender
++                            .send(VcpuResponse::RestoredState)
++                            .expect("vcpu channel unexpectedly closed");
++                    }
++                    Err(err) => {
++                        self.response_sender
++                            .send(VcpuResponse::Error(VcpuError::VcpuResponse(err)))
++                            .expect("vcpu channel unexpectedly closed");
++                    }
++                }
++                StateMachine::next(Self::paused)
++            }
+             Ok(VcpuEvent::DumpCpuConfig) => {
+                 self.kvm_vcpu
+                     .dump_cpu_config()
+@@ -394,9 +452,9 @@ impl Vcpu {
+         match self.kvm_vcpu.fd.run() {
+             Err(ref err) if err.errno() == libc::EINTR => {
+                 self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
+-                // Notify that this KVM_RUN was interrupted.
+                 Ok(VcpuEmulation::Interrupted)
+             }
++
+             #[cfg(feature = "gdb")]
+             Ok(VcpuExit::Debug(_)) => {
+                 if let Some(gdb_event) = &self.gdb_event {
+@@ -407,7 +465,59 @@ impl Vcpu {
+ 
+                 Ok(VcpuEmulation::Paused)
+             }
+-            emulation_result => handle_kvm_exit(&mut self.kvm_vcpu.peripherals, emulation_result),
++            emulation_result => {
++                // DST debug: log exit type
++                match &emulation_result {
++                    Ok(VcpuExit::Hlt) => { /* will be handled below */ }
++                    Ok(VcpuExit::MmioRead(_, _)) | Ok(VcpuExit::MmioWrite(_, _)) => { /* normal */ }
++                    Ok(other) => { log::debug!("DST: VcpuExit = {:?}", std::mem::discriminant(other)); }
++                    Err(e) => { log::debug!("DST: KVM_RUN error: {}", e); }
++                }
++
++                // HLT: record for idle detection + add idle quantum.
++                let dst_hlt_fired = matches!(&emulation_result, Ok(kvm_ioctls::VcpuExit::Hlt));
++                if dst_hlt_fired {
++                    if let Some(clock) = &self.kvm_vcpu.dst_clock {
++                        clock.advance(clock.rdtsc_quantum());
++                        clock.record_hlt();
++                        return Ok(VcpuEmulation::Interrupted);
++                    }
++                } else if let Some(clock) = &self.kvm_vcpu.dst_clock {
++                    clock.reset_hlt();
++                }
++                // DST: intercept KVM_EXIT_RDTSC (exit 38, mapped to Unsupported by kvm-ioctls).
++                // Return VirtualClock monotonic_ns as the TSC value to the guest.
++                if let Ok(kvm_ioctls::VcpuExit::Unsupported(exit_reason)) = &emulation_result {
++                                            if *exit_reason == 38 || *exit_reason == 51 {
++                        log::warn!("DST: KVM_EXIT_RDTSC intercepted!");
++                        if let Some(clock) = &self.kvm_vcpu.dst_clock {
++                            // Advance clock per RDTSC: each RDTSC exit ≈ ~1K-10K guest insns.
++                            // 10us quantum makes timers advance proportionally to how
++                            // often the guest reads time.
++                            clock.advance(clock.rdtsc_quantum());
++                            if clock.target_reached() {
++                                // Target reached! Return Interrupted to break inner loop.
++                                // The outer running() loop checks target_reached and self-pauses.
++                                let tsc = clock.monotonic_ns() as u64;
++                                let kvm_run = self.kvm_vcpu.fd.get_kvm_run();
++                                unsafe {
++                                    let ptr = kvm_run as *const _ as *mut u8;
++                                    (ptr.add(32) as *mut u64).write_unaligned(tsc);
++                                }
++                                return Ok(VcpuEmulation::Interrupted);
++                            }
++                            let tsc = clock.monotonic_ns() as u64;
++                            let kvm_run = self.kvm_vcpu.fd.get_kvm_run();
++                            unsafe {
++                                let ptr = kvm_run as *const _ as *mut u8;
++                                (ptr.add(32) as *mut u64).write_unaligned(tsc);
++                            }
++                            return Ok(VcpuEmulation::Handled);
++                        }
++                    }
++                }
++                handle_kvm_exit(&mut self.kvm_vcpu.peripherals, emulation_result)
++            },
+         }
+     }
+ }
+@@ -521,6 +631,8 @@ pub enum VcpuEvent {
+     SaveState,
+     /// Event to dump CPU configuration of a paused Vcpu.
+     DumpCpuConfig,
++    /// Restore vCPU state in-place (DST).
++    RestoreState(Box<crate::arch::x86_64::vcpu::VcpuState>),
+ }
+ 
+ /// List of responses that the Vcpu reports.
+@@ -531,6 +643,8 @@ pub enum VcpuResponse {
+     Exited(FcExitCode),
+     /// Requested action not allowed.
+     NotAllowed(String),
++    /// vCPU state restored (DST).
++    RestoredState,
+     /// Vcpu is paused.
+     Paused,
+     /// Vcpu is resumed.
+@@ -552,6 +666,7 @@ impl fmt::Debug for VcpuResponse {
+             Error(err) => write!(f, "VcpuResponse::Error({:?})", err),
+             NotAllowed(reason) => write!(f, "VcpuResponse::NotAllowed({})", reason),
+             DumpedCpuConfig(_) => write!(f, "VcpuResponse::DumpedCpuConfig"),
++            RestoredState => write!(f, "VcpuResponse::RestoredState"),
+         }
+     }
+ }
+-- 
+2.43.0
+

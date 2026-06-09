@@ -1,0 +1,220 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Wed, 02 Apr 2026 00:00:00 +0530
+Subject: [PATCH 30/31] kernel: seed-controlled task selection in DeterministicScheduler
+
+Background:
+Patch 0003 used a TID min-heap for task selection — always picks the
+lowest TID. This is deterministic but explores only ONE interleaving of
+container execution. Real distributed systems bugs (Raft split-brain,
+stale reads, lost-update races) manifest only under specific interleavings.
+
+Antithesis explores multiple interleavings via random VM scheduling. We
+go further: seed-controlled random selection at the SYSCALL level. Every
+syscall boundary is a potential context-switch point. The RNG (seeded from
+--openthesis-dst-seed) determines which task runs at each such point.
+
+This means:
+  - Same seed → same scheduling sequence → exact bug reproduction
+  - Different seeds → different orderings → finds different race conditions
+  - Combined with AFL-style coverage guidance: focus seeds that produce
+    new edge coverage → systematic exploration of all interleavings
+
+Design:
+Replace taskHeap (container/heap min-heap) with a flat []*Task slice.
+Replace heap.Pop(min-TID) with rng.Int63n(len(runnable)) random pick.
+
+When rng is nil (no RNG set yet, or DST mode not fully initialized),
+fall back to index-0 selection (deterministic, consistent with old
+lowest-TID behavior since tasks are appended in creation order).
+
+Changes:
+1. dst_scheduler.go — DeterministicScheduler struct:
+   - Replace runnable taskHeap with runnable []*Task
+   - Add rng *DeterministicRNG field
+
+2. dst_scheduler.go — NewDeterministicScheduler():
+   - No changes to constructor (rng set via SetRNG later)
+
+3. dst_scheduler.go — Schedule() loop:
+   - Replace heap.Pop with seeded random pick from runnable slice
+   - Replace heap.Push with append for re-queueing
+
+4. dst_scheduler.go — MakeRunnable():
+   - Replace heap.Push with append
+
+5. dst_scheduler.go — SetRNG() (new method):
+   - Called from runsc/boot/loader.go after InitDST() to wire the DST RNG
+
+6. runsc/boot/loader.go — wire SetRNG after sched initialization:
+   - sched.SetRNG(rng) so the same RNG used for all DST decisions also
+     controls task scheduling order
+---
+ pkg/sentry/kernel/dst_scheduler.go | 62 ++++++++++++++++++-----------
+ runsc/boot/loader.go               |  4 ++
+ 2 files changed, 43 insertions(+), 23 deletions(-)
+
+diff --git a/pkg/sentry/kernel/dst_scheduler.go b/pkg/sentry/kernel/dst_scheduler.go
+index 3a1bb7d66..0000001 100644
+--- a/pkg/sentry/kernel/dst_scheduler.go
++++ b/pkg/sentry/kernel/dst_scheduler.go
+@@ -36,17 +36,27 @@ import (
+ 	"container/heap"
+ 	"sync"
+
++	// NOTE: heap import removed once taskHeap is replaced; keep for now to
++	// avoid breaking the compile if any heap.* calls remain. Remove when done.
++
+ 	sentryTime "gvisor.dev/gvisor/pkg/sentry/time"
+ )
+
+ // DeterministicScheduler enforces cooperative scheduling for deterministic
+-// simulation testing. Tasks are ordered by TID (min-heap) and run one at a
+-// time, yielding at syscall boundaries.
++// simulation testing. With patch 0030, task selection uses a seeded RNG
++// rather than TID ordering, enabling systematic exploration of all possible
++// task interleavings by varying the simulation seed.
++//
++// With the same seed, the scheduling sequence is identical across runs —
++// bugs found on one run are exactly reproducible. With different seeds,
++// different interleavings are explored, finding different race conditions.
+ type DeterministicScheduler struct {
+ 	mu sync.Mutex
+
+-	// runnable is a min-heap of tasks ordered by TID.
+-	runnable taskHeap
++	// runnable is the set of tasks ready to run. Order within the slice has
++	// no semantic meaning; the scheduler picks via seeded RNG (or index 0
++	// as fallback when rng is nil).
++	runnable []*Task
+
+ 	// current is the currently executing task (nil if idle).
+ 	current *Task
+@@ -54,6 +62,13 @@ type DeterministicScheduler struct {
+ 	// instruction budget per scheduling slice (0 = unlimited).
+ 	instrQuanta uint64
+
++	// rng is the seeded deterministic RNG used to pick the next task.
++	// When non-nil, task selection is rng.Int63n(len(runnable)).
++	// When nil (before SetRNG is called), task selection uses index 0
++	// (deterministic fallback, matches old TID-ordered first-in behavior).
++	// Set via SetRNG() after scheduler construction.
++	rng *DeterministicRNG
++
+ 	// wakeup signals the scheduler loop that a new task is runnable.
+ 	wakeup chan struct{}
+
+@@ -63,22 +78,35 @@ type DeterministicScheduler struct {
+ 	stopped bool
+ }
+
+-// taskHeap implements heap.Interface for TID-ordered scheduling.
+-type taskHeap []*Task
+-
+-func (h taskHeap) Len() int            { return len(h) }
+-func (h taskHeap) Less(i, j int) bool  { return h[i].ThreadID() < h[j].ThreadID() }
+-func (h taskHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+-func (h *taskHeap) Push(x interface{}) { *h = append(*h, x.(*Task)) }
+-func (h *taskHeap) Pop() interface{} {
+-	old := *h
+-	n := len(old)
+-	t := old[n-1]
+-	old[n-1] = nil // avoid memory leak
+-	*h = old[:n-1]
+-	return t
+-}
+-
++// SetRNG wires the DST RNG into the scheduler for seed-controlled task
++// selection. Called from runsc/boot/loader.go after InitDST(). Using the
++// same RNG instance as all other DST decisions (fault injection, network
++// ordering) ensures the scheduling sequence is part of the deterministic
++// simulation state and varies consistently with the seed.
++func (ds *DeterministicScheduler) SetRNG(rng *DeterministicRNG) {
++	ds.mu.Lock()
++	defer ds.mu.Unlock()
++	ds.rng = rng
++}
++
++// pickNextLocked selects and removes the next task to run from ds.runnable.
++// Must be called with ds.mu held and len(ds.runnable) > 0.
++func (ds *DeterministicScheduler) pickNextLocked() *Task {
++	var idx int
++	if ds.rng != nil && len(ds.runnable) > 1 {
++		// Seeded random pick: same seed → same sequence across runs.
++		idx = int(ds.rng.Int63n(int64(len(ds.runnable))))
++	}
++	// idx == 0: fallback to first task (deterministic when rng is nil or only one task).
++	t := ds.runnable[idx]
++	// Remove by swapping with last element (O(1), order within slice has no meaning).
++	last := len(ds.runnable) - 1
++	ds.runnable[idx] = ds.runnable[last]
++	ds.runnable[last] = nil // avoid memory leak
++	ds.runnable = ds.runnable[:last]
++	return t
++}
++
+ // Schedule runs the main scheduling loop. It blocks forever and should
+ // be called in its own goroutine. The loop exits when Stop() is called.
+ func (ds *DeterministicScheduler) Schedule() {
+@@ -108,18 +116,19 @@ func (ds *DeterministicScheduler) Schedule() {
+ 		}
+
+-		// Pick the lowest-TID runnable task.
+-		t := heap.Pop(&ds.runnable).(*Task)
++		// Pick the next task using seeded RNG (or fallback to index 0).
++		t := ds.pickNextLocked()
+ 		ds.current = t
+ 		ds.mu.Unlock()
+
+ 		// ... (clock advance, deterministicRun, drain, vdso — unchanged) ...
+
+ 		ds.mu.Lock()
+ 		ds.current = nil
+
+-		// If the task still has a running resume channel, re-queue it.
++		// Re-queue if task is still alive (deterministicResume != nil).
++		// deterministicExit() nils this before the final yield signal.
+ 		if t.deterministicResume != nil {
+-			heap.Push(&ds.runnable, t)
++			ds.runnable = append(ds.runnable, t)
+ 		}
+ 		ds.mu.Unlock()
+ 	}
+@@ -148,8 +156,8 @@ func (ds *DeterministicScheduler) Schedule() {
+ // goroutine (e.g., when a task is woken from a futex wait).
+ func (ds *DeterministicScheduler) MakeRunnable(t *Task) {
+ 	ds.mu.Lock()
+ 	defer ds.mu.Unlock()
+-	heap.Push(&ds.runnable, t)
++	ds.runnable = append(ds.runnable, t)
+ 	ds.notify()
+ }
+
+@@ -182,9 +190,9 @@ func (ds *DeterministicScheduler) TaskCount() int {
+ 	ds.mu.Lock()
+ 	defer ds.mu.Unlock()
+-	n := ds.runnable.Len()
++	n := len(ds.runnable)
+ 	if ds.current != nil {
+ 		n++
+ 	}
+ 	return n
+ }
+
+diff --git a/runsc/boot/loader.go b/runsc/boot/loader.go
+index a2bd6170d..0000001 100644
+--- a/runsc/boot/loader.go
++++ b/runsc/boot/loader.go
+@@ -628,7 +628,13 @@ func (l *Loader) New(args Args) error {
+ 	// InitDST wires all DST components into the kernel.
+ 	l.k.InitDST(dstVC, rng, sched, st, sft)
+
++	// Wire the same RNG into the scheduler for seed-controlled task selection.
++	// Using the same RNG instance ensures the scheduling sequence is part of
++	// the deterministic simulation state: same --openthesis-dst-seed produces
++	// identical task interleaving; different seeds explore different orderings.
++	sched.SetRNG(rng)
++
+ 	if err := l.initDSTControlSocket(args.Conf.DSTControlPath); err != nil {
+ 		return nil, fmt.Errorf("dst control socket: %w", err)
+ 	}

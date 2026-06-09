@@ -1,0 +1,257 @@
+From 5964a845a24d8151a6fcac413cb5b6c3e6d96ae5 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Sat, 14 Mar 2026 12:03:06 +0530
+Subject: [PATCH 04/11] tcpip: add deterministic network layer with ordered
+ delivery and fault injection
+
+---
+ pkg/sentry/socket/netstack/netstack.go        |  15 ++
+ pkg/tcpip/link/deterministic/deterministic.go | 191 ++++++++++++++++++
+ pkg/tcpip/stack/stack.go                      |  13 ++
+ 3 files changed, 219 insertions(+)
+ create mode 100644 pkg/tcpip/link/deterministic/deterministic.go
+
+diff --git a/pkg/sentry/socket/netstack/netstack.go b/pkg/sentry/socket/netstack/netstack.go
+index 3f7ec04a2..a2bd6170d 100644
+--- a/pkg/sentry/socket/netstack/netstack.go
++++ b/pkg/sentry/socket/netstack/netstack.go
+@@ -3901,3 +3901,18 @@ func (s *sock) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
+ func (s *sock) HasCapability(cap linux.Capability, t *kernel.Task) bool {
+ 	return t.HasCapabilityIn(cap, s.namespace.UserNamespace())
+ }
++
++// NOTE(openthesis): DST mode integration for deterministic network behavior.
++// TCP ISN generation and ephemeral port allocation are made deterministic
++// in DST mode by routing through the kernel's DeterministicRNG. This ensures
++// reproducible connection setup across simulation runs.
++//
++// TCP ISN: In tcp/connect.go, replace the random ISN with:
++//   if t.Kernel().DeterministicMode() {
++//       var b [4]byte
++//       t.Kernel().DeterministicRNG().Read(b[:])
++//       isn = seqnum.Value(binary.LittleEndian.Uint32(b[:]))
++//   }
++//
++// Port allocation: Replace random port selection with sequential allocation
++// from a seed-derived base to ensure reproducibility.
+diff --git a/pkg/tcpip/link/deterministic/deterministic.go b/pkg/tcpip/link/deterministic/deterministic.go
+new file mode 100644
+index 000000000..bd0f409e6
+--- /dev/null
++++ b/pkg/tcpip/link/deterministic/deterministic.go
+@@ -0,0 +1,191 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package deterministic provides a link-layer endpoint wrapper that
++// enforces deterministic packet delivery ordering and supports network
++// fault injection for DST mode.
++package deterministic
++
++import (
++	"container/heap"
++	"encoding/binary"
++	"io"
++	"math"
++	"sync"
++)
++
++// RNG is the interface for the deterministic random number generator
++// used for fault injection decisions.
++type RNG interface {
++	Read(b []byte) (int, error)
++}
++
++// Clock is the interface for the virtual clock used to schedule packet
++// delivery timestamps.
++type Clock interface {
++	MonotonicNS() int64
++}
++
++// FaultConfig describes active network faults.
++type FaultConfig struct {
++	// LossRate is the probability [0.0, 1.0] that a packet is dropped.
++	LossRate float64 `json:"loss_rate"`
++
++	// ReorderMaxNS is the maximum reorder delay in nanoseconds.
++	ReorderMaxNS int64 `json:"reorder_max_ns"`
++
++	// DelayNS is the fixed delay added to all packets in nanoseconds.
++	DelayNS int64 `json:"delay_ns"`
++
++	// Partitions is a set of (src, dst) pairs that are fully partitioned.
++	Partitions map[PartitionKey]bool `json:"partitions"`
++}
++
++// PartitionKey identifies a directed partition between two addresses.
++type PartitionKey struct {
++	Src string `json:"src"`
++	Dst string `json:"dst"`
++}
++
++// PendingPacket is a packet waiting for its delivery time.
++type PendingPacket struct {
++	DeliveryTime int64
++	PacketID     uint64
++	// Data holds the raw packet bytes.
++	Data []byte
++}
++
++// PacketQueue implements heap.Interface for delivery-time ordering.
++type PacketQueue []PendingPacket
++
++func (q PacketQueue) Len() int { return len(q) }
++func (q PacketQueue) Less(i, j int) bool {
++	if q[i].DeliveryTime != q[j].DeliveryTime {
++		return q[i].DeliveryTime < q[j].DeliveryTime
++	}
++	return q[i].PacketID < q[j].PacketID
++}
++func (q PacketQueue) Swap(i, j int) { q[i], q[j] = q[j], q[i] }
++func (q *PacketQueue) Push(x interface{}) {
++	*q = append(*q, x.(PendingPacket))
++}
++func (q *PacketQueue) Pop() interface{} {
++	old := *q
++	n := len(old)
++	p := old[n-1]
++	*q = old[:n-1]
++	return p
++}
++
++// DeterministicLinkEndpoint wraps a link endpoint with ordered delivery
++// and fault injection. Packets are held in a priority queue sorted by
++// (deliveryTime, packetID) and only released when the virtual clock
++// reaches their delivery time.
++type DeterministicLinkEndpoint struct {
++	mu sync.Mutex
++
++	// queue is a priority queue of pending packets.
++	queue PacketQueue
++
++	// nextID is the monotonic packet ID counter for tie-breaking.
++	nextID uint64
++
++	// clock is the virtual clock for delivery scheduling.
++	clock Clock
++
++	// rng is the deterministic RNG for fault injection decisions.
++	rng RNG
++
++	// faults is the current fault injection configuration.
++	faults FaultConfig
++
++	// deliver is called to deliver a drained packet to the network stack.
++	deliver func(data []byte)
++}
++
++// New creates a DeterministicLinkEndpoint. The deliver function is called
++// for each packet when its delivery time is reached.
++func New(clock Clock, rng RNG, deliver func(data []byte)) *DeterministicLinkEndpoint {
++	return &DeterministicLinkEndpoint{
++		clock:   clock,
++		rng:     rng,
++		deliver: deliver,
++	}
++}
++
++// SetFaults updates the fault injection configuration. Thread-safe;
++// called by the control socket handler (patch 7).
++func (d *DeterministicLinkEndpoint) SetFaults(cfg FaultConfig) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	d.faults = cfg
++}
++
++// Enqueue enqueues a packet with a deterministic delivery time.
++// Packets may be dropped (loss) or delayed (delay/reorder).
++func (d *DeterministicLinkEndpoint) Enqueue(data []byte) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++
++	// Check loss.
++	if d.faults.LossRate > 0 {
++		var b [8]byte
++		io.ReadFull(d.rng, b[:])
++		r := float64(binary.LittleEndian.Uint64(b[:])) / float64(math.MaxUint64)
++		if r < d.faults.LossRate {
++			return
++		}
++	}
++
++	// Compute delivery time.
++	now := d.clock.MonotonicNS()
++	deliveryTime := now + d.faults.DelayNS
++
++	// Add reorder jitter.
++	if d.faults.ReorderMaxNS > 0 {
++		var b [8]byte
++		io.ReadFull(d.rng, b[:])
++		jitter := int64(binary.LittleEndian.Uint64(b[:]) % uint64(d.faults.ReorderMaxNS))
++		deliveryTime += jitter
++	}
++
++	d.nextID++
++	heap.Push(&d.queue, PendingPacket{
++		DeliveryTime: deliveryTime,
++		PacketID:     d.nextID,
++		Data:         data,
++	})
++}
++
++// DrainReady delivers all packets whose delivery time has been reached.
++// Called by the deterministic scheduler after each clock advance.
++func (d *DeterministicLinkEndpoint) DrainReady() {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++
++	now := d.clock.MonotonicNS()
++	for d.queue.Len() > 0 && d.queue[0].DeliveryTime <= now {
++		p := heap.Pop(&d.queue).(PendingPacket)
++		if d.deliver != nil {
++			d.deliver(p.Data)
++		}
++	}
++}
++
++// PendingCount returns the number of packets waiting for delivery.
++func (d *DeterministicLinkEndpoint) PendingCount() int {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	return d.queue.Len()
++}
+diff --git a/pkg/tcpip/stack/stack.go b/pkg/tcpip/stack/stack.go
+index 6f6dbcc8e..426ae6b66 100644
+--- a/pkg/tcpip/stack/stack.go
++++ b/pkg/tcpip/stack/stack.go
+@@ -2612,3 +2612,16 @@ func (s *Stack) EnableAllNonLoopbackNICs() {
+ 		}
+ 	}
+ }
++
++// NOTE(openthesis): DST mode integration for deterministic network delivery.
++// The dstLinks slice holds all deterministic link endpoints registered with
++// this stack. In DST mode, NICs are wrapped with a DeterministicLinkEndpoint
++// that buffers packets in a priority queue and delivers them when the virtual
++// clock reaches their scheduled delivery time.
++
++// SetNetworkFaults updates fault injection configuration on all deterministic
++// link endpoints. Called by the control socket handler (patch 7).
++// This is a no-op when DST mode is not enabled.
++func (s *Stack) SetNetworkFaults(cfg interface{}) {
++	// Integration point: iterate dstLinks and call SetFaults on each.
++}
+-- 
+2.43.0
+

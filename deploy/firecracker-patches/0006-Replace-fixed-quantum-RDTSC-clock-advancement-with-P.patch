@@ -1,0 +1,71 @@
+From c165470339fa875bb0a9893e613fcd510d91b0ba Mon Sep 17 00:00:00 2001
+From: OpenThesis Build <openthesis@localhost>
+Date: Tue, 7 Apr 2026 12:00:00 +0000
+Subject: [PATCH 6/6]  Replace fixed-quantum RDTSC clock advancement with
+ PMC-delta-driven advancement and preemption schedule injection.
+
+On HLT: drain PMC counter so next RDTSC gets a clean delta.
+On RDTSC exit: virtual_clock += retired_instruction_count_since_last_exit.
+After advance: inject LAPIC timer interrupt at programmed preemption points.
+
+Result: virtual_time = f(instructions_retired) - same model as Antithesis.
+Preemption injection diversifies goroutine interleavings per seed.
+---
+ src/vmm/src/vstate/vcpu.rs | 31 +++++++++++++++++++++++++------
+ 1 file changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/src/vmm/src/vstate/vcpu.rs b/src/vmm/src/vstate/vcpu.rs
+index ec9ad3a6..65d4032e 100644
+--- a/src/vmm/src/vstate/vcpu.rs
++++ b/src/vmm/src/vstate/vcpu.rs
+@@ -474,9 +474,13 @@ impl Vcpu {
+                     Err(e) => { log::debug!("DST: KVM_RUN error: {}", e); }
+                 }
+ 
+-                // HLT: record for idle detection + add idle quantum.
++                // HLT: drain PMC so next RDTSC gets a clean delta, then advance
++                // by rdtsc_quantum (not PMC) -- HLT has ~0 guest instructions.
+                 let dst_hlt_fired = matches!(&emulation_result, Ok(kvm_ioctls::VcpuExit::Hlt));
+                 if dst_hlt_fired {
++                    if let Some(pmc) = &self.kvm_vcpu.dst_pmc {
++                        self.kvm_vcpu.dst_pmc_prev = pmc.read();
++                    }
+                     if let Some(clock) = &self.kvm_vcpu.dst_clock {
+                         clock.advance(clock.rdtsc_quantum());
+                         clock.record_hlt();
+@@ -489,12 +493,27 @@ impl Vcpu {
+                 // Return VirtualClock monotonic_ns as the TSC value to the guest.
+                 if let Ok(kvm_ioctls::VcpuExit::Unsupported(exit_reason)) = &emulation_result {
+                                             if *exit_reason == 38 || *exit_reason == 51 {
+-                        log::warn!("DST: KVM_EXIT_RDTSC intercepted!");
++                        log::debug!("DST: KVM_EXIT_RDTSC");
++                        // Advance virtual clock by retired guest instructions since last exit.
++                        // virtual_time = f(instructions_retired) -- same model as Antithesis.
++                        let pmc_delta = {
++                            if let Some(pmc) = &self.kvm_vcpu.dst_pmc {
++                                let now = pmc.read();
++                                let d = now.saturating_sub(self.kvm_vcpu.dst_pmc_prev);
++                                self.kvm_vcpu.dst_pmc_prev = now;
++                                d.max(1)
++                            } else { 0 }
++                        };
+                         if let Some(clock) = &self.kvm_vcpu.dst_clock {
+-                            // Advance clock per RDTSC: each RDTSC exit ≈ ~1K-10K guest insns.
+-                            // 10us quantum makes timers advance proportionally to how
+-                            // often the guest reads time.
+-                            clock.advance(clock.rdtsc_quantum());
++                            let delta = if pmc_delta > 0 { pmc_delta } else { clock.rdtsc_quantum() };
++                            clock.advance(delta);
++                            if clock.check_preemption() {
++                                if let Err(e) = self.kvm_vcpu.fd.interrupt(0x20) {
++                                    log::debug!("DST: preemption inject failed: {}", e);
++                                } else {
++                                    log::debug!("DST: preemption injected at ns={}", clock.monotonic_ns());
++                                }
++                            }
+                             if clock.target_reached() {
+                                 // Target reached! Return Interrupted to break inner loop.
+                                 // The outer running() loop checks target_reached and self-pauses.
+-- 
+2.43.0
+

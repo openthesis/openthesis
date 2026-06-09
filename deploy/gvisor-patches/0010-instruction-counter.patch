@@ -1,0 +1,219 @@
+From a46a7d048ad8ff7003fa5a866dac1718fe8b5332 Mon Sep 17 00:00:00 2001
+From: OpenThesis <openthesis@openthesis.dev>
+Date: Tue, 10 Mar 2026 00:00:00 +0000
+Subject: [PATCH 10/11] sentry/platform: add perf_event instruction counter for
+ virtual clock advancement
+
+Count retired instructions per task using perf_event_open with
+PERF_COUNT_HW_INSTRUCTIONS. The instruction count feeds into the
+virtual clock (patch 1) to advance time proportionally, giving
+sub-syscall time resolution while remaining fully reproducible
+(instruction counts are deterministic when scheduling is deterministic).
+
+On platforms where hardware performance counters are unavailable
+(e.g., nested VMs, some cloud instances), the counter gracefully
+degrades to a no-op and the virtual clock relies solely on scheduling
+quanta for time advancement.
+
+Requirements:
+  - Linux x86_64 with perf_event support
+  - perf_event_paranoid <= 1 (or CAP_PERFMON)
+  - Not available inside nested VMs without PMU passthrough
+
+Integration notes:
+  - pkg/sentry/kernel/dst_scheduler.go: after a task's scheduling
+    slice completes, read the instruction counter and call
+    VirtualClock.AdvanceInstructions(delta).
+  - pkg/sentry/platform/kvm/machine.go: create an InstructionCounter
+    for each vCPU thread.
+  - pkg/sentry/platform/ptrace/ptrace.go: create an InstructionCounter
+    for each traced thread.
+---
+ pkg/sentry/platform/dst_counter.go | 175 +++++++++++++++++++++++++++++
+ 1 file changed, 175 insertions(+)
+ create mode 100644 pkg/sentry/platform/dst_counter.go
+
+diff --git a/pkg/sentry/platform/dst_counter.go b/pkg/sentry/platform/dst_counter.go
+new file mode 100644
+index 000000000..bcabc1638
+--- /dev/null
++++ b/pkg/sentry/platform/dst_counter.go
+@@ -0,0 +1,175 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++
++package platform
++
++import (
++	"encoding/binary"
++	"fmt"
++	"unsafe"
++
++	"golang.org/x/sys/unix"
++)
++
++// InstructionCounter tracks retired instructions for a task using
++// Linux perf_event. The count is used by the deterministic scheduler
++// to advance the virtual clock proportionally to actual computation.
++//
++// Each InstructionCounter is bound to a specific OS thread (via the
++// pid parameter to perf_event_open). In the KVM platform, this is
++// the vCPU thread; in the ptrace platform, it is the traced thread.
++//
++// When hardware counters are unavailable, the counter reports zero
++// and Available() returns false. The virtual clock falls back to
++// quantum-only advancement in this case.
++type InstructionCounter struct {
++	// fd is the perf_event file descriptor. -1 if unavailable.
++	fd int
++
++	// total is the cumulative instruction count across all slices.
++	total uint64
++
++	// available indicates whether hardware counters are working.
++	available bool
++
++	// tid is the OS thread ID this counter is bound to.
++	tid int
++}
++
++// NewInstructionCounter creates a counter for the given OS thread.
++// If perf_event_open fails (e.g., insufficient permissions, nested VM,
++// no PMU), the counter is created in unavailable mode and all
++// operations are no-ops.
++func NewInstructionCounter(tid int) *InstructionCounter {
++	attr := unix.PerfEventAttr{
++		Type:   unix.PERF_TYPE_HARDWARE,
++		Config: unix.PERF_COUNT_HW_INSTRUCTIONS,
++		Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
++		Bits:   unix.PerfBitDisabled | unix.PerfBitExcludeKernel | unix.PerfBitExcludeHv,
++	}
++
++	fd, err := unix.PerfEventOpen(
++		&attr,
++		tid,  // target thread
++		-1,   // any CPU
++		-1,   // no group
++		unix.PERF_FLAG_FD_CLOEXEC,
++	)
++	if err != nil {
++		return &InstructionCounter{
++			fd:        -1,
++			available: false,
++			tid:       tid,
++		}
++	}
++
++	return &InstructionCounter{
++		fd:        fd,
++		available: true,
++		tid:       tid,
++	}
++}
++
++// Available returns true if hardware instruction counting is working.
++func (ic *InstructionCounter) Available() bool {
++	return ic.available
++}
++
++// Enable starts counting instructions. Call this before a task's
++// scheduling slice begins.
++func (ic *InstructionCounter) Enable() {
++	if !ic.available {
++		return
++	}
++	unix.IoctlSetInt(ic.fd, unix.PERF_EVENT_IOC_ENABLE, 0)
++}
++
++// Disable stops counting and returns the number of instructions
++// retired since the last Enable call. The counter is reset after
++// reading so each slice starts from zero.
++//
++// The returned delta is passed to VirtualClock.AdvanceInstructions()
++// to advance virtual time proportionally.
++func (ic *InstructionCounter) Disable() uint64 {
++	if !ic.available {
++		return 0
++	}
++
++	// Stop counting.
++	unix.IoctlSetInt(ic.fd, unix.PERF_EVENT_IOC_DISABLE, 0)
++
++	// Read the current count.
++	var buf [8]byte
++	n, err := unix.Read(ic.fd, buf[:])
++	if err != nil || n != 8 {
++		return 0
++	}
++	count := binary.LittleEndian.Uint64(buf[:])
++
++	// Compute delta since last read.
++	delta := count - ic.total
++	ic.total = count
++
++	// Reset the counter for the next slice.
++	unix.IoctlSetInt(ic.fd, unix.PERF_EVENT_IOC_RESET, 0)
++	ic.total = 0
++
++	return delta
++}
++
++// Total returns the cumulative instruction count across all slices.
++func (ic *InstructionCounter) Total() uint64 {
++	if !ic.available {
++		return 0
++	}
++	return ic.total
++}
++
++// Close releases the perf_event file descriptor.
++func (ic *InstructionCounter) Close() error {
++	if !ic.available || ic.fd < 0 {
++		return nil
++	}
++	err := unix.Close(ic.fd)
++	ic.fd = -1
++	ic.available = false
++	return err
++}
++
++// String returns a human-readable description of the counter.
++func (ic *InstructionCounter) String() string {
++	if !ic.available {
++		return fmt.Sprintf("InstructionCounter{tid=%d, unavailable}", ic.tid)
++	}
++	return fmt.Sprintf("InstructionCounter{tid=%d, fd=%d, total=%d}", ic.tid, ic.fd, ic.total)
++}
++
++// ============================================================
++// Scheduler Integration
++// ============================================================
++
++// NOTE(openthesis): The deterministic scheduler (patch 3) should
++// integrate the instruction counter as follows:
++//
++// In DeterministicScheduler.Schedule(), around the task execution:
++//
++//   // Before the task runs:
++//   if t.instrCounter != nil {
++//       t.instrCounter.Enable()
++//   }
++//
++//   t.deterministicRun(ds.instrQuanta)
++//
++//   // After the task yields:
++//   if t.instrCounter != nil {
++//       delta := t.instrCounter.Disable()
++//       ds.clock.AdvanceInstructions(delta)
++//   }
++//
++// In Task initialization (when DST mode is enabled):
++//
+-- 
+2.43.0
+

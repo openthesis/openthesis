@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>{{if .Report.ProjectName}}{{.Report.ProjectName}} — {{end}}OpenThesis</title>
+<style>
+:root{
+  --bg:#0f0d11;
+  --s1:#161319;
+  --s2:#1f1b24;
+  --s3:#2a2530;
+  --bd:#3d3642;
+  --bd2:#524a5a;
+  --tx:#e4dfeb;
+  --tx2:#a399b0;
+  --tx3:#9089a0;
+  --ac:#b8a9d4;
+  --ac2:#9d8dbe;
+  --ac-dim:rgba(184,169,212,.10);
+  --ok:#22c55e;
+  --ok-dim:rgba(34,197,94,.12);
+  --err:#ef4444;
+  --err-dim:rgba(239,68,68,.12);
+  --warn:#f59e0b;
+  --warn-dim:rgba(245,158,11,.12);
+  --info:#60a5fa;
+  --info-dim:rgba(96,165,250,.12);
+  --sans:'Red Hat Text',system-ui,-apple-system,sans-serif;
+  --mono:'Red Hat Mono','SFMono-Regular',Consolas,monospace;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:var(--sans);font-size:13px;line-height:1.55;color:var(--tx);background:var(--bg);-webkit-font-smoothing:antialiased}
+a{color:var(--ac);text-decoration:none}
+a:hover{text-decoration:underline;color:var(--tx)}
+code,.mono{font-family:var(--mono);font-size:.8125rem}
+
+.topbar{position:sticky;top:0;z-index:20;height:40px;background:var(--s1);border-bottom:1px solid var(--bd);display:flex;align-items:center;padding:0 16px;gap:8px}
+.tb-logo{width:22px;height:22px;background:var(--ac2);border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:var(--bg);flex-shrink:0;letter-spacing:-.5px}
+.tb-proj{font-size:13px;font-weight:600;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:240px}
+.tb-sep{color:var(--bd2);flex-shrink:0}
+.tb-run{font-family:var(--mono);font-size:11px;color:var(--tx3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:280px}
+.tb-spacer{flex:1}
+.tb-meta{font-size:11px;color:var(--tx3);white-space:nowrap}
+
+.doc{max-width:960px;margin:0 auto;padding:20px 20px 64px}
+
+.badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:9999px;font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;white-space:nowrap}
+.b-ok{background:var(--ok-dim);color:var(--ok);border:1px solid rgba(34,197,94,.2)}
+.b-err{background:var(--err-dim);color:var(--err);border:1px solid rgba(239,68,68,.2)}
+.b-warn{background:var(--warn-dim);color:var(--warn);border:1px solid rgba(245,158,11,.2)}
+.b-info{background:var(--info-dim);color:var(--info);border:1px solid rgba(96,165,250,.2)}
+.b-muted{background:var(--s2);color:var(--tx3);border:1px solid var(--bd)}
+.b-ac{background:var(--ac-dim);color:var(--ac);border:1px solid rgba(184,169,212,.2)}
+
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:16px}
+.metric{background:var(--s1);border:1px solid var(--bd);border-radius:8px;padding:12px 14px}
+.m-val{font-size:24px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums;color:var(--tx);margin-bottom:4px}
+.m-lbl{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--tx3)}
+.metric.err .m-val{color:var(--err)}
+.metric.ok .m-val{color:var(--ok)}
+.metric.ac .m-val{color:var(--ac)}
+
+.section{background:var(--s1);border:1px solid var(--bd);border-radius:8px;margin-bottom:10px;overflow:hidden}
+.sec-hd{display:flex;align-items:center;gap:9px;padding:11px 16px;cursor:pointer;user-select:none}
+.sec-hd:hover{background:var(--s2)}
+.sec-chev{width:14px;height:14px;flex-shrink:0;color:var(--tx3);transition:transform .15s}
+.section.open .sec-chev{transform:rotate(90deg)}
+.sec-title{font-size:13px;font-weight:600;color:var(--tx);flex:1}
+.sec-sum{font-size:11px;color:var(--tx3)}
+.sec-body{display:none;padding:0 16px 16px}
+.section.open .sec-body{display:block}
+
+.viol-list{display:flex;flex-direction:column;gap:6px;margin-top:4px}
+.viol-item{background:var(--s2);border:1px solid var(--bd);border-radius:6px;overflow:hidden}
+.viol-item summary{list-style:none;display:grid;grid-template-columns:16px 1fr auto;align-items:center;gap:10px;padding:10px 14px;cursor:pointer;font-size:12px}
+.viol-item summary::-webkit-details-marker,.viol-item summary::marker{display:none}
+.viol-item summary:hover{background:var(--s3)}
+.vi-chev{font-size:8px;color:var(--tx3);transition:transform .15s;flex-shrink:0}
+details[open] .vi-chev{transform:rotate(90deg)}
+.vi-name{font-family:var(--mono);font-size:11px;color:var(--err);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.vi-msg{color:var(--tx2);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
+.vi-step{font-family:var(--mono);font-size:11px;color:var(--tx3);white-space:nowrap;flex-shrink:0}
+.viol-body{padding:12px 14px;background:var(--bg);border-top:1px solid var(--bd)}
+.vdl{display:grid;grid-template-columns:130px 1fr;gap:4px 12px;font-size:12px}
+.vdl dt{color:var(--tx3);font-weight:500;padding-top:1px}
+.vdl dd{color:var(--tx2);word-break:break-all}
+.cmd-row{margin-top:12px;display:flex;flex-direction:column;gap:4px}
+.cmd-box{background:var(--s1);border:1px solid var(--bd);border-radius:5px;padding:7px 10px;font-family:var(--mono);font-size:11px;color:var(--tx2);cursor:pointer;display:flex;align-items:center;gap:8px;transition:border-color .1s,color .1s}
+.cmd-box:hover{border-color:var(--bd2);color:var(--tx)}
+.cmd-box code{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cmd-box .clbl{font-size:10px;color:var(--tx3);flex-shrink:0;font-family:var(--sans)}
+
+.assert-strips{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-top:12px}
+.assert-strip{background:var(--s2);border:1px solid var(--bd);border-radius:6px;padding:10px 12px;display:flex;align-items:center;gap:10px}
+.asd{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.asd.ok{background:var(--ok);box-shadow:0 0 5px rgba(34,197,94,.35)}
+.asd.err{background:var(--err);box-shadow:0 0 5px rgba(239,68,68,.35)}
+.asd.warn{background:var(--warn)}
+.as-lbl{font-size:11px;color:var(--tx2);flex:1}
+.as-val{font-family:var(--mono);font-size:11px}
+
+.assert-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-top:4px}
+.assert-card{background:var(--s2);border:1px solid var(--bd);border-radius:7px;padding:12px 14px}
+.ac-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.ac-kind{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--tx3)}
+.ac-row{display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:12px;color:var(--tx2);border-bottom:1px solid var(--bd)}
+.ac-row:last-of-type{border-bottom:none}
+.rate-bar{background:var(--bd);border-radius:9999px;height:3px;margin-top:8px;overflow:hidden}
+.rate-fill{height:100%;border-radius:9999px;background:linear-gradient(90deg,var(--ok),#4ade80)}
+.rate-fill.fail{background:linear-gradient(90deg,var(--err),#f87171)}
+.rate-note{font-size:10px;color:var(--tx3);text-align:right;margin-top:4px}
+
+.prop-tabs{display:flex;gap:2px;margin:10px 0}
+.ptab{padding:4px 12px;border-radius:5px;font-size:11px;font-weight:600;color:var(--tx3);cursor:pointer;border:1px solid transparent;user-select:none}
+.ptab:hover{background:var(--s2);color:var(--tx2)}
+.ptab.active{background:var(--ac-dim);color:var(--ac);border-color:rgba(184,169,212,.2)}
+
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{padding:6px 10px;text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--tx3);border-bottom:1px solid var(--bd)}
+td{padding:7px 10px;border-bottom:1px solid var(--bd);vertical-align:top;color:var(--tx2)}
+tr:last-child td{border-bottom:none}
+tbody tr:hover td{background:var(--s2)}
+.tok{color:var(--ok)}
+.terr{color:var(--err)}
+.twarn{color:var(--warn)}
+.tmuted{color:var(--tx3)}
+
+.spark{display:block;width:100%;height:120px;margin-top:8px}
+.spark-leg{display:flex;justify-content:space-between;font-size:10px;color:var(--tx3);margin-top:4px}
+.cov-leg{display:flex;gap:14px;margin-top:10px;font-size:11px}
+.cov-item{display:flex;align-items:center;gap:5px;color:var(--tx2)}
+.cov-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+
+.tree-svg{display:block;max-width:100%;border:1px solid var(--bd);border-radius:6px;background:var(--s2)}
+.tree-scroll{overflow-x:auto;overflow-y:auto;max-height:500px;margin-top:4px}
+.tree-leg{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:11px}
+.tree-item{display:flex;align-items:center;gap:5px;color:var(--tx2)}
+.tldot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+
+.ev-bar{display:flex;gap:6px;margin:10px 0;flex-wrap:wrap;align-items:center}
+.ev-in{flex:1;min-width:140px;background:var(--s2);border:1px solid var(--bd);border-radius:5px;padding:5px 9px;color:var(--tx);font-size:12px;font-family:var(--sans);outline:none}
+.ev-in:focus{border-color:var(--bd2)}
+.ev-sel{background:var(--s2);border:1px solid var(--bd);border-radius:5px;padding:5px 7px;color:var(--tx2);font-size:11px;font-family:var(--sans);outline:none}
+.ev-sel:focus{border-color:var(--bd2)}
+.ev-ct{font-size:11px;color:var(--tx3);white-space:nowrap}
+.type-badge{display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:700;font-family:var(--mono);white-space:nowrap}
+.type-violation{background:var(--err-dim);color:var(--err)}
+.type-assert{background:var(--ac-dim);color:var(--ac)}
+.type-fault{background:var(--warn-dim);color:var(--warn)}
+.type-lifecycle{background:var(--ok-dim);color:var(--ok)}
+.type-coverage{background:var(--info-dim);color:var(--info)}
+.type-other{background:var(--s2);color:var(--tx2)}
+#ev-tbody tr{font-size:11px}
+#ev-tbody td{padding:4px 9px;border-bottom:1px solid var(--bd);vertical-align:top}
+#ev-tbody tr:hover td{background:var(--s2)}
+#ev-tbody tr.hidden{display:none}
+
+.fc-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-top:4px}
+.fc{background:var(--s2);border:1px solid var(--bd);border-radius:7px;padding:12px 14px;text-align:center}
+.fc-n{font-size:28px;font-weight:700;line-height:1;margin-bottom:3px;font-variant-numeric:tabular-nums}
+.fc-l{font-size:10px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;color:var(--tx3)}
+.fc.new .fc-n{color:var(--err)}
+.fc.ongoing .fc-n{color:var(--warn)}
+.fc.resolved .fc-n{color:var(--ok)}
+.fc.rare .fc-n{color:var(--info)}
+
+.empty{text-align:center;padding:32px 20px;color:var(--tx3);font-size:12px}
+.empty strong{color:var(--tx2);display:block;margin-bottom:4px}
+.tbl-scroll{overflow-x:auto}
+.mt12{margin-top:12px}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="tb-logo">OT</div>
+  <span class="tb-proj">{{if .Report.ProjectName}}{{.Report.ProjectName}}{{else}}OpenThesis{{end}}</span>
+  <span class="tb-sep">/</span>
+  <span class="tb-run">{{.Report.RunID}}</span>
+  <div class="tb-spacer"></div>
+  {{if .Report.Summary.BugsFound}}
+    <span class="badge b-err">{{.Report.Summary.BugsFound}} violation{{if ne .Report.Summary.BugsFound 1}}s{{end}}</span>
+  {{else}}
+    <span class="badge b-ok">clean</span>
+  {{end}}
+  <span class="tb-meta">seed&nbsp;<span class="mono">{{.Report.Seed}}</span>&nbsp;·&nbsp;{{formatDuration .Report.Duration}}</span>
+</div>
+
+<div class="doc">
+
+  <div class="metrics">
+    <div class="metric {{if .Report.Summary.BugsFound}}err{{else}}ok{{end}}">
+      <div class="m-val">{{.Report.Summary.BugsFound}}</div>
+      <div class="m-lbl">Violations</div>
+    </div>
+    <div class="metric ac">
+      <div class="m-val">{{.Report.Summary.TotalStates}}</div>
+      <div class="m-lbl">States</div>
+    </div>
+    <div class="metric ac">
+      <div class="m-val">{{.Report.Coverage.TotalEdges}}</div>
+      <div class="m-lbl">Edges</div>
+    </div>
+    <div class="metric">
+      <div class="m-val">{{formatDuration .Report.Duration}}</div>
+      <div class="m-lbl">Duration</div>
+    </div>
+    <div class="metric">
+      <div class="m-val">{{.Report.Summary.MaxDepth}}</div>
+      <div class="m-lbl">Max depth</div>
+    </div>
+  </div>
+
+  <div class="section {{if .Report.Summary.BugsFound}}open{{end}}" id="s-viol">
+    <div class="sec-hd" onclick="toggleSec('s-viol')">
+      <svg class="sec-chev" viewBox="0 0 10 10" fill="currentColor"><path d="M3 1l5 4-5 4V1z"/></svg>
+      <span class="sec-title">Violations</span>
+      <div style="flex:1"></div>
+      {{if .Report.Summary.BugsFound}}
+        <span class="badge b-err">{{.Report.Summary.BugsFound}}</span>
+      {{else}}
+        <span class="badge b-ok">none</span>
+      {{end}}
+    </div>
+    <div class="sec-body">
+      {{if .Report.Violations}}
+      <div class="viol-list">
+        {{range $i,$v := .Report.Violations}}
+        {{$meta := vmeta $.ViolationMeta $i}}
+        <details class="viol-item">
+          <summary>
+            <span class="vi-chev">▶</span>
+            <span>
+              <div class="vi-name">
+                {{$v.Property}}
+                {{if $meta.IsRare}}<span class="badge b-info" style="margin-left:6px;font-size:9px">rare</span>{{end}}
+              </div>
+              <div class="vi-msg">{{$v.Message}}</div>
+            </span>
+            <span class="vi-step">step {{$v.Step}}</span>
+          </summary>
+          <div class="viol-body">
+            {{if $meta.ProbSVG}}
+            <div style="margin-bottom:14px">
+              <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--tx3);margin-bottom:4px">
+                Causality - probability over time
+                <span style="font-weight:400;color:var(--tx3);margin-left:6px">amber line = inception point (when bug became likely)</span>
+              </div>
+              {{$meta.ProbSVG}}
+              <div style="font-size:10px;color:var(--tx3);margin-top:4px">
+                Run <code>openthesis causality --artifact {{$v.ArtifactDir}}</code> for detailed analysis
+              </div>
+            </div>
+            {{end}}
+            <dl class="vdl">
+              <dt>Property</dt><dd class="mono terr">{{$v.Property}}</dd>
+              <dt>Message</dt><dd>{{$v.Message}}</dd>
+              <dt>Seed</dt><dd class="mono">{{$v.Seed}}</dd>
+              <dt>Step</dt><dd class="mono">{{$v.Step}}</dd>
+              <dt>Snapshot</dt><dd class="mono">#{{$v.SnapshotID}}</dd>
+              {{if $v.PathDepth}}<dt>Path depth</dt><dd class="mono">{{$v.PathDepth}}</dd>{{end}}
+              {{if $v.PathIDs}}<dt>Path</dt><dd class="mono">{{joinUint64 $v.PathIDs " → "}}</dd>{{end}}
+              {{if $v.ActiveFaults}}
+                <dt>Active faults</dt>
+                <dd>{{range $v.ActiveFaults}}<span class="badge b-warn" style="margin-right:3px">{{.}}</span>{{end}}</dd>
+              {{end}}
+              {{if $v.Details}}
+                <dt>Context</dt>
+                <dd>{{range $k,$val := $v.Details}}<span class="mono tmuted">{{$k}}</span>=<span class="mono" style="margin-right:8px">{{$val}}</span>{{end}}</dd>
+              {{end}}
+              {{if $v.Artifact}}
+                {{if $v.Artifact.Backend}}<dt>Backend</dt><dd class="mono">{{$v.Artifact.Backend}}</dd>{{end}}
+                {{if $v.Artifact.FaultSchedule}}<dt>Fault schedule</dt><dd class="mono" style="word-break:break-all">{{$v.Artifact.FaultSchedule}}</dd>{{end}}
+                {{if $v.Artifact.BurstInsns}}<dt>Burst insns</dt><dd class="mono">{{$v.Artifact.BurstInsns}}</dd>{{end}}
+                {{if $v.Artifact.ReplayFile}}<dt>Replay file</dt><dd class="mono">{{$v.Artifact.ReplayFile}}</dd>{{end}}
+              {{end}}
+              {{if $meta.IsRare}}
+                <dt>Rarity</dt><dd><span class="badge b-info">rare - &lt;33% encounter probability</span></dd>
+              {{end}}
+            </dl>
+            {{if $v.ArtifactDir}}
+            <div class="cmd-row">
+              <div class="cmd-box" onclick="copyCmd(this)"><code>openthesis replay --artifact {{$v.ArtifactDir}}{{if $v.Artifact}}{{if $v.Artifact.Backend}} --backend {{$v.Artifact.Backend}}{{end}}{{end}}</code><span class="clbl">copy</span></div>
+              <div class="cmd-box" onclick="copyCmd(this)"><code>openthesis shrink --artifact {{$v.ArtifactDir}}{{if $v.Artifact}}{{if $v.Artifact.Backend}} --backend {{$v.Artifact.Backend}}{{end}}{{end}}</code><span class="clbl">copy</span></div>
+              <div class="cmd-box" onclick="copyCmd(this)"><code>openthesis branch --artifact {{$v.ArtifactDir}}{{if $v.Artifact}}{{if $v.Artifact.Backend}} --backend {{$v.Artifact.Backend}}{{end}}{{end}}</code><span class="clbl">copy</span></div>
+              <div class="cmd-box" onclick="copyCmd(this)"><code>openthesis causality --artifact {{$v.ArtifactDir}}{{if $v.Artifact}}{{if $v.Artifact.Backend}} --backend {{$v.Artifact.Backend}}{{end}}{{end}}</code><span class="clbl">copy</span></div>
+              <div class="cmd-box" onclick="copyCmd(this)"><code>openthesis exec --artifact {{$v.ArtifactDir}} --cmd "ps aux"</code><span class="clbl">copy</span></div>
+              <div class="cmd-box" onclick="copyCmd(this)"><code>openthesis debug --artifact {{$v.ArtifactDir}}</code><span class="clbl">copy</span></div>
+            </div>
+            {{end}}
+          </div>
+        </details>
+        {{end}}
+      </div>
+      {{else}}
+      <div class="empty">
+        <strong class="tok">No violations found</strong>
+        All always-assertions held across {{.Report.Summary.TotalStates}} states.
+      </div>
+      {{end}}
+      <div class="assert-strips">
+        {{with .Report.Assertions.Always}}
+        <div class="assert-strip">
+          <div class="asd {{if gt .Failed 0}}err{{else}}ok{{end}}"></div>
+          <span class="as-lbl">Always</span>
+          {{if gt .Failed 0}}
+            <span class="as-val terr">{{.Failed}} failing</span>
+          {{else}}
+            <span class="as-val tok">{{.Passed}} holding</span>
+          {{end}}
+        </div>
+        {{end}}
+        {{with .Report.Assertions.Sometimes}}
+        <div class="assert-strip">
+          <div class="asd {{if gt .Passed 0}}ok{{else}}warn{{end}}"></div>
+          <span class="as-lbl">Sometimes</span>
+          {{if gt .Passed 0}}
+            <span class="as-val tok">{{.Passed}} observed</span>
+          {{else}}
+            <span class="as-val twarn">unobserved</span>
+          {{end}}
+        </div>
+        {{end}}
+        {{with .Report.Assertions.Reachable}}
+        <div class="assert-strip">
+          <div class="asd {{if gt .Passed 0}}ok{{else}}warn{{end}}"></div>
+          <span class="as-lbl">Reachable</span>
+          {{if gt .Passed 0}}
+            <span class="as-val tok">{{.Passed}} reached</span>
+          {{else}}
+            <span class="as-val twarn">not reached</span>
+          {{end}}
+        </div>
+        {{end}}
+      </div>
+    </div>
+  </div>
+
+  <div class="section open" id="s-assert">
+    <div class="sec-hd" onclick="toggleSec('s-assert')">
+      <svg class="sec-chev" viewBox="0 0 10 10" fill="currentColor"><path d="M3 1l5 4-5 4V1z"/></svg>
+      <span class="sec-title">Assertions</span>
+      <div style="flex:1"></div>
+      <span class="sec-sum">{{totalAssertions .Report.Assertions}} total</span>
+    </div>
+    <div class="sec-body">
+      <div class="assert-cards">
+        {{with .Report.Assertions.Always}}
+        <div class="assert-card">
+          <div class="ac-hd">
+            <span class="ac-kind">Always</span>
+            <span class="badge {{if gt .Failed 0}}b-err{{else}}b-ok{{end}}">{{if gt .Failed 0}}{{.Failed}} failing{{else}}all holding{{end}}</span>
+          </div>
+          <div class="ac-row"><span>Total</span><span class="mono">{{.Total}}</span></div>
+          <div class="ac-row"><span>Passed</span><span class="mono tok">{{.Passed}}</span></div>
+          <div class="ac-row"><span>Failed</span><span class="mono {{if gt .Failed 0}}terr{{end}}">{{.Failed}}</span></div>
+          <div class="rate-bar"><div class="rate-fill {{if gt .Failed 0}}fail{{end}}" style="width:{{passRate .Passed .Total}}"></div></div>
+          <div class="rate-note">{{passRate .Passed .Total}} pass rate</div>
+        </div>
+        {{end}}
+        {{with .Report.Assertions.Sometimes}}
+        <div class="assert-card">
+          <div class="ac-hd">
+            <span class="ac-kind">Sometimes</span>
+            <span class="badge {{if eq .Passed 0}}b-warn{{else}}b-ok{{end}}">{{if eq .Passed 0}}unobserved{{else}}observed{{end}}</span>
+          </div>
+          <div class="ac-row"><span>Total</span><span class="mono">{{.Total}}</span></div>
+          <div class="ac-row"><span>Observed</span><span class="mono tok">{{.Passed}}</span></div>
+          <div class="ac-row"><span>Not observed</span><span class="mono {{if gt .Failed 0}}terr{{end}}">{{.Failed}}</span></div>
+          <div class="rate-bar"><div class="rate-fill" style="width:{{passRate .Passed .Total}}"></div></div>
+          <div class="rate-note">{{passRate .Passed .Total}} observed</div>
+        </div>
+        {{end}}
+        {{with .Report.Assertions.Reachable}}
+        <div class="assert-card">
+          <div class="ac-hd">
+            <span class="ac-kind">Reachable</span>
+            <span class="badge {{if gt .Passed 0}}b-ok{{else}}b-warn{{end}}">{{if gt .Passed 0}}reached{{else}}not reached{{end}}</span>
+          </div>
+          <div class="ac-row"><span>Total</span><span class="mono">{{.Total}}</span></div>
+          <div class="ac-row"><span>Reached</span><span class="mono tok">{{.Passed}}</span></div>
+          <div class="ac-row"><span>Missed</span><span class="mono {{if gt .Failed 0}}terr{{end}}">{{.Failed}}</span></div>
+          <div class="rate-bar"><div class="rate-fill" style="width:{{passRate .Passed .Total}}"></div></div>
+          <div class="rate-note">{{passRate .Passed .Total}} reached</div>
+        </div>
+        {{end}}
+      </div>
+    </div>
+  </div>
+
+  {{if .Report.Properties}}
+  <div class="section" id="s-props">
+    <div class="sec-hd" onclick="toggleSec('s-props')">
+      <svg class="sec-chev" viewBox="0 0 10 10" fill="currentColor"><path d="M3 1l5 4-5 4V1z"/></svg>
+      <span class="sec-title">Properties</span>
+      <div style="flex:1"></div>
+      <span class="sec-sum">{{totalProperties .Report.Properties}}</span>
+    </div>
+    <div class="sec-body">
+      <div class="prop-tabs">
+        <div class="ptab active" onclick="filterProps(this,'')">All</div>
+        <div class="ptab" onclick="filterProps(this,'passing')">Passing</div>
+        <div class="ptab" onclick="filterProps(this,'failing')">Failing</div>
+      </div>
+      <div class="tbl-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Property</th>
+            <th style="width:80px">Type</th>
+            <th style="width:56px">Total</th>
+            <th style="width:56px">Passed</th>
+            <th style="width:56px">Failed</th>
+            <th style="width:70px">Status</th>
+          </tr>
+        </thead>
+        <tbody id="prop-tbody">
+          {{range .Report.Properties}}{{range .Properties}}
+          <tr data-ps="{{if gt .Failed 0}}failing{{else if gt .Passed 0}}passing{{else}}pending{{end}}">
+            <td class="tmuted" style="font-size:11px;word-break:break-word">{{.Message}}</td>
+            <td class="mono tmuted">{{.AssertType}}</td>
+            <td class="mono">{{.Total}}</td>
+            <td class="mono {{if gt .Passed 0}}tok{{end}}">{{.Passed}}</td>
+            <td class="mono {{if gt .Failed 0}}terr{{end}}">{{.Failed}}</td>
+            <td>
+              {{if gt .Failed 0}}<span class="badge b-err">failing</span>
+              {{else if gt .Passed 0}}<span class="badge b-ok">passing</span>
+              {{else}}<span class="badge b-muted">pending</span>{{end}}
+            </td>
+          </tr>
+          {{end}}{{end}}
+        </tbody>
+      </table>
+      </div>
+    </div>
+  </div>
+  {{end}}
+
+  <div class="section open" id="s-cov">
+    <div class="sec-hd" onclick="toggleSec('s-cov')">
+      <svg class="sec-chev" viewBox="0 0 10 10" fill="currentColor"><path d="M3 1l5 4-5 4V1z"/></svg>
+      <span class="sec-title">Coverage</span>
+      <div style="flex:1"></div>
+      <span class="sec-sum">{{.Report.Coverage.TotalEdges}} edges · {{pct .Report.Coverage.Percentage}}</span>
+    </div>
+    <div class="sec-body">
+      <div class="metrics mt12" style="grid-template-columns:repeat(3,1fr)">
+        <div class="metric ac">
+          <div class="m-val">{{.Report.Coverage.TotalEdges}}</div>
+          <div class="m-lbl">Total edges</div>
+        </div>
+        <div class="metric">
+          <div class="m-val">{{.Report.Coverage.NewEdges}}</div>
+          <div class="m-lbl">New edges</div>
+        </div>
+        <div class="metric">
+          <div class="m-val">{{pct .Report.Coverage.Percentage}}</div>
+          <div class="m-lbl">Coverage</div>
+        </div>
+      </div>
+      {{if .Report.Coverage.TimeSeries}}
+        {{.CoverageSVG}}
+        <div class="spark-leg">
+          <span>step 0</span>
+          <span>step {{lastStep .Report.Coverage.TimeSeries}}</span>
+        </div>
+        <div class="cov-leg">
+          <div class="cov-item"><div class="cov-dot" style="background:var(--ac)"></div>edges</div>
+          {{if .Report.Violations}}<div class="cov-item"><div class="cov-dot" style="background:var(--err)"></div>violation</div>{{end}}
+        </div>
+      {{else}}
+        <div class="empty">No timeline data captured.</div>
+      {{end}}
+    </div>
+  </div>
+
+  <div class="section" id="s-tree">
+    <div class="sec-hd" onclick="toggleSec('s-tree')">
+      <svg class="sec-chev" viewBox="0 0 10 10" fill="currentColor"><path d="M3 1l5 4-5 4V1z"/></svg>
+      <span class="sec-title">Multiverse map</span>
+      <div style="flex:1"></div>
+      {{if .Report.Tree}}<span class="sec-sum">{{len .Report.Tree}} nodes</span>{{end}}
+    </div>
+    <div class="sec-body">
+      {{if .TreeSVG}}
+      <div class="tree-scroll">{{.TreeSVG}}</div>
+      <div class="tree-leg">
+        <div class="tree-item"><div class="tldot" style="background:var(--ok)"></div>new edges</div>
+        <div class="tree-item"><div class="tldot" style="background:var(--warn)"></div>faults injected</div>
+        <div class="tree-item"><div class="tldot" style="background:var(--ac2)"></div>new edges + faults</div>
+        <div class="tree-item"><div class="tldot" style="background:var(--err)"></div>violation</div>
+        <div class="tree-item"><div class="tldot" style="background:var(--s3);border:1px solid var(--bd)"></div>default</div>
+      </div>
+      <p style="font-size:11px;color:var(--tx3);margin-top:8px">Hover a node for details. Root is leftmost; depth increases left to right.</p>
+      {{else}}
+      <div class="empty">No snapshot tree for this run.</div>
+      {{end}}
+    </div>
+  </div>
+
+  {{if .HasEvents}}
+  <div class="section" id="s-events">
+    <div class="sec-hd" onclick="toggleSec('s-events')">
+      <svg class="sec-chev" viewBox="0 0 10 10" fill="currentColor"><path d="M3 1l5 4-5 4V1z"/></svg>
+      <span class="sec-title">Events</span>
+      <div style="flex:1"></div>
+      <span class="sec-sum b-muted badge" id="ev-badge">{{len .Events}} embedded</span>
+    </div>
+    <div class="sec-body">
+      <div class="ev-bar">
+        <input class="ev-in" id="ev-search" type="search" placeholder="Search type, container, payload...">
+        <select class="ev-sel" id="ev-type">
+          <option value="">All types</option>
+          <option value="sdk_violation">violation</option>
+          <option value="sdk_assert">assert</option>
+          <option value="fault_applied">fault</option>
+          <option value="lifecycle">lifecycle</option>
+          <option value="coverage_burst">coverage</option>
+        </select>
+        <select class="ev-sel" id="ev-container">
+          <option value="">All containers</option>
+        </select>
+        <span class="ev-ct" id="ev-count"></span>
+      </div>
+      <div class="tbl-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:50px">Step</th>
+            <th style="width:64px">VTime</th>
+            <th style="width:92px">Type</th>
+            <th style="width:80px">Container</th>
+            <th>Details</th>
+          </tr>
+        </thead>
+        <tbody id="ev-tbody">
+          {{range .Events}}
+          <tr data-type="{{.Type}}" data-container="{{.Container}}" data-text="{{.Type}} {{.Container}} {{payloadText .Payload}}">
+            <td class="mono tmuted">{{.Step}}</td>
+            <td class="mono tmuted">{{formatVTime .VTimeNS}}</td>
+            <td><span class="type-badge {{typeBadgeClass .Type}}">{{.Type}}</span></td>
+            <td class="mono tmuted">{{if .Container}}{{.Container}}{{else}}<span class="tmuted">-</span>{{end}}</td>
+            <td class="mono" style="font-size:10px;word-break:break-all">{{payloadText .Payload}}</td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+      </div>
+      <p style="font-size:10px;color:var(--tx3);margin-top:8px" id="ev-note">Showing embedded events (up to 300). Run <code>openthesis serve</code> for live search.</p>
+    </div>
+  </div>
+  {{end}}
+
+  {{if .Report.Findings}}
+  <div class="section" id="s-findings">
+    <div class="sec-hd" onclick="toggleSec('s-findings')">
+      <svg class="sec-chev" viewBox="0 0 10 10" fill="currentColor"><path d="M3 1l5 4-5 4V1z"/></svg>
+      <span class="sec-title">Findings diff</span>
+      <div style="flex:1"></div>
+      <span class="sec-sum">{{len .Report.Findings}} tracked</span>
+    </div>
+    <div class="sec-body">
+      <div class="fc-grid">
+        <div class="fc new"><div class="fc-n">{{countFindings .Report.Findings "new"}}</div><div class="fc-l">New</div></div>
+        <div class="fc ongoing"><div class="fc-n">{{countFindings .Report.Findings "ongoing"}}</div><div class="fc-l">Ongoing</div></div>
+        <div class="fc resolved"><div class="fc-n">{{countFindings .Report.Findings "resolved"}}</div><div class="fc-l">Resolved</div></div>
+        <div class="fc rare"><div class="fc-n">{{countFindings .Report.Findings "rare"}}</div><div class="fc-l">Rare</div></div>
+      </div>
+    </div>
+  </div>
+  {{end}}
+
+  <div class="section" id="s-env">
+    <div class="sec-hd" onclick="toggleSec('s-env')">
+      <svg class="sec-chev" viewBox="0 0 10 10" fill="currentColor"><path d="M3 1l5 4-5 4V1z"/></svg>
+      <span class="sec-title">Environment</span>
+      <div style="flex:1"></div>
+      <span class="sec-sum">seed {{.Report.Seed}} · {{formatDuration .Report.Duration}}</span>
+    </div>
+    <div class="sec-body">
+      <div class="tbl-scroll mt12">
+      <table>
+        <thead><tr><th style="width:160px">Field</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Run ID</td><td class="mono">{{.Report.RunID}}</td></tr>
+          <tr><td>Seed</td><td class="mono">{{.Report.Seed}}</td></tr>
+          <tr><td>Duration</td><td class="mono">{{formatDuration .Report.Duration}}</td></tr>
+          {{if .Report.ProjectName}}<tr><td>Project</td><td>{{.Report.ProjectName}}</td></tr>{{end}}
+          {{if .Report.Description}}<tr><td>Description</td><td>{{.Report.Description}}</td></tr>{{end}}
+          {{if .Backend}}<tr><td>Backend</td><td class="mono">{{.Backend}}</td></tr>{{end}}
+          <tr><td>Created at</td><td class="mono">{{.Report.CreatedAt.Format "2006-01-02T15:04:05Z"}}</td></tr>
+        </tbody>
+      </table>
+      </div>
+      {{if .Report.Environment.Containers}}
+      <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--tx3);margin:16px 0 8px">Nodes</div>
+      <div class="tbl-scroll">
+      <table>
+        <thead><tr><th>Name</th><th>Image / binary</th><th>Tag</th></tr></thead>
+        <tbody>
+          {{range .Report.Environment.Containers}}
+          <tr>
+            <td class="mono">{{.Name}}</td>
+            <td class="mono tmuted">{{.Image}}</td>
+            <td class="mono tmuted">{{if .Tag}}{{.Tag}}{{else}}&mdash;{{end}}</td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+      </div>
+      {{end}}
+    </div>
+  </div>
+
+</div>
+
+<script>
+(function(){
+  function toggleSec(id){
+    document.getElementById(id).classList.toggle('open');
+  }
+  window.toggleSec = toggleSec;
+
+  window.copyCmd = function(el){
+    var code = el.querySelector('code');
+    if(!code) return;
+    if(navigator.clipboard) navigator.clipboard.writeText(code.textContent);
+    var lbl = el.querySelector('.clbl');
+    if(lbl){ lbl.textContent='copied!'; setTimeout(function(){ lbl.textContent='copy'; },1200); }
+  };
+
+  window.filterProps = function(tab, status){
+    document.querySelectorAll('.ptab').forEach(function(t){ t.classList.remove('active'); });
+    tab.classList.add('active');
+    document.querySelectorAll('#prop-tbody tr').forEach(function(r){
+      r.style.display = (!status || r.dataset.ps===status) ? '' : 'none';
+    });
+  };
+
+  var evRows = document.querySelectorAll('#ev-tbody tr');
+  var evSearch = document.getElementById('ev-search');
+  var evType = document.getElementById('ev-type');
+  var evCont = document.getElementById('ev-container');
+  var evCount = document.getElementById('ev-count');
+  var evBadge = document.getElementById('ev-badge');
+
+  if(evSearch && evRows.length){
+    var containers = {};
+    evRows.forEach(function(r){ var c=r.dataset.container; if(c) containers[c]=1; });
+    Object.keys(containers).sort().forEach(function(c){
+      var o=document.createElement('option'); o.value=c; o.textContent=c; evCont.appendChild(o);
+    });
+    function filterEv(){
+      var q=evSearch.value.toLowerCase(), typ=evType.value, con=evCont.value, vis=0;
+      evRows.forEach(function(r){
+        var show=true;
+        if(typ && r.dataset.type!==typ) show=false;
+        if(con && r.dataset.container!==con) show=false;
+        if(q && r.dataset.text.toLowerCase().indexOf(q)===-1) show=false;
+        r.classList.toggle('hidden',!show);
+        if(show) vis++;
+      });
+      if(evCount) evCount.textContent=vis+'/'+evRows.length;
+    }
+    evSearch.addEventListener('input',filterEv);
+    evType.addEventListener('change',filterEv);
+    evCont.addEventListener('change',filterEv);
+    filterEv();
+  }
+
+  fetch('/api/events?limit=1').then(function(r){
+    if(!r.ok) return;
+    if(evBadge) evBadge.textContent='live';
+    var note=document.getElementById('ev-note');
+    if(note) note.textContent='Live mode active.';
+  }).catch(function(){});
+})();
+</script>
+</body>
+</html>

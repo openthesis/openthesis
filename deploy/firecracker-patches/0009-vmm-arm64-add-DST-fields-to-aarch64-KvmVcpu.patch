@@ -1,0 +1,76 @@
+# ARM64-only: applied when building for aarch64-unknown-linux-musl
+From 0000000000000000000000000000000000000009 Mon Sep 17 00:00:00 2001
+From: OpenThesis Build <openthesis@localhost>
+Date: Fri, 6 Jun 2026 00:00:00 +0000
+Subject: [PATCH 9/10] vmm: arm64 - add DST fields to aarch64 KvmVcpu
+
+Add the DST instrumentation fields to the ARM64 KvmVcpu struct and its
+constructor, mirroring the x86_64 additions from patches 0002 and 0005.
+
+Fields added:
+  dst_clock     - shared VirtualClock (Arc) for burst-boundary detection
+  dst_pmc       - instruction counter via perf_event_open (PMC)
+  dst_seed      - per-vCPU deterministic seed (from OPENTHESIS_DST_SEED)
+  dst_pmc_prev  - previous PMC reading for delta computation
+  dst_timer_offset - last CNTVOFF_EL2 offset written to KVM; used for
+                     logging and idempotency checks in arm_timer.rs
+
+Fields intentionally omitted (x86_64-specific):
+  dst_rdtsc_exiting - RDTSC exit cap is x86_64-only; ARM64 uses
+                      CNTVOFF_EL2 injection instead (patch 0010)
+  dst_boot_tsc_base - TSC is x86_64-only; ARM64 boot timing uses
+                      the physical counter CNTPCT_EL0 (patch 0010)
+---
+ src/vmm/src/arch/aarch64/vcpu.rs | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/src/vmm/src/arch/aarch64/vcpu.rs b/src/vmm/src/arch/aarch64/vcpu.rs
+index 000000001..000000002 100644
+--- a/src/vmm/src/arch/aarch64/vcpu.rs
++++ b/src/vmm/src/arch/aarch64/vcpu.rs
+@@ -1,3 +1,13 @@
++// DST fields for aarch64 KvmVcpu mirror the x86_64 additions (patches 0002/0005)
++// with the following differences:
++//   - No dst_rdtsc_exiting: ARM64 time is injected via CNTVOFF_EL2, not RDTSC exits.
++//   - No dst_boot_tsc_base: ARM64 boot timing uses CNTPCT_EL0 (physical counter).
++//   - dst_timer_offset added: tracks the last CNTVOFF_EL2 value written to KVM,
++//     enabling logging and idempotency checks in the arm_timer injection path.
++// The ctrl socket (patch 0005) "set-time" handler calls
++// crate::dst::arm_timer::set_virtual_timer() on ARM64 instead of set_rdtsc_response().
++
+ // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ // SPDX-License-Identifier: Apache-2.0
+
+@@ -74,6 +84,12 @@ pub struct KvmVcpu {
+     pub peripherals: Peripherals,
+     /// MPIDR register value.
+     pub mpidr: u64,
++    // DST fields
++    pub dst_clock: Option<std::sync::Arc<crate::dst::clock::VirtualClock>>,
++    pub dst_pmc: Option<crate::dst::pmc::InstructionCounter>,
++    pub dst_seed: Option<u64>,
++    pub dst_pmc_prev: u64,
++    /// Last CNTVOFF_EL2 offset written via KVM_SET_ONE_REG. 0 = not yet set.
++    pub dst_timer_offset: u64,
+ }
+
+ /// Vcpu peripherals
+@@ -88,6 +104,11 @@ impl KvmVcpu {
+     pub fn new(index: u8, vm: &Vm) -> Result<Self, KvmVcpuError> {
+         let kvm_vcpu = vm.fd().create_vcpu(index.into()).map_err(KvmVcpuError::VcpuFd)?;
+         Ok(KvmVcpu {
+-            index,
+-            fd: kvm_vcpu,
+-            peripherals: Default::default(),
+-            mpidr: 0,
++            index,
++            fd: kvm_vcpu,
++            peripherals: Default::default(),
++            mpidr: 0,
++            dst_clock: None,
++            dst_pmc: None,
++            dst_seed: None,
++            dst_pmc_prev: 0,
++            dst_timer_offset: 0,
+         })
+     }

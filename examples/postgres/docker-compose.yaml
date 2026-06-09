@@ -1,0 +1,33 @@
+services:
+  postgres:
+    container_name: postgres
+    hostname: postgres
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: dst
+      OPENTHESIS_OUTPUT_DIR: /tmp/openthesis-output
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+
+  tests:
+    container_name: tests
+    hostname: tests
+    image: openthesis-postgres-tests:latest
+    environment:
+      OPENTHESIS_OUTPUT_DIR: /tmp/openthesis-output
+      OPENTHESIS_SDK_LOCAL_OUTPUT: /tmp/openthesis-output/sdk.jsonl
+      PGHOST: postgres
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: dst
+    depends_on:
+      postgres: { condition: service_healthy }
+    volumes:
+      - ./tests:/opt/openthesis/test
+    command: sleep infinity

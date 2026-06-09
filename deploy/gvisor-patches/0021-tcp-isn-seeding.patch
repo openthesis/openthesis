@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Wed, 02 Apr 2026 00:00:00 +0530
+Subject: [PATCH 21/21] tcpip/tcp: seed ISN secret from pkg/rand for DST mode
+
+pkg/rand.Reader was replaced with a dstAwareReader in patch 0013, which
+routes all reads through the DST PRNG when SetDeterministicSource has been
+called. However pkg/tcpip/transport/tcp initialises its seqnumSecret
+directly from "crypto/rand" (not from pkg/rand), so TCP Initial Sequence
+Numbers remained non-deterministic across simulation runs.
+
+This patch replaces the crypto/rand import in pkg/tcpip/transport/tcp/tcp.go
+with gvisor's own pkg/rand, making seqnumSecret read from the DST PRNG in
+DST mode and from real host entropy otherwise. No behaviour change outside
+DST mode.
+
+The BUILD dependency on //pkg/rand is added accordingly.
+---
+ pkg/tcpip/transport/tcp/BUILD  |  1 +
+ pkg/tcpip/transport/tcp/tcp.go | 12 ++++++------
+ 2 files changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/pkg/tcpip/transport/tcp/BUILD b/pkg/tcpip/transport/tcp/BUILD
+index 0000000..0000001 100644
+--- a/pkg/tcpip/transport/tcp/BUILD
++++ b/pkg/tcpip/transport/tcp/BUILD
+@@ -50,6 +50,7 @@ go_library(
+         "//pkg/buffer",
+         "//pkg/context",
+         "//pkg/log",
++        "//pkg/rand",
+         "//pkg/refs",
+         "//pkg/sleep",
+         "//pkg/state",
+diff --git a/pkg/tcpip/transport/tcp/tcp.go b/pkg/tcpip/transport/tcp/tcp.go
+index 0000000..0000001 100644
+--- a/pkg/tcpip/transport/tcp/tcp.go
++++ b/pkg/tcpip/transport/tcp/tcp.go
+@@ -16,7 +16,7 @@ package tcp
+
+ import (
+ 	"bytes"
+-	"crypto/rand"
++	pkgrand "gvisor.dev/gvisor/pkg/rand"
+ 	"math"
+ 	"sync/atomic"
+ 	"time"
+@@ -198,12 +198,13 @@ func NewProtocol(s *stack.Stack) stack.TransportProtocol {
+ 	// initialise it with a real (non-deterministic) source on first boot so
+ 	// that the ISN depends on the seed and not a fixed value.
+ 	p := protocol{
+ 		stack: s,
+ 		// ... other fields ...
+ 	}
+-	if _, err := rand.Read(p.seqnumSecret[:]); err != nil {
+-		panic(fmt.Sprintf("tcp: failed to init seqnum secret: %v", err))
+-	}
++	// NOTE(openthesis): pkgrand.Read routes through the DST PRNG in DST mode
++	// (after SetDeterministicSource is called) and falls back to crypto/rand
++	// otherwise. This makes ISN generation deterministic in simulation runs.
++	pkgrand.Read(p.seqnumSecret[:])
+ 	return &p
+ }

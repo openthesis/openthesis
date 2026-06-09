@@ -1,0 +1,66 @@
+{
+  "name": "postgres-dst",
+  "description": "PostgreSQL 16 single-node DST — explores data durability under fault injection. synchronous_commit=off means WAL may not be flushed before crash ack, causing write loss after SIGKILL + crash recovery.",
+  "nodes": [
+    {
+      "name": "pg-primary",
+      "binary": "./pg-server",
+      "args": [],
+      "env": {},
+      "ready_probe": ":5432",
+      "fault_probe": ":5432",
+      "daemon": true
+    },
+    {
+      "name": "pg-driver",
+      "binary": "./pg-driver",
+      "args": ["loop"],
+      "env": {},
+      "daemon": false
+    }
+  ],
+  "test_dir": "./tests",
+  "sut_image": "./sut.ext4",
+  "kernel_path": "/var/lib/openthesis/kernel/vmlinux",
+  "setup_timeout": "3m",
+  "exploration": {
+    "strategy": "coverage",
+    "max_states": 5000,
+    "max_depth": 50,
+    "branch_factor": 8,
+    "seed": 42,
+    "burst_min_ns": 100000000,
+    "burst_max_ns": 500000000,
+    "burst_timeout_secs": 20,
+    "use_wall_clock_bursts": true
+  },
+  "faults": {
+    "enabled": true,
+    "swarm_testing": true,
+    "adaptive_faults": true,
+    "network": {
+      "drop_rate": 0.05,
+      "delay_min": "5ms",
+      "delay_max": "100ms",
+      "crash_rate": 0.0,
+      "partition_rate": 0.03,
+      "directed_partition_ratio": 0.3,
+      "throttle_rate": 0.03,
+      "throttle_min_kbps": 512,
+      "throttle_max_kbps": 8192,
+      "reorder_rate": 0.03,
+      "reorder_correlation": 25
+    },
+    "node": {
+      "hang_rate": 0.03,
+      "hang_min": "500ms",
+      "hang_max": "3s",
+      "terminate_rate": 0.015,
+      "clock_jitter_max": "50ms",
+      "pause_rate": 0.03,
+      "pause_min": "200ms",
+      "pause_max": "2s"
+    }
+  },
+  "duration": "5m"
+}

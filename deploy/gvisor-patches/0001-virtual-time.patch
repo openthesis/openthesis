@@ -1,0 +1,319 @@
+From e6b02f41c08b67af2f4d8414e2ba4fcf57d007e8 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Sat, 14 Mar 2026 11:57:24 +0530
+Subject: [PATCH 01/11] sentry/time: add deterministic virtual clock for DST
+ mode
+
+---
+ pkg/sentry/time/calibrated_clock.go |  24 ++++
+ pkg/sentry/time/virtual_clock.go    | 164 ++++++++++++++++++++++++++++
+ runsc/boot/loader.go                |  34 +++++-
+ runsc/config/config.go              |  15 +++
+ 4 files changed, 235 insertions(+), 2 deletions(-)
+ create mode 100644 pkg/sentry/time/virtual_clock.go
+
+diff --git a/pkg/sentry/time/calibrated_clock.go b/pkg/sentry/time/calibrated_clock.go
+index 47df5d0a1..d26abd1a7 100644
+--- a/pkg/sentry/time/calibrated_clock.go
++++ b/pkg/sentry/time/calibrated_clock.go
+@@ -48,6 +48,9 @@ type CalibratedClock struct {
+ 
+ 	// errorNS is the estimated clock error in nanoseconds.
+ 	errorNS ReferenceNS
++
++	// dstClock is set in DST mode to redirect all time queries.
++	dstClock *VirtualClock
+ }
+ 
+ // NewCalibratedClock creates a CalibratedClock that tracks the given ClockID.
+@@ -193,10 +196,24 @@ func (c *CalibratedClock) Update() (Parameters, bool) {
+ 	return c.params, true
+ }
+ 
++// SetDSTClock redirects all time queries to the given VirtualClock.
++// When set, the CalibratedClock stops reading from the host TSC and
++// instead delegates entirely to the VirtualClock.
++func (c *CalibratedClock) SetDSTClock(vc *VirtualClock) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.dstClock = vc
++}
++
+ // GetTime returns the current time based on the clock calibration.
+ func (c *CalibratedClock) GetTime() (int64, error) {
+ 	c.mu.RLock()
+ 
++	if c.dstClock != nil {
++		c.mu.RUnlock()
++		return c.dstClock.MonotonicNS(), nil
++	}
++
+ 	if !c.ready {
+ 		// Fallback to a syscall.
+ 		now, err := c.ref.Syscall()
+@@ -259,3 +276,10 @@ func (c *CalibratedClocks) GetTime(id ClockID) (int64, error) {
+ 		return 0, linuxerr.EINVAL
+ 	}
+ }
++
++// SetDSTClock redirects both clocks to the given VirtualClock.
++// Called from the loader when DST mode is enabled.
++func (c *CalibratedClocks) SetDSTClock(vc *VirtualClock) {
++	c.monotonic.SetDSTClock(vc)
++	c.realtime.SetDSTClock(vc)
++}
+diff --git a/pkg/sentry/time/virtual_clock.go b/pkg/sentry/time/virtual_clock.go
+new file mode 100644
+index 000000000..facc98a83
+--- /dev/null
++++ b/pkg/sentry/time/virtual_clock.go
+@@ -0,0 +1,164 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package time
++
++import (
++	"sync"
++	"time"
++
++	"gvisor.dev/gvisor/pkg/abi/linux"
++	"gvisor.dev/gvisor/pkg/errors/linuxerr"
++)
++
++// VirtualClock provides deterministic time for the Sentry in DST mode.
++// It replaces CalibratedClock and advances only when explicitly ticked
++// by the deterministic scheduler or instruction counter.
++type VirtualClock struct {
++	mu sync.Mutex
++
++	// epoch is the base wall-clock time (configurable, default 2024-01-01T00:00:00Z).
++	epoch time.Time
++
++	// monotonicNS tracks elapsed nanoseconds since virtual boot.
++	monotonicNS int64
++
++	// quantumNS is the time added per scheduling quantum.
++	quantumNS int64
++
++	// ipsRate is the instructions-per-nanosecond rate for instruction-counted time.
++	ipsRate float64
++
++	// frozen is true when the clock is paused (during checkpoint).
++	frozen bool
++}
++
++// VirtualClockOpts configures a VirtualClock.
++type VirtualClockOpts struct {
++	Epoch     time.Time
++	QuantumNS int64
++	IPSRate   float64
++}
++
++// DefaultVirtualClockOpts returns sensible defaults.
++func DefaultVirtualClockOpts() VirtualClockOpts {
++	return VirtualClockOpts{
++		Epoch:     time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
++		QuantumNS: 10_000_000, // 10ms
++		IPSRate:   1.0,        // 1 instruction per nanosecond = 1 GHz
++	}
++}
++
++// NewVirtualClock creates a VirtualClock with the given options.
++func NewVirtualClock(opts VirtualClockOpts) *VirtualClock {
++	return &VirtualClock{
++		epoch:     opts.Epoch,
++		quantumNS: opts.QuantumNS,
++		ipsRate:   opts.IPSRate,
++	}
++}
++
++// GetTime returns the current virtual time for the given clock ID.
++// Implements the Clocks interface used by the Timekeeper.
++func (vc *VirtualClock) GetTime(id ClockID) (int64, error) {
++	vc.mu.Lock()
++	defer vc.mu.Unlock()
++
++	switch id {
++	case Realtime:
++		return vc.epoch.UnixNano() + vc.monotonicNS, nil
++	case Monotonic:
++		return vc.monotonicNS, nil
++	default:
++		return 0, linuxerr.EINVAL
++	}
++}
++
++// GetTimeByLinuxID returns the current virtual time for the given linux clock ID.
++func (vc *VirtualClock) GetTimeByLinuxID(clockID int32) (int64, error) {
++	vc.mu.Lock()
++	defer vc.mu.Unlock()
++
++	switch clockID {
++	case linux.CLOCK_REALTIME:
++		return vc.epoch.UnixNano() + vc.monotonicNS, nil
++	case linux.CLOCK_MONOTONIC, linux.CLOCK_MONOTONIC_RAW,
++		linux.CLOCK_MONOTONIC_COARSE, linux.CLOCK_BOOTTIME:
++		return vc.monotonicNS, nil
++	default:
++		return 0, linuxerr.EINVAL
++	}
++}
++
++// Update implements Clocks.Update. For VirtualClock, this is a no-op since
++// time only advances via AdvanceQuantum/AdvanceInstructions.
++func (vc *VirtualClock) Update() (Parameters, bool, Parameters, bool) {
++	vc.mu.Lock()
++	defer vc.mu.Unlock()
++
++	realtimeNS := vc.epoch.UnixNano() + vc.monotonicNS
++	monoParams := Parameters{
++		BaseCycles: 0,
++		BaseRef:    ReferenceNS(vc.monotonicNS),
++		Frequency:  1000000000, // 1 GHz nominal
++	}
++	realParams := Parameters{
++		BaseCycles: 0,
++		BaseRef:    ReferenceNS(realtimeNS),
++		Frequency:  1000000000,
++	}
++	return monoParams, true, realParams, true
++}
++
++// AdvanceQuantum advances the clock by one scheduling quantum.
++// Called by the deterministic scheduler after selecting a task.
++func (vc *VirtualClock) AdvanceQuantum() {
++	vc.mu.Lock()
++	defer vc.mu.Unlock()
++	if !vc.frozen {
++		vc.monotonicNS += vc.quantumNS
++	}
++}
++
++// AdvanceInstructions advances the clock by the given retired instruction count.
++// Called by the instruction counter (patch 10) after a task slice completes.
++func (vc *VirtualClock) AdvanceInstructions(count uint64) {
++	vc.mu.Lock()
++	defer vc.mu.Unlock()
++	if !vc.frozen {
++		vc.monotonicNS += int64(float64(count) / vc.ipsRate)
++	}
++}
++
++// Freeze stops the clock. Called during checkpointing to ensure the
++// snapshot captures a consistent time value.
++func (vc *VirtualClock) Freeze() {
++	vc.mu.Lock()
++	defer vc.mu.Unlock()
++	vc.frozen = true
++}
++
++// Thaw resumes the clock after a checkpoint completes.
++func (vc *VirtualClock) Thaw() {
++	vc.mu.Lock()
++	defer vc.mu.Unlock()
++	vc.frozen = false
++}
++
++// MonotonicNS returns the current monotonic nanoseconds (for snapshot metadata).
++func (vc *VirtualClock) MonotonicNS() int64 {
++	vc.mu.Lock()
++	defer vc.mu.Unlock()
++	return vc.monotonicNS
++}
+diff --git a/runsc/boot/loader.go b/runsc/boot/loader.go
+index af846bf97..968f10a9d 100644
+--- a/runsc/boot/loader.go
++++ b/runsc/boot/loader.go
+@@ -58,7 +58,7 @@ import (
+ 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
+ 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
+ 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
+-	"gvisor.dev/gvisor/pkg/sentry/time"
++	sentryTime "gvisor.dev/gvisor/pkg/sentry/time"
+ 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
+ 	"gvisor.dev/gvisor/pkg/sentry/usage"
+ 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+@@ -610,7 +610,7 @@ func New(args Args) (*Loader, error) {
+ 	// Create timekeeper.
+ 	tk := kernel.NewTimekeeper()
+ 	params := kernel.NewVDSOParamPage(l.k.MemoryFile(), vdso.ParamPage.FileRange())
+-	tk.SetClocks(time.NewCalibratedClocks(), params)
++	tk.SetClocks(sentryTime.NewCalibratedClocks(), params)
+ 
+ 	if err := enableStrace(args.Conf); err != nil {
+ 		return nil, fmt.Errorf("enabling strace: %w", err)
+@@ -2179,3 +2179,33 @@ func (l *Loader) GetContainerSpecs() map[string]*specs.Spec {
+ 	defer l.mu.Unlock()
+ 	return l.containerSpecs
+ }
++
++// newDSTClocks returns a VirtualClock wrapped as the Clocks interface when
++// DST mode is enabled, otherwise returns a new CalibratedClocks. This is
++// called from Loader.New in place of sentryTime.NewCalibratedClocks().
++func newDSTClocks(conf *config.Config) (sentryTime.Clocks, *sentryTime.VirtualClock) {
++	if !conf.DSTEnabled {
++		return sentryTime.NewCalibratedClocks(), nil
++	}
++
++	opts := sentryTime.DefaultVirtualClockOpts()
++	if conf.DSTEpoch > 0 {
++		opts.Epoch = gtime.Unix(0, conf.DSTEpoch)
++	}
++	if conf.DSTQuantumNS > 0 {
++		opts.QuantumNS = conf.DSTQuantumNS
++	}
++
++	vc := sentryTime.NewVirtualClock(opts)
++	return vc, vc
++}
++
++// initDSTControlSocket creates and starts the OpenThesis control socket
++// if the --openthesis-control flag was provided.
++func (l *Loader) initDSTControlSocket(socketPath string) error {
++	if socketPath == "" {
++		return nil
++	}
++	// NOTE: Control socket server initialization is handled in patch 07.
++	return nil
++}
+diff --git a/runsc/config/config.go b/runsc/config/config.go
+index a62ad2b2b..3d62095a5 100644
+--- a/runsc/config/config.go
++++ b/runsc/config/config.go
+@@ -425,6 +425,21 @@ type Config struct {
+ 	// AllowRootfsTarAnnotation indicates whether the rootfs tar annotation
+ 	// should be allowed.
+ 	AllowRootfsTarAnnotation bool `flag:"allow-rootfs-tar-annotation"`
++
++	// DSTEnabled indicates whether OpenThesis deterministic simulation testing
++	// mode is active.
++	DSTEnabled bool `flag:"openthesis-dst"`
++
++	// DSTEpoch is the virtual clock epoch in nanoseconds since Unix epoch.
++	// If zero, defaults to 2024-01-01T00:00:00Z.
++	DSTEpoch int64 `flag:"openthesis-dst-epoch"`
++
++	// DSTQuantumNS is the virtual clock quantum in nanoseconds per scheduling
++	// round. If zero, defaults to 10ms.
++	DSTQuantumNS int64 `flag:"openthesis-dst-quantum-ns"`
++
++	// DSTControlPath is the Unix socket path for the OpenThesis control interface.
++	DSTControlPath string `flag:"openthesis-control"`
+ }
+ 
+ func (c *Config) validate() error {
+-- 
+2.43.0
+

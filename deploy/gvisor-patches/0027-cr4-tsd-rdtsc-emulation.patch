@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: burntcarrot <aadhav.n1@gmail.com>
+Date: Wed, 02 Apr 2026 00:00:00 +0530
+Subject: [PATCH 27/28] kvm: set CR4.TSD and emulate RDTSC in #GP handler for DST mode
+
+Background:
+Patch 0025 attempted CPU_BASED_RDTSC_EXITING to intercept RDTSC.
+This doesn't work: KVM handles RDTSC VMEXITs internally in the kernel
+module (kvm_emulate_rdtsc_delay) and never forwards them to the gVisor
+sentry. The VMEXIT never reaches bluepillFault/handleVMExit.
+
+Correct approach — CR4.TSD:
+  CR4.TSD (bit 2, Time Stamp Disable) causes RDTSC and RDTSCP in ring 3
+  to raise #GP(0) instead of executing. The sentry handles #GP via
+  bluepillFault. We can check if the faulting instruction is RDTSC (0F 31,
+  2 bytes) or RDTSCP (0F 01 F9, 3 bytes) and emulate them by returning
+  virtual TSC, then advance RIP and return.
+
+  RDTSC in ring 0 (sentry code itself) still executes natively — CR4.TSD
+  only affects ring 3. The sentry's own TSC reads are irrelevant for guest
+  determinism because the guest never sees them.
+
+Removes CPU_BASED_RDTSC_EXITING from patch 0025:
+  That approach was wrong; this replaces it. The ExitRdtsc/ExitRdtscp
+  constants from patch 0025 are retained for documentation, but the
+  VMEXIT dispatch added there is removed here (the VMEXITs never fire).
+
+Changes:
+1. pkg/sentry/platform/kvm/machine_amd64.go — initArchState()
+   - Remove CPU_BASED_RDTSC_EXITING from VMCS (was ineffective anyway)
+   - Set CR4.TSD (bit 2) in GUEST_CR4 VMCS field when dstGetTimeNS != nil
+
+2. pkg/sentry/platform/kvm/bluepill_fault.go (or machine_amd64_unsafe.go)
+   - In the #GP handler, after existing checks:
+     Read 2–3 bytes at guest RIP.
+     If bytes == [0x0F, 0x31]: RDTSC — emulate, advance RIP+2.
+     If bytes == [0x0F, 0x01, 0xF9]: RDTSCP — emulate, advance RIP+3.
+   - Emulation: tscTicks = dstGetTimeNS() * tscFreqKHz / 1_000_000
+     Set RAX = tscTicks & 0xFFFFFFFF, RDX = tscTicks >> 32
+     For RDTSCP: RCX = 0 (fixed IA32_TSC_AUX for determinism)
+
+3. Remove the VMEXIT dispatch block added by patch 0025 (dead code).
+---
+ pkg/sentry/platform/kvm/machine_amd64.go        | 28 +++++++-----
+ pkg/sentry/platform/kvm/machine_amd64_unsafe.go | 50 +++++++++++++++++++++
+ 2 files changed, 63 insertions(+), 15 deletions(-)
+
+diff --git a/pkg/sentry/platform/kvm/machine_amd64.go b/pkg/sentry/platform/kvm/machine_amd64.go
+index 0000000..0000001 100644
+--- a/pkg/sentry/platform/kvm/machine_amd64.go
++++ b/pkg/sentry/platform/kvm/machine_amd64.go
+@@ -122,23 +122,21 @@ func (m *machine) initArchState() error {
+ 	// ... existing KVM setup code ...
+
+-	// Enable RDTSC_EXITING so every RDTSC/RDTSCP instruction causes a VMEXIT.
+-	// (NOTE from patch 0027: this does NOT work — KVM handles RDTSC VMEXITs
+-	// internally and never forwards them to the sentry. Removed.)
+-	//
+-	// Instead, use CR4.TSD which causes #GP(0) in ring 3 on RDTSC/RDTSCP.
+-	// The sentry's #GP handler in machine_amd64_unsafe.go emulates the
+-	// instruction by reading dstGetTimeNS() and synthesizing virtual TSC.
++	// Set CR4.TSD (bit 2) to cause RDTSC/RDTSCP in ring 3 to trap via #GP.
++	// The sentry's #GP handler (handleGuestPF / bluepillFault) detects the
++	// RDTSC/RDTSCP opcodes and emulates them using the virtual clock.
++	//
++	// This is required for determinism: without it, ring-3 code reads host
++	// TSC directly, diverging across runs.
++	//
++	// Note: CPU_BASED_RDTSC_EXITING is NOT used here. KVM handles those
++	// VMEXITs internally (kvm_emulate_rdtsc_delay) and the sentry never sees
++	// them. CR4.TSD is the correct interception point for user-mode RDTSC.
+ 	if m.dstGetTimeNS != nil {
+-		const cpuBasedRdtscExiting = 1 << 12
+-		controls, _ := vmcs.Read(vmcs.CPU_BASED_VM_EXEC_CONTROL)
+-		// Remove the incorrect RDTSC_EXITING bit if it was set.
+-		vmcs.Write(vmcs.CPU_BASED_VM_EXEC_CONTROL, controls &^ cpuBasedRdtscExiting)
+-
+-		// Set CR4.TSD to force user-mode RDTSC through #GP.
++		// bit 2 = CR4.TSD (Time Stamp Disable)
+ 		cr4, _ := vmcs.Read(vmcs.GUEST_CR4)
+ 		vmcs.Write(vmcs.GUEST_CR4, cr4|(1<<2))
+ 	}
+
+ 	return nil
+ }
+
+@@ -163,11 +167,5 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo)
+ 	// ... existing SwitchToUser code ...
+
+-	// REMOVED (patch 0027): RDTSC/RDTSCP VMEXIT handling.
+-	// CPU_BASED_RDTSC_EXITING VMEXITs are handled by KVM internally and
+-	// never reach this dispatch. The emulation is done in bluepillFault
+-	// #GP handling instead (machine_amd64_unsafe.go).
+-	case ring0.ExitRdtsc, ring0.ExitRdtscp:
+-		// Dead code — KVM never forwards these VMEXITs to the sentry.
+-		// Kept as a no-op to avoid breaking the switch structure from patch 0025.
+-		fallthrough
++	// (RDTSC/RDTSCP are handled via #GP from CR4.TSD, not VMEXIT — see
++	// bluepillFault in machine_amd64_unsafe.go)
+
+diff --git a/pkg/sentry/platform/kvm/machine_amd64_unsafe.go b/pkg/sentry/platform/kvm/machine_amd64_unsafe.go
+index 0000000..0000001 100644
+--- a/pkg/sentry/platform/kvm/machine_amd64_unsafe.go
++++ b/pkg/sentry/platform/kvm/machine_amd64_unsafe.go
+@@ -1,6 +1,9 @@
+ package kvm
+
+ import (
++	"unsafe"
++
++	"golang.org/x/sys/unix"
+ 	"gvisor.dev/gvisor/pkg/sentry/platform/kvm/vmcs"
+ )
+
+@@ -40,5 +43,64 @@ func (c *vCPU) setTSCToVirtual(virtualNS uint64) {
+ 	// (existing implementation from patch 0014 — sets KVM MSR_IA32_TSC)
+ }
+
++// handleRDTSCFault is called from bluepillFault when the fault reason is
++// ExceptionGP and DST mode is active. It checks if the faulting instruction
++// is RDTSC (0F 31) or RDTSCP (0F 01 F9) and emulates it using the virtual
++// clock if so. Returns true if the fault was handled, false if the caller
++// should fall through to normal #GP handling.
++//
++// The emulation:
++//   tscTicks = dstGetTimeNS() * tscFreqKHz / 1_000_000
++//   RAX = low 32 bits, RDX = high 32 bits (RDTSC architectural contract)
++//   RCX = 0 for RDTSCP (IA32_TSC_AUX — fixed for determinism)
++//   RIP advances past the instruction (2 bytes RDTSC, 3 bytes RDTSCP)
++//
++// Safety: we read guest memory at the faulting RIP. The sentry address space
++// and the guest address space are the same in gVisor ring0 KVM, so a normal
++// pointer dereference at the guest RIP is safe for ring-3 instruction bytes.
++func (c *vCPU) handleRDTSCFault() bool {
++	if c.machine.dstGetTimeNS == nil {
++		return false
++	}
++
++	regs := c.Registers()
++	rip := regs.Rip
++
++	// Read up to 3 bytes at the faulting instruction address.
++	// The memory is part of the guest userspace mapping.
++	var buf [3]byte
++	p := (*[3]byte)(unsafe.Pointer(uintptr(rip)))
++	buf = *p // may fault if RIP is unmapped — caller's SIGBUS handling covers this
++
++	switch {
++	case buf[0] == 0x0F && buf[1] == 0x31: // RDTSC
++		virtualNS := c.machine.dstGetTimeNS()
++		tscTicks := uint64(virtualNS) * c.machine.tscFreqKHz / 1_000_000
++		regs.Rax = tscTicks & 0xFFFFFFFF
++		regs.Rdx = tscTicks >> 32
++		regs.Rip += 2
++		return true
+
++	case buf[0] == 0x0F && buf[1] == 0x01 && buf[2] == 0xF9: // RDTSCP
++		virtualNS := c.machine.dstGetTimeNS()
++		tscTicks := uint64(virtualNS) * c.machine.tscFreqKHz / 1_000_000
++		regs.Rax = tscTicks & 0xFFFFFFFF
++		regs.Rdx = tscTicks >> 32
++		regs.Rcx = 0 // IA32_TSC_AUX: fixed 0 for determinism
++		regs.Rip += 3
++		return true
++	}
++
++	return false
++}
++
++// Integration point: in bluepillFault, inside the ExceptionGP case, add:
++//
++//   if c.handleRDTSCFault() {
++//       return // fault handled; resume guest at updated RIP
++//   }
++//   // ... existing #GP handling (inject GP to guest) ...
++
++// Suppress unused import if unix is not used elsewhere in this file.
++var _ = unix.SIGBUS

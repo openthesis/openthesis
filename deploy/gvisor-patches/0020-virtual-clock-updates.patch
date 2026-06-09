@@ -1,0 +1,49 @@
+diff --git a/pkg/sentry/time/clocks.go b/pkg/sentry/time/clocks.go
+index 837e86094..42219e4ab 100644
+--- a/pkg/sentry/time/clocks.go
++++ b/pkg/sentry/time/clocks.go
+@@ -29,3 +29,12 @@ type Clocks interface {
+ 	// Realtime.
+ 	GetTime(c ClockID) (int64, error)
+ }
++
++// MutableClock is an optional extension of Clocks for clocks whose time can
++// be set directly. Implemented by VirtualClock in DST mode; not supported by
++// the production CalibratedClocks.
++type MutableClock interface {
++	Clocks
++	// SetTime sets the clock to an absolute nanosecond value.
++	SetTime(id ClockID, nanos int64)
++}
+diff --git a/pkg/sentry/time/virtual_clock.go b/pkg/sentry/time/virtual_clock.go
+index 386dab529..42851c29f 100644
+--- a/pkg/sentry/time/virtual_clock.go
++++ b/pkg/sentry/time/virtual_clock.go
+@@ -123,7 +123,7 @@ func (vc *VirtualClock) Update() (Parameters, bool, Parameters, bool) {
+ 		BaseRef:    ReferenceNS(realtimeNS),
+ 		Frequency:  1000000000,
+ 	}
+-	return monoParams, true, realParams, true
++	return monoParams, false, realParams, false
+ }
+ 
+ // AdvanceQuantum advances the clock by one scheduling quantum.
+@@ -167,4 +167,19 @@ func (vc *VirtualClock) MonotonicNS() int64 {
+ 	defer vc.mu.Unlock()
+ 	return vc.monotonicNS
+ }
++
++// SetTime sets the virtual clock to an absolute nanosecond value for the
++// given clock ID. Used by the DST control socket to synchronize time
++// across snapshot restore and external time injection.
++func (vc *VirtualClock) SetTime(id ClockID, nanos int64) {
++	vc.mu.Lock()
++	defer vc.mu.Unlock()
++	switch id {
++	case Monotonic:
++		vc.monotonicNS = nanos
++	case Realtime:
++		// Adjust epoch so that epoch+monotonicNS == nanos.
++		vc.epoch = time.Unix(0, nanos-vc.monotonicNS)
++	}
++}

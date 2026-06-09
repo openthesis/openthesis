@@ -1,0 +1,222 @@
+diff --git a/pkg/sentry/kernel/BUILD b/pkg/sentry/kernel/BUILD
+index 6e29c5dae..eab629ac6 100644
+--- a/pkg/sentry/kernel/BUILD
++++ b/pkg/sentry/kernel/BUILD
+@@ -349,6 +349,7 @@ go_library(
+         "//pkg/context",
+         "//pkg/coverage",
+         "//pkg/cpuid",
++        "//pkg/rand",
+         "//pkg/devutil",
+         "//pkg/errors",
+         "//pkg/errors/linuxerr",
+diff --git a/pkg/sentry/kernel/dst_init.go b/pkg/sentry/kernel/dst_init.go
+index 6e4f3daa2..93d796e78 100644
+--- a/pkg/sentry/kernel/dst_init.go
++++ b/pkg/sentry/kernel/dst_init.go
+@@ -15,6 +15,7 @@
+ package kernel
+ 
+ import (
++	pkgrand "gvisor.dev/gvisor/pkg/rand"
+ 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+ )
+ 
+@@ -38,6 +39,12 @@ func (k *Kernel) InitDST(
+ 	k.dstSnapshotTree = st
+ 	k.dstSyscallFaultTable = sft
+ 
++	// Wire the DST RNG into pkg/rand so that all sentry-internal rand.Read()
++	// and rand.Reader calls (including TCP ISN generation, ephemeral port
++	// allocation, and mmap layout randomization) use the deterministic PRNG.
++	// This must be called while the sentry is still single-threaded.
++	pkgrand.SetDeterministicSource(rng)
++
+ 	// Start the scheduler loop in the background. It blocks until tasks become
+ 	// runnable, so starting it before container creation is harmless.
+ 	go sched.Schedule()
+diff --git a/pkg/sentry/kernel/dst_rng.go b/pkg/sentry/kernel/dst_rng.go
+index ae838f9fa..7964d0a80 100644
+--- a/pkg/sentry/kernel/dst_rng.go
++++ b/pkg/sentry/kernel/dst_rng.go
+@@ -81,3 +81,20 @@ func (r *DeterministicRNG) Read(b []byte) (int, error) {
+ 	}
+ 	return n, nil
+ }
++
++// Reseed resets the RNG to a new initial seed. Call this before forking a
++// guest process to ensure the child explores a different random path.
++func (r *DeterministicRNG) Reseed(seed uint64) {
++	r.mu.Lock()
++	r.seed = seed
++	// Re-expand seed to 256 bits using SplitMix64 (same as NewDeterministicRNG).
++	s := seed
++	for i := 0; i < 4; i++ {
++		s += 0x9e3779b97f4a7c15
++		s = (s ^ (s >> 30)) * 0xbf58476d1ce4e5b9
++		s = (s ^ (s >> 27)) * 0x94d049bb133111eb
++		r.state[i] = s ^ (s >> 31)
++	}
++	r.counter = 0
++	r.mu.Unlock()
++}
+diff --git a/pkg/sentry/kernel/dst_scheduler.go b/pkg/sentry/kernel/dst_scheduler.go
+index 77ff92304..d33f66f9c 100644
+--- a/pkg/sentry/kernel/dst_scheduler.go
++++ b/pkg/sentry/kernel/dst_scheduler.go
+@@ -39,6 +39,11 @@ type DeterministicScheduler struct {
+ 	// current is the currently executing task (nil if idle).
+ 	current *Task
+ 
++	// currentBlocking is set when the current task has entered a blocking
++	// wait (via TaskBlocking). The scheduler will not re-queue it after the
++	// quantum; MakeRunnable() will re-add it when the event fires.
++	currentBlocking bool
++
+ 	// clock is the virtual clock to advance on each quantum.
+ 	clock *sentryTime.VirtualClock
+ 
+@@ -125,10 +130,12 @@ func (ds *DeterministicScheduler) Schedule() {
+ 		ds.mu.Lock()
+ 		ds.current = nil
+ 
+-		// If the task still has a running resume channel, re-queue it.
+-		if t.deterministicResume != nil {
++		// Re-queue the task only if it didn't enter a blocking wait.
++		// If it called TaskBlocking(), MakeRunnable() will re-add it when woken.
++		if t.deterministicResume != nil && !ds.currentBlocking {
+ 			heap.Push(&ds.runnable, t)
+ 		}
++		ds.currentBlocking = false
+ 		ds.mu.Unlock()
+ 	}
+ }
+@@ -142,6 +149,18 @@ func (ds *DeterministicScheduler) MakeRunnable(t *Task) {
+ 	ds.notify()
+ }
+ 
++// TaskBlocking is called when the current task is about to enter a blocking
++// wait (e.g., waiting for I/O or a futex). The scheduler marks the task as
++// blocking so it won't be re-queued after the current quantum ends.
++// MakeRunnable() will re-add the task when the blocking event fires.
++func (ds *DeterministicScheduler) TaskBlocking(t *Task) {
++	ds.mu.Lock()
++	defer ds.mu.Unlock()
++	if ds.current == t {
++		ds.currentBlocking = true
++	}
++}
++
+ // Pause freezes the scheduler. All tasks stop at their next yield
+ // point. The virtual clock is also frozen. Used before checkpointing.
+ func (ds *DeterministicScheduler) Pause() {
+@@ -195,3 +214,16 @@ func (ds *DeterministicScheduler) notify() {
+ 	default:
+ 	}
+ }
++
++// AdvanceQuantum advances the virtual clock by stepNS nanoseconds and
++// signals the scheduler loop. Called by the DST control socket during
++// run-burst to drive time forward in fixed increments.
++func (ds *DeterministicScheduler) AdvanceQuantum(stepNS uint64) {
++	ds.mu.Lock()
++	clk := ds.clock
++	ds.mu.Unlock()
++	if clk != nil {
++		clk.AdvanceInstructions(stepNS) // reuse: 1 ns per "instruction" at 1 GHz
++	}
++	ds.notify()
++}
+diff --git a/runsc/dst/BUILD b/runsc/dst/BUILD
+index 1be8cd028..4dae66400 100644
+--- a/runsc/dst/BUILD
++++ b/runsc/dst/BUILD
+@@ -3,6 +3,7 @@ load("//tools:defs.bzl", "go_library")
+ go_library(
+     name = "dst",
+     srcs = ["ctrl.go"],
++    stateify = False,
+     visibility = ["//runsc:__subpackages__"],
+     deps = [
+         "//pkg/log",
+diff --git a/runsc/dst/ctrl.go b/runsc/dst/ctrl.go
+index ff722bab5..1d937d8a2 100644
+--- a/runsc/dst/ctrl.go
++++ b/runsc/dst/ctrl.go
+@@ -21,6 +21,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"net"
++	"time"
+ 	"os"
+ 	"path/filepath"
+ 
+@@ -236,4 +237,69 @@ func (cs *ControlServer) dispatch(req controlRequest) controlResponse {
+ 		}
+ 
+ 	case "set-time":
++		nanos := req.Nanos
++		if nanos == 0 {
++			nanos = req.NS
++		}
++		if vc, ok := cs.kernel.VirtualClock().(sentryTime.MutableClock); ok {
++			vc.SetTime(sentryTime.Monotonic, nanos)
++			return controlResponse{OK: true, VirtualTimeNS: nanos}
++		}
++		return controlResponse{OK: false, Error: "virtual clock not initialized"}
++
++	case "set-seed":
++		if rng := cs.kernel.DeterministicRNG(); rng != nil {
++			rng.Reseed(req.Seed)
++			return controlResponse{OK: true, RNGSeed: req.Seed}
++		}
++		return controlResponse{OK: false, Error: "deterministic RNG not initialized"}
++
++	case "advance-time":
++		if vc, ok := cs.kernel.VirtualClock().(sentryTime.MutableClock); ok {
++			cur, _ := vc.GetTime(sentryTime.Monotonic)
++			newTime := cur + int64(req.DeltaNS)
++			vc.SetTime(sentryTime.Monotonic, newTime)
++			return controlResponse{OK: true, VirtualTimeNS: newTime}
++		}
++		return controlResponse{OK: false, Error: "virtual clock not initialized"}
++
++	case "run-burst":
++		sched := cs.kernel.DeterministicScheduler()
++		if sched == nil {
++			return controlResponse{OK: false, Error: "deterministic scheduler not initialized"}
++		}
++		insns := req.Instructions
++		if insns == 0 {
++			insns = 5000000
++		}
++		totalNS := insns * 128
++		sched.Resume()
++		// Give ptraced tasks real wall-clock time to make progress.
++		// The DeterministicScheduler does not yet use task channels for ptrace threads,
++		// so we sleep proportionally to virtual time (1ms per 10ms virtual, min 50ms).
++		wallNS := totalNS / 10
++		if wallNS < 50_000_000 {
++			wallNS = 50_000_000
++		}
++		time.Sleep(time.Duration(wallNS))
++		quantumNS := uint64(10000000)
++		for remaining := totalNS; remaining > 0; {
++			step := quantumNS
++			if remaining < step {
++				step = remaining
++			}
++			sched.AdvanceQuantum(step)
++			remaining -= step
++		}
++		sched.Pause()
++		var vt int64
++		if vc := cs.kernel.VirtualClock(); vc != nil {
++			vt, _ = vc.GetTime(sentryTime.Monotonic)
++		}
++		return controlResponse{OK: true, VirtualTimeNS: vt}
++
++	default:
++		return controlResponse{OK: false, Error: fmt.Sprintf("unknown command: %s", req.Cmd)}
++	}
++}

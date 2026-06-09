@@ -1,0 +1,42 @@
+diff --git a/runsc/boot/loader.go b/runsc/boot/loader.go
+index dec663b07..3142f3db2 100644
+--- a/runsc/boot/loader.go
++++ b/runsc/boot/loader.go
+@@ -621,11 +621,15 @@ func New(args Args) (*Loader, error) {
+ 	// When DST mode is requested, wire all deterministic components into the
+ 	// kernel and start the OpenThesis control socket before any tasks run.
+ 	if dstVC != nil {
+-		rng := kernel.NewDeterministicRNG(0)
++		rng := kernel.NewDeterministicRNG(args.Conf.DSTSeed)
+ 		sched := kernel.NewDeterministicScheduler(dstVC, uint64(args.Conf.DSTQuantumNS))
+ 		st := kernel.NewSnapshotTree()
+ 		sft := kernel.NewSyscallFaultTable(rng)
+ 		l.k.InitDST(dstVC, rng, sched, st, sft)
++		// DST: wire virtual clock into KVM platform for TSC offset control.
++		if dc, ok := p.(platform.DSTClocker); ok {
++			dc.SetDSTGetTimeNS(dstVC.MonotonicNS)
++		}
+ 		if err := l.initDSTControlSocket(args.Conf.DSTControlPath); err != nil {
+ 			return nil, fmt.Errorf("dst control socket: %w", err)
+ 		}
+@@ -669,7 +673,21 @@ func New(args Args) (*Loader, error) {
+ 	}
+ 
+ 	cpufs := cpuid.HostFeatureSet()
++	// DST: In deterministic mode, clear RDRAND and RDSEED from the guest CPUID
++	// feature set. In ptrace mode, CPUID is intercepted and emulated; without
++	// this, guest programs that call rdrand/rdseed directly get real hardware
++	// entropy, breaking reproducibility. Clearing these bits forces guest code
++	// through software entropy paths (routed through pkg/rand which is
++	// seeded by the DST seed).
++	if dstVC != nil {
++		// Use Fixed() to produce a Static-backed copy, then unset the features.
++		fs2 := cpufs.Fixed()
++		s := fs2.ToStatic()
++		cpuid.X86FeatureRDRAND.Unset(&s)
++		cpuid.X86FeatureRDSEED.Unset(&s)
++		cpufs = s.ToFeatureSet()
++	}
+ 	if value, ok := args.Spec.Annotations[specutils.AnnotationCPUFeatures]; ok {
+ 		allowedFeatures := make(map[cpuid.Feature]struct{})
+ 		for str := range strings.SplitSeq(value, ",") {

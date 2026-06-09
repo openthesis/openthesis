@@ -1,0 +1,9 @@
+--- /tmp/kvm.h.orig
++++ /usr/src/linux-6.18.7/include/uapi/linux/kvm.h
+@@ -965,5 +965,6 @@
+ #define KVM_CAP_GUEST_MEMFD_FLAGS 244
+ 
+ #define KVM_CAP_RDTSC_EXITING			245
++#define KVM_CAP_HLT_USER_EXIT			246
+ 
+ struct kvm_irq_routing_irqchip {

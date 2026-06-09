@@ -1,0 +1,9 @@
+--- /tmp/kvm.h.orig
++++ /usr/src/linux-source-6.8.0/include/uapi/linux/kvm.h
+@@ -1162,6 +1162,7 @@
+ #define KVM_CAP_VM_TYPES 235
+
+ #define KVM_CAP_RDTSC_EXITING			236
++#define KVM_CAP_HLT_USER_EXIT			237
+
+ #ifdef KVM_CAP_IRQ_ROUTING
